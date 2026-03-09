@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter};
@@ -191,13 +191,33 @@ async fn handle_resolved(
         .filter(is_usable_peer_addr)
         .collect();
 
+    if addrs.is_empty() {
+        let host = info.get_hostname().trim_end_matches('.').to_string();
+        let resolve_target = format!("{host}:{port}");
+        if let Ok(resolved) = tokio::task::spawn_blocking(move || {
+            resolve_target
+                .to_socket_addrs()
+                .map(|iter| iter.collect::<Vec<SocketAddr>>())
+        })
+        .await
+        {
+            if let Ok(extra) = resolved {
+                addrs.extend(extra.into_iter().filter(is_usable_peer_addr));
+            }
+        }
+    }
+
     // Prefer IPv4 first for cross-platform LAN interoperability.
     addrs.sort_by_key(|a| if a.is_ipv4() { 0 } else { 1 });
     let mut seen = HashSet::new();
     addrs.retain(|a| seen.insert(*a));
 
     if addrs.is_empty() {
-        tracing::debug!("No addresses resolved for {name}");
+        tracing::debug!(
+            "No usable addresses resolved for {name} (hostname={}, port={})",
+            info.get_hostname(),
+            port
+        );
         return;
     }
 
