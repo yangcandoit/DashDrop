@@ -16,6 +16,7 @@
 > - 已落地：sender `Accept/Reject` 超时控制、`USER_RESPONSE_TIMEOUT_SECS=60`、目录 `Complete/Ack` 生命周期、`reason_code` 协议编码、fingerprint 限流、probe close `0xD0`。
 > - 已落地：接收端冲突策略执行（覆盖/重命名/跳过）与并发流上限配置接线（运行时可配）。
 > - 已落地：partial 结果失败项可被发送端按文件级重试（无需整任务重发）。
+> - 已落地：工程门禁与发布自动化（CI + clippy、security audit、CodeQL、installers/release checksum）；协议行为不变，仅增强交付质量。
 > - 部分待补：协议文档中的“真实端到端集成测试要求”尚未完全达成（当前为单测+契约测试增强）。
 
 ---
@@ -357,3 +358,38 @@ cert_fp = SHA256(peer_tls_cert.public_key_der)
 | BLE 发现 | 替换/补充发现层，Hello 握手在连接层，天然兼容 |
 | 手动添加（IP:port）| 已纳入 M1：先连接并展示 fp 人工核验，确认后进入 PendingAccept |
 | 中继模式 | 新增 `relay` 连接类型，数据仍 E2E 加密 |
+
+---
+
+## 9. 协议演进与迁移策略
+
+### 9.1 版本字段职责
+
+- `wire_version`：仅用于 `Hello` 固定外壳可解析性；当前固定 `0`，不得随业务变更而修改。
+- `supported_versions`/`chosen_version`：业务协议版本协商字段；允许随版本演进扩展。
+
+### 9.2 兼容策略
+
+1. Minor 演进（向后兼容）：
+- 仅新增可选字段或新增消息变体，旧端可忽略。
+- 不允许删除已有必选字段，不允许改变现有字段语义。
+
+2. Major 演进（可能不兼容）：
+- 必须通过 `supported_versions` 协商；交集为空时返回 `E_VERSION_MISMATCH`。
+- 新旧协议并行期至少保留 `N` 与 `N-1` 两个版本。
+
+3. 事件契约稳定性：
+- 终态事件名固定为 6 个：`transfer_complete` / `transfer_partial` / `transfer_rejected` / `transfer_cancelled_by_sender` / `transfer_cancelled_by_receiver` / `transfer_failed`。
+- 新版本禁止引入额外终态事件名；扩展信息通过 payload 字段增加。
+
+### 9.3 弃用流程
+
+1. 标记阶段：在文档和代码注释中标记 `deprecated_since`。
+2. 双写阶段：发送端可同时写新旧字段，接收端优先读新字段并兼容旧字段。
+3. 移除阶段：至少跨一个 minor 版本后移除旧字段。
+
+### 9.4 升级回滚策略
+
+1. 客户端升级后若协商失败，必须在 UI 显示“版本不兼容”并给出下一步（升级另一端或降级当前端）。
+2. 任一版本迁移不得改变 `transfer_id`/`reason_code(E_*)`/终态事件名语义，保证历史和监控统计可连续。
+3. 数据库迁移必须可回滚：新列默认可空，旧列保留至少一个版本周期。

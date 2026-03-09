@@ -7,7 +7,8 @@
 
 > **实现状态快照（2026-03-09）**：
 > - 已实现：DTO 边界（`DeviceView/SessionView/TransferView`）、`transfer_accepted`、终态事件统一映射、`revision` 仅状态跃迁递增。
-> - 已实现：CI 门禁（`cargo check`、`cargo test`、`npm run build`、`npm run test:e2e`）。
+> - 已实现：CI 门禁（`cargo check`、`cargo clippy --all-targets --all-features`、`cargo test`、`npm run build`、`npm run test:e2e`）。
+> - 已实现：GitHub 安全与发布自动化（`security-audit`、`CodeQL`、`Dependabot`、installers + checksums 上传）。
 > - 已实现：`connect_by_address`、trusted-only auto-accept、Probe(ALPN `dashdrop-probe/1`) 与 `Offline` 状态收敛、security_events 审计落地。
 > - 已实现：真实浏览器自动化 Playwright E2E（mock IPC 驱动的 UI 流程）。
 > - 已实现：sender accept 超时、60s 用户响应时限、目录 complete/ack 生命周期、fingerprint 级 offer 限流、Probe `0xD0` close code。

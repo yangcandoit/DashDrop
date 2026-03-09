@@ -10,11 +10,15 @@ concurrency:
   group: installers-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
+env:
+  APP_NAME: dashdrop
+
 jobs:
   preflight:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -54,8 +58,6 @@ jobs:
           - os: macos-latest
             platform: macos
     runs-on: ${{ matrix.os }}
-    permissions:
-      contents: read
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -82,14 +84,74 @@ jobs:
       - name: Install JS deps
         run: npm ci
 
+      - name: Resolve release label
+        id: release_meta
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            label="${GITHUB_REF_NAME}"
+          else
+            short="${GITHUB_SHA::7}"
+            label="manual-${GITHUB_RUN_NUMBER}-${short}"
+          fi
+          echo "label=${label}" >> "${GITHUB_OUTPUT}"
+
       - name: Build Tauri installers
         run: npm run tauri build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
-      - name: Upload installer artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: dashdrop-${{ matrix.platform }}
-          path: |
+      - name: Optional Windows code signing
+        if: runner.os == 'Windows' && secrets.WINDOWS_CERT_BASE64 != '' && secrets.WINDOWS_CERT_PASSWORD != ''
+        shell: pwsh
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [System.IO.File]::WriteAllBytes($pfxPath, [System.Convert]::FromBase64String("${{ secrets.WINDOWS_CERT_BASE64 }}"))
+          $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          if (-not $signtool) { throw "signtool not found" }
+          $targets = Get-ChildItem -Path "src-tauri/target/release/bundle" -Recurse -Include *.exe,*.msi
+          if (-not $targets) { throw "No Windows installer files found to sign" }
+          foreach ($file in $targets) {
+            & $signtool sign /fd SHA256 /f $pfxPath /p "${{ secrets.WINDOWS_CERT_PASSWORD }}" /tr "http://timestamp.digicert.com" /td SHA256 $file.FullName
+          }
+
+      - name: macOS signing/notarization secret status
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=()
+          for key in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [[ -z "${!key}" ]]; then
+              missing+=("${key}")
+            fi
+          done
+          if [[ ${#missing[@]} -eq 0 ]]; then
+            echo "macOS signing/notarization secrets detected."
+          else
+            echo "macOS signing/notarization not enabled (missing: ${missing[*]})."
+          fi
+
+      - name: Collect normalized release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-bundle
+          shopt -s globstar nullglob
+          files=(
             src-tauri/target/release/bundle/**/*.msi
             src-tauri/target/release/bundle/**/*.exe
             src-tauri/target/release/bundle/**/*.dmg
@@ -97,6 +159,44 @@ jobs:
             src-tauri/target/release/bundle/**/*.AppImage
             src-tauri/target/release/bundle/**/*.deb
             src-tauri/target/release/bundle/**/*.rpm
+          )
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "No installer bundles found."
+            exit 1
+          fi
+          for src in "${files[@]}"; do
+            base="$(basename "${src}")"
+            cp "${src}" "release-bundle/${APP_NAME}-${{ steps.release_meta.outputs.label }}-${{ matrix.platform }}-${base}"
+          done
+          ls -lh release-bundle
+
+      - name: Smoke check bundled artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          total="$(find release-bundle -type f | wc -l | tr -d ' ')"
+          if [[ "${total}" == "0" ]]; then
+            echo "No packaged artifacts found in release-bundle."
+            exit 1
+          fi
+          case "${{ matrix.platform }}" in
+            linux)
+              find release-bundle -type f \( -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" \) | grep -q .
+              ;;
+            windows)
+              find release-bundle -type f \( -name "*.msi" -o -name "*.exe" \) | grep -q .
+              ;;
+            macos)
+              find release-bundle -type f \( -name "*.dmg" -o -name "*.app.tar.gz" \) | grep -q .
+              ;;
+          esac
+          echo "Smoke check passed for ${{ matrix.platform }} with ${total} artifacts."
+
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashdrop-${{ matrix.platform }}
+          path: release-bundle/**/*
           if-no-files-found: error
           retention-days: 14
 

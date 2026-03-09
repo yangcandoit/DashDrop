@@ -11,10 +11,15 @@ Current project status (single source of truth): [STATUS.md](./STATUS.md)
 
 - 构建与测试：
   - `cargo check` 已接入 CI 并通过
+  - `cargo clippy --all-targets --all-features -- -D warnings` 已接入 CI
   - `cargo test` 已接入 CI 并通过
   - `npm run build` 已接入 CI 并通过
   - `npm run test:e2e`（Playwright UI E2E）已接入 CI 并通过
   - `npm run test:e2e:contract`（契约脚本级 E2E）已接入 CI 并通过
+  - 已新增安全扫描工作流：`security-audit.yml`（cargo audit + npm audit）与 `codeql.yml`
+  - 已新增 `dependabot.yml`（Actions/npm/cargo 依赖周更）
+  - 已新增安装包发布流水线增强：标准化产物命名、烟测、可选签名/公证钩子、发布校验和
+  - 已新增发布与升级模板文档：`docs/RELEASE_NOTES_TEMPLATE.md`、`docs/UPGRADE_MIGRATION_TEMPLATE.md`
 - 状态契约：
   - 已收口进行中/终态事件契约，已包含 `transfer_accepted`
   - `revision` 仅在状态跃迁递增，`transfer_progress` 不再推动 revision 递增

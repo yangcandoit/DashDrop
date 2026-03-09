@@ -45,6 +45,9 @@
   - [x] E2E（`npm run test:e2e` Playwright UI 自动化）
   - [x] E2E contract（`npm run test:e2e:contract` 脚本级契约）
   - [x] `cargo clippy --all-targets --all-features`
+- [x] 安全扫描门禁与定时任务（`.github/workflows/security-audit.yml` + `.github/workflows/codeql.yml`）。
+- [x] 依赖自动更新（`.github/dependabot.yml` 覆盖 GitHub Actions / npm / cargo）。
+- [x] 安装包流水线与发布资产上传（`.github/workflows/build-installers.yml`，含 `SHA256SUMS.txt`）。
 
 ## P1（高优先级，建议首个小版本完成）
 
@@ -71,8 +74,8 @@
 
 ### 2. 架构与长期维护
 - [x] 持久化方案统一评估（JSON vs tauri store vs sqlite）并固化（**已收口为 SQLite 作为唯一运行时持久化，`state.json` 仅保留一次性迁移读取**）。
-- [ ] 协议演进策略文档（版本兼容、弃用策略、迁移策略）（**未实现**）。
-- [ ] 发布说明模板与升级迁移说明模板（**未实现**）。
+- [x] 协议演进策略文档（版本兼容、弃用策略、迁移策略）（**已补充于 `PROTOCOL.md` §9**）。
+- [x] 发布说明模板与升级迁移说明模板（**已补 `docs/RELEASE_NOTES_TEMPLATE.md` 与 `docs/UPGRADE_MIGRATION_TEMPLATE.md`，并配置 `.github/release.yml` 分类模板**）。
 
 ## 建议执行顺序
 

@@ -78,9 +78,23 @@ Estimated completion:
 ### CI and tests
 - CI workflow exists and runs:
   - `cargo check`
+  - `cargo clippy --all-targets --all-features -- -D warnings`
   - `cargo test`
   - `npm run build`
   - `npm run test:e2e`
+- Added GitHub security workflows:
+  - `.github/workflows/security-audit.yml` (`cargo audit` + `npm audit`)
+  - `.github/workflows/codeql.yml` (JavaScript/TypeScript CodeQL scan)
+- Added dependency automation:
+  - `.github/dependabot.yml` (GitHub Actions + npm + cargo weekly updates)
+- Build installer workflow hardened:
+  - normalized release asset names
+  - per-platform smoke checks
+  - optional macOS notarization and Windows code-signing hooks
+  - tag release uploads with `SHA256SUMS.txt`
+- Added release/upgrade documentation templates:
+  - `docs/RELEASE_NOTES_TEMPLATE.md`
+  - `docs/UPGRADE_MIGRATION_TEMPLATE.md`
 - Rust unit/contract tests currently passing.
 - Frontend script-level E2E contract test exists and passing.
 - Frontend Playwright UI E2E exists and passing (`tests/playwright/transfer-ui.spec.ts`).
@@ -107,6 +121,7 @@ Estimated completion:
 ### Remaining release tails
 - Playwright E2E currently uses injected mock IPC backend (real UI + mocked backend contract), not a full Tauri runtime orchestration test.
 - Backend新增 `src-tauri/tests/phase_d_contract.rs` 为跨模块合同集成测试；真实多进程/多主机 QUIC 编排压测仍可继续扩展。
+- Code-signing / notarization currently remains optional hooks; production certificates and notarization credentials still need to be configured in repository secrets.
 
 ## Validation snapshot
 
