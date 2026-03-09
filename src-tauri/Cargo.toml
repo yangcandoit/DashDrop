@@ -1,0 +1,65 @@
+[package]
+name = "dashdrop"
+version = "0.1.0"
+description = "DashDrop — Fast, secure LAN file transfer"
+authors = ["DashDrop"]
+edition = "2021"
+
+[lib]
+name = "dashdrop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ciborium = "0.2"
+
+# QUIC / TLS
+quinn = { version = "0.11", features = [] }
+rustls = { version = "0.23", features = ["ring"], default-features = false }
+rustls-pki-types = "1"
+
+# Crypto & Identity
+rcgen = { version = "0.13", features = ["pem"] }
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
+rand = "0.8"
+sha2 = "0.10"
+base64 = "0.22"
+blake3 = "1"
+pkcs8 = { version = "0.10", features = ["pem", "std"] }
+
+# Discovery
+mdns-sd = "0.11"
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+sysinfo = "0.38.3"
+tauri-plugin-notification = "2.3.3"
+tauri-plugin-store = "2.4.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7.0"
+
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+keyring = "2.3.3"
+
+[profile.release]
+opt-level = "s"
+strip = true
