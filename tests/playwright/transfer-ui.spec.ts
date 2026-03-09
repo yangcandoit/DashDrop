@@ -66,6 +66,8 @@ test.beforeEach(async ({ page }) => {
               rejected: 0,
               bytes_sent: 0,
               bytes_received: 0,
+              average_duration_ms: 0,
+              failure_distribution: {},
             };
           case "get_trusted_peers":
             return state.trustedPeers;

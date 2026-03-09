@@ -68,7 +68,9 @@ pub struct TransferView {
     pub bytes_transferred: u64,
     pub total_bytes: u64,
     pub revision: u64,
+    pub started_at_unix: u64,
     pub ended_at_unix: Option<u64>,
+    pub terminal_reason_code: Option<String>,
     pub error: Option<String>,
 }
 
@@ -84,7 +86,9 @@ impl From<&TransferTask> for TransferView {
             bytes_transferred: value.bytes_transferred,
             total_bytes: value.total_bytes,
             revision: value.revision,
+            started_at_unix: value.started_at_unix,
             ended_at_unix: value.ended_at_unix,
+            terminal_reason_code: value.terminal_reason_code.clone(),
             error: value.error.clone(),
         }
     }

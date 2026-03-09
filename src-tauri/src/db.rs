@@ -1,7 +1,10 @@
-use crate::state::{SecurityEvent, TransferDirection, TransferTask};
+use crate::state::{
+    AppConfig, SecurityEvent, TransferDirection, TransferMetrics, TransferTask, TrustedPeer,
+};
 use anyhow::Result;
 use rusqlite::types::Type;
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
@@ -45,11 +48,23 @@ pub fn init_db(app: &AppHandle) -> Result<Connection> {
             bytes_transferred INTEGER NOT NULL,
             total_bytes INTEGER NOT NULL,
             revision INTEGER NOT NULL DEFAULT 0,
-            error TEXT,
-            ended_at INTEGER NOT NULL
+            started_at INTEGER NOT NULL DEFAULT 0,
+            ended_at INTEGER NOT NULL,
+            reason_code TEXT,
+            error TEXT
         )",
         [],
     )?;
+
+    // Runtime migration for older history table schemas.
+    let _ = conn.execute(
+        "ALTER TABLE transfers_history ADD COLUMN started_at INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE transfers_history ADD COLUMN reason_code TEXT",
+        [],
+    );
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS security_events (
@@ -63,24 +78,108 @@ pub fn init_db(app: &AppHandle) -> Result<Connection> {
         [],
     )?;
 
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS app_config_store (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            config_json TEXT NOT NULL
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS trusted_peers_store (
+            fingerprint TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            paired_at INTEGER NOT NULL,
+            alias TEXT,
+            last_used_at INTEGER
+        )",
+        [],
+    )?;
+
     Ok(conn)
+}
+
+pub fn load_app_config(conn: &Connection) -> Result<Option<AppConfig>> {
+    let mut stmt = conn.prepare("SELECT config_json FROM app_config_store WHERE id = 1")?;
+    let mut rows = stmt.query([])?;
+    if let Some(row) = rows.next()? {
+        let json: String = row.get(0)?;
+        let config = serde_json::from_str::<AppConfig>(&json)?;
+        Ok(Some(config))
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn load_trusted_peers(conn: &Connection) -> Result<Vec<TrustedPeer>> {
+    let mut stmt = conn.prepare(
+        "SELECT fingerprint, name, paired_at, alias, last_used_at
+         FROM trusted_peers_store
+         ORDER BY paired_at ASC",
+    )?;
+    let iter = stmt.query_map([], |row| {
+        Ok(TrustedPeer {
+            fingerprint: row.get(0)?,
+            name: row.get(1)?,
+            paired_at: row.get(2)?,
+            alias: row.get(3)?,
+            last_used_at: row.get(4)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for peer in iter {
+        out.push(peer?);
+    }
+    Ok(out)
+}
+
+pub fn save_app_config(conn: &Connection, config: &AppConfig) -> Result<()> {
+    let json = serde_json::to_string(config)?;
+    conn.execute(
+        "INSERT INTO app_config_store (id, config_json) VALUES (1, ?1)
+         ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json",
+        params![json],
+    )?;
+    Ok(())
+}
+
+pub fn replace_trusted_peers(
+    conn: &Connection,
+    trusted: &HashMap<String, TrustedPeer>,
+) -> Result<()> {
+    conn.execute("DELETE FROM trusted_peers_store", [])?;
+    for peer in trusted.values() {
+        conn.execute(
+            "INSERT INTO trusted_peers_store
+             (fingerprint, name, paired_at, alias, last_used_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                peer.fingerprint,
+                peer.name,
+                peer.paired_at,
+                peer.alias,
+                peer.last_used_at
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 pub fn save_transfer(conn: &Connection, t: &TransferTask) -> Result<()> {
     let items_json = serde_json::to_string(&t.items)?;
-
     let ended_sys = t.ended_at_unix.unwrap_or_else(|| {
-        match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            Ok(duration) => duration.as_secs(),
-            Err(_) => 0,
-        }
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0)
     });
 
     conn.execute(
         "INSERT OR REPLACE INTO transfers_history (
             id, direction, peer_fingerprint, peer_name, items, status,
-            bytes_transferred, total_bytes, revision, error, ended_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            bytes_transferred, total_bytes, revision, started_at, ended_at, reason_code, error
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             t.id,
             match t.direction {
@@ -94,15 +193,23 @@ pub fn save_transfer(conn: &Connection, t: &TransferTask) -> Result<()> {
             t.bytes_transferred,
             t.total_bytes,
             t.revision,
-            t.error,
+            t.started_at_unix,
             ended_sys,
+            t.terminal_reason_code,
+            t.error,
         ],
     )?;
     Ok(())
 }
 
 pub fn get_history(conn: &Connection, limit: u32, offset: u32) -> Result<Vec<TransferTask>> {
-    let mut stmt = conn.prepare("SELECT id, direction, peer_fingerprint, peer_name, items, status, bytes_transferred, total_bytes, revision, error, ended_at FROM transfers_history ORDER BY ended_at DESC LIMIT ?1 OFFSET ?2")?;
+    let mut stmt = conn.prepare(
+        "SELECT id, direction, peer_fingerprint, peer_name, items, status, bytes_transferred,
+                total_bytes, revision, started_at, ended_at, reason_code, error
+         FROM transfers_history
+         ORDER BY ended_at DESC
+         LIMIT ?1 OFFSET ?2",
+    )?;
 
     let transfer_iter = stmt.query_map(params![limit, offset], |row| {
         let items_str: String = row.get(4)?;
@@ -111,6 +218,7 @@ pub fn get_history(conn: &Connection, limit: u32, offset: u32) -> Result<Vec<Tra
         let status_str: String = row.get(5)?;
         let status = serde_json::from_str(&format!("\"{}\"", status_str))
             .map_err(|e| rusqlite::Error::FromSqlConversionFailure(5, Type::Text, Box::new(e)))?;
+
         Ok(TransferTask {
             id: row.get(0)?,
             direction: parse_direction(row.get(1)?)?,
@@ -121,9 +229,13 @@ pub fn get_history(conn: &Connection, limit: u32, offset: u32) -> Result<Vec<Tra
             bytes_transferred: row.get(6)?,
             total_bytes: row.get(7)?,
             revision: row.get(8)?,
-            error: row.get(9)?,
+            started_at_unix: row.get(9)?,
             ended_at_unix: Some(row.get(10)?),
+            terminal_reason_code: row.get(11)?,
+            error: row.get(12)?,
             source_paths: None,
+            source_path_by_file_id: None,
+            failed_file_ids: None,
             conn: None,
             ended_at: None,
         })
@@ -134,6 +246,64 @@ pub fn get_history(conn: &Connection, limit: u32, offset: u32) -> Result<Vec<Tra
         tasks.push(t?);
     }
     Ok(tasks)
+}
+
+pub fn get_transfer_metrics(conn: &Connection) -> Result<TransferMetrics> {
+    let mut metrics = TransferMetrics::default();
+
+    let mut status_stmt =
+        conn.prepare("SELECT status, COUNT(*) FROM transfers_history GROUP BY status")?;
+    let status_iter = status_stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+    })?;
+    for status in status_iter {
+        let (status, count) = status?;
+        match status.as_str() {
+            "Completed" => metrics.completed = count,
+            "PartialCompleted" => metrics.partial = count,
+            "Failed" => metrics.failed = count,
+            "CancelledBySender" => metrics.cancelled_by_sender = count,
+            "CancelledByReceiver" => metrics.cancelled_by_receiver = count,
+            "Rejected" => metrics.rejected = count,
+            _ => {}
+        }
+    }
+
+    metrics.bytes_sent = conn.query_row(
+        "SELECT COALESCE(SUM(bytes_transferred), 0) FROM transfers_history WHERE direction = 'Send'",
+        [],
+        |row| row.get(0),
+    )?;
+    metrics.bytes_received = conn.query_row(
+        "SELECT COALESCE(SUM(bytes_transferred), 0) FROM transfers_history WHERE direction = 'Receive'",
+        [],
+        |row| row.get(0),
+    )?;
+
+    let avg_duration_ms: Option<f64> = conn.query_row(
+        "SELECT AVG((ended_at - started_at) * 1000.0)
+         FROM transfers_history
+         WHERE started_at > 0 AND ended_at >= started_at",
+        [],
+        |row| row.get(0),
+    )?;
+    metrics.average_duration_ms = avg_duration_ms.unwrap_or(0.0).round() as u64;
+
+    let mut failure_stmt = conn.prepare(
+        "SELECT COALESCE(reason_code, 'UNKNOWN') AS code, COUNT(*)
+         FROM transfers_history
+         WHERE status IN ('Failed', 'Rejected', 'CancelledBySender', 'CancelledByReceiver', 'PartialCompleted')
+         GROUP BY COALESCE(reason_code, 'UNKNOWN')",
+    )?;
+    let failure_iter = failure_stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+    })?;
+    for row in failure_iter {
+        let (code, count) = row?;
+        metrics.failure_distribution.insert(code, count);
+    }
+
+    Ok(metrics)
 }
 
 pub fn log_security_event(

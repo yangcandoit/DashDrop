@@ -144,10 +144,16 @@ pub struct TransferTask {
     pub bytes_transferred: u64,
     pub total_bytes: u64,
     pub revision: u64,
+    pub started_at_unix: u64,
     pub ended_at_unix: Option<u64>,
+    pub terminal_reason_code: Option<String>,
     pub error: Option<String>,
     #[serde(skip)]
     pub source_paths: Option<Vec<String>>,
+    #[serde(skip)]
+    pub source_path_by_file_id: Option<HashMap<u32, String>>,
+    #[serde(skip)]
+    pub failed_file_ids: Option<Vec<u32>>,
     #[serde(skip)]
     pub conn: Option<quinn::Connection>,
     #[serde(skip)]
@@ -224,6 +230,8 @@ pub struct TransferMetrics {
     pub rejected: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    pub average_duration_ms: u64,
+    pub failure_distribution: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

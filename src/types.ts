@@ -75,7 +75,9 @@ export interface TransferView {
   bytes_transferred: number;
   total_bytes: number;
   revision?: number;
+  started_at_unix?: number;
   ended_at_unix?: number | null;
+  terminal_reason_code?: string | null;
   error?: string;
 }
 
@@ -215,4 +217,6 @@ export interface TransferMetrics {
   rejected: number;
   bytes_sent: number;
   bytes_received: number;
+  average_duration_ms: number;
+  failure_distribution: Record<string, number>;
 }

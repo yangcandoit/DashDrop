@@ -13,6 +13,8 @@
 > - 已实现：sender accept 超时、60s 用户响应时限、目录 complete/ack 生命周期、fingerprint 级 offer 限流、Probe `0xD0` close code。
 > - 已实现：配置驱动的文件冲突策略（overwrite/rename/skip）与并发流上限（`max_parallel_streams`）。
 > - 已实现：前端任务管理增强（批量取消、发送任务重试）、配对别名与最近使用时间展示。
+> - 已实现：partial 终态失败项按文件级重试（基于 `failed_file_ids` 与源路径映射）。
+> - 已实现：配置/信任持久化收口 SQLite（legacy `state.json` 仅迁移读取）。
 > - 未完成：真实双端 QUIC 多机编排压测（当前仍以合同测试+UI mock E2E 为主）。
 > - 说明：本文中若出现与代码细节不一致的结构定义，以 `src-tauri/src/*.rs` 与 `src/*.ts` 的当前实现为准。
 

@@ -57,6 +57,14 @@ pub async fn send_files(
     let items: Vec<FileItem> = items_with_paths.iter().map(|(i, _)| i.clone()).collect();
 
     let total_size: u64 = items.iter().map(|f| f.size).sum();
+    let started_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let source_path_by_file_id: HashMap<u32, String> = items_with_paths
+        .iter()
+        .map(|(item, path)| (item.file_id, path.to_string_lossy().to_string()))
+        .collect();
     let peer_name = {
         let devices = state.devices.read().await;
         devices
@@ -88,7 +96,9 @@ pub async fn send_files(
                 bytes_transferred: 0,
                 total_bytes: total_size,
                 revision: 0,
+                started_at_unix,
                 ended_at_unix: None,
+                terminal_reason_code: None,
                 error: None,
                 source_paths: Some(
                     paths
@@ -96,6 +106,8 @@ pub async fn send_files(
                         .map(|p| p.to_string_lossy().to_string())
                         .collect(),
                 ),
+                source_path_by_file_id: Some(source_path_by_file_id),
+                failed_file_ids: None,
                 conn: Some(conn.clone()),
                 ended_at: None,
             },
@@ -144,6 +156,8 @@ pub async fn send_files(
             if let Some(t) = transfers.get_mut(&transfer_id) {
                 t.status = TransferStatus::Rejected;
                 t.revision += 1;
+                t.terminal_reason_code = Some(error_code_key(&r.reason));
+                t.failed_file_ids = Some(t.items.iter().map(|item| item.file_id).collect());
                 t.ended_at = Some(std::time::Instant::now());
                 t.ended_at_unix = Some(
                     std::time::SystemTime::now()
@@ -187,6 +201,8 @@ pub async fn send_files(
             if let Some(t) = transfers.get_mut(&transfer_id) {
                 t.status = TransferStatus::Failed;
                 t.revision += 1;
+                t.terminal_reason_code = Some(ErrorCode::Timeout.reason_code().to_string());
+                t.failed_file_ids = Some(t.items.iter().map(|item| item.file_id).collect());
                 t.error = Some("Offer response timeout".to_string());
                 t.ended_at = Some(std::time::Instant::now());
                 t.ended_at_unix = Some(
@@ -320,8 +336,8 @@ pub async fn send_files(
 
     // Build proper file_id → path mapping from items_with_paths
     let file_id_to_path: HashMap<u32, PathBuf> = items_with_paths
-        .into_iter()
-        .map(|(i, p)| (i.file_id, p))
+        .iter()
+        .map(|(i, p)| (i.file_id, p.clone()))
         .collect();
 
     for item in &items {
@@ -418,6 +434,27 @@ pub async fn send_files(
                 TransferOutcome::CancelledByReceiver => TransferStatus::CancelledByReceiver,
             };
             t.revision += 1;
+            t.failed_file_ids = match &outcome {
+                TransferOutcome::PartialSuccess(failed) => {
+                    Some(failed.iter().map(|entry| entry.file_id).collect())
+                }
+                TransferOutcome::Success => None,
+                TransferOutcome::Failed(_) => {
+                    Some(t.items.iter().map(|item| item.file_id).collect())
+                }
+                TransferOutcome::CancelledBySender | TransferOutcome::CancelledByReceiver => {
+                    Some(t.items.iter().map(|item| item.file_id).collect())
+                }
+            };
+            t.terminal_reason_code = match &outcome {
+                TransferOutcome::Success => None,
+                TransferOutcome::PartialSuccess(failed) => {
+                    failed.first().map(|entry| error_code_key(&entry.reason))
+                }
+                TransferOutcome::Failed(code) => Some(error_code_key(code)),
+                TransferOutcome::CancelledByReceiver => Some("E_CANCELLED_BY_RECEIVER".to_string()),
+                TransferOutcome::CancelledBySender => Some("E_CANCELLED_BY_SENDER".to_string()),
+            };
             t.ended_at = Some(std::time::Instant::now());
             t.ended_at_unix = Some(
                 std::time::SystemTime::now()

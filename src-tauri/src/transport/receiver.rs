@@ -128,6 +128,10 @@ pub async fn handle_offer(
     state: Arc<AppState>,
 ) -> Result<()> {
     let transfer_id = offer.transfer_id;
+    let started_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
 
     // Register in state
     let items_meta: Vec<_> = offer
@@ -155,9 +159,13 @@ pub async fn handle_offer(
                 bytes_transferred: 0,
                 total_bytes: offer.total_size,
                 revision: 0,
+                started_at_unix,
                 ended_at_unix: None,
+                terminal_reason_code: None,
                 error: None,
                 source_paths: None,
+                source_path_by_file_id: None,
+                failed_file_ids: None,
                 conn: Some(conn.clone()),
                 ended_at: None,
             },
@@ -197,7 +205,13 @@ pub async fn handle_offer(
             }),
         )
         .await?;
-        update_transfer_status(&state, transfer_id.clone(), TransferStatus::Failed).await;
+        update_transfer_status(
+            &state,
+            transfer_id.clone(),
+            TransferStatus::Failed,
+            Some("E_DISK_FULL"),
+        )
+        .await;
         {
             let mut transfers = state.transfers.write().await;
             if let Some(t) = transfers.get_mut(&transfer_id) {
@@ -264,8 +278,14 @@ pub async fn handle_offer(
             }),
         )
         .await?;
-        update_transfer_status(&state, transfer_id.clone(), TransferStatus::Rejected).await;
         let (reason_code, terminal_cause) = reject_reason(is_timeout);
+        update_transfer_status(
+            &state,
+            transfer_id.clone(),
+            TransferStatus::Rejected,
+            Some(reason_code),
+        )
+        .await;
         emit_transfer_terminal(
             &app,
             &transfer_id,
@@ -280,10 +300,14 @@ pub async fn handle_offer(
     }
 
     // Accept
-    let accepted_revision =
-        update_transfer_status(&state, transfer_id.clone(), TransferStatus::Transferring)
-            .await
-            .unwrap_or(0);
+    let accepted_revision = update_transfer_status(
+        &state,
+        transfer_id.clone(),
+        TransferStatus::Transferring,
+        None,
+    )
+    .await
+    .unwrap_or(0);
     emit_transfer_accepted(&app, &transfer_id, accepted_revision);
     state.mark_peer_used(&peer_fp).await;
     write_message(
@@ -296,7 +320,13 @@ pub async fn handle_offer(
     if let Err(e) = fs::create_dir_all(&save_root).await {
         let reason = io_error_code(&e);
         let _ = send_cancel(&conn, reason.clone()).await;
-        update_transfer_status(&state, transfer_id.clone(), TransferStatus::Failed).await;
+        update_transfer_status(
+            &state,
+            transfer_id.clone(),
+            TransferStatus::Failed,
+            Some(reason.reason_code()),
+        )
+        .await;
         emit_transfer_terminal(
             &app,
             &transfer_id,
@@ -331,8 +361,13 @@ pub async fn handle_offer(
     match result {
         Ok(outcome) => match &outcome {
             TransferOutcome::Success => {
-                update_transfer_status(&state, transfer_id.clone(), TransferStatus::Completed)
-                    .await;
+                update_transfer_status(
+                    &state,
+                    transfer_id.clone(),
+                    TransferStatus::Completed,
+                    None,
+                )
+                .await;
                 emit_transfer_complete(
                     &app,
                     &transfer_id,
@@ -344,6 +379,7 @@ pub async fn handle_offer(
                     &state,
                     transfer_id.clone(),
                     TransferStatus::PartialCompleted,
+                    None,
                 )
                 .await;
                 emit_transfer_partial(
@@ -356,7 +392,13 @@ pub async fn handle_offer(
                 );
             }
             TransferOutcome::Failed(e) => {
-                update_transfer_status(&state, transfer_id.clone(), TransferStatus::Failed).await;
+                update_transfer_status(
+                    &state,
+                    transfer_id.clone(),
+                    TransferStatus::Failed,
+                    Some(e.reason_code()),
+                )
+                .await;
                 emit_transfer_terminal(
                     &app,
                     &transfer_id,
@@ -380,6 +422,7 @@ pub async fn handle_offer(
                     &state,
                     transfer_id.clone(),
                     TransferStatus::CancelledBySender,
+                    Some("E_CANCELLED_BY_SENDER"),
                 )
                 .await;
                 emit_transfer_terminal(
@@ -397,6 +440,7 @@ pub async fn handle_offer(
                     &state,
                     transfer_id.clone(),
                     TransferStatus::CancelledByReceiver,
+                    Some("E_CANCELLED_BY_RECEIVER"),
                 )
                 .await;
                 emit_transfer_terminal(
@@ -418,7 +462,13 @@ pub async fn handle_offer(
                 reason = %e,
                 "receive transfer error"
             );
-            update_transfer_status(&state, transfer_id.clone(), TransferStatus::Failed).await;
+            update_transfer_status(
+                &state,
+                transfer_id.clone(),
+                TransferStatus::Failed,
+                Some("E_PROTOCOL"),
+            )
+            .await;
             emit_transfer_terminal(
                 &app,
                 &transfer_id,
@@ -880,6 +930,7 @@ async fn update_transfer_status(
     state: &Arc<AppState>,
     id: String,
     status: TransferStatus,
+    reason_code: Option<&str>,
 ) -> Option<u64> {
     let mut metrics_snapshot: Option<(TransferDirection, TransferStatus, u64)> = None;
     let mut transfers = state.transfers.write().await;
@@ -888,6 +939,9 @@ async fn update_transfer_status(
         if previous_status != status {
             t.status = status.clone();
             t.revision += 1;
+        }
+        if let Some(code) = reason_code {
+            t.terminal_reason_code = Some(code.to_string());
         }
         match t.status {
             TransferStatus::Completed

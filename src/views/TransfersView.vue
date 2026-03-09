@@ -63,6 +63,9 @@ const canRetry = (status: string, direction: string) =>
     status === 'Rejected' ||
     status === 'PartialCompleted');
 
+const retryLabel = (status: string) =>
+  status === 'PartialCompleted' ? 'Retry Failed Files' : 'Retry';
+
 const handleRetry = async (transferId: string) => {
   try {
     await retryTransfer(transferId);
@@ -139,7 +142,7 @@ const handleCancelAll = async () => {
                 v-if="canRetry(t.status, t.direction)"
                 @click="handleRetry(t.id)"
                 style="font-size: 0.8rem; padding: 4px 8px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.2); background: transparent; color: inherit; cursor: pointer;">
-                Retry
+                {{ retryLabel(t.status) }}
               </button>
             </div>
           </div>

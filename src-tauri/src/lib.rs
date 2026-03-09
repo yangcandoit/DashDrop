@@ -51,10 +51,32 @@ pub fn run() {
                 identity.device_name
             );
 
-            let persisted = persistence::load_state(&handle).unwrap_or_default();
+            let db_conn = db::init_db(&handle).expect("Failed to initialize SQLite database");
+            let mut db_config = db::load_app_config(&db_conn).unwrap_or(None);
+            let mut db_trusted = db::load_trusted_peers(&db_conn).unwrap_or_default();
+
+            if db_config.is_none() && db_trusted.is_empty() {
+                if let Ok(legacy) = persistence::load_state(&handle) {
+                    if let Some(cfg) = legacy.app_config.clone() {
+                        let _ = db::save_app_config(&db_conn, &cfg);
+                        db_config = Some(cfg);
+                    }
+                    if !legacy.trusted_peers.is_empty() {
+                        let trusted_map: std::collections::HashMap<String, state::TrustedPeer> =
+                            legacy
+                                .trusted_peers
+                                .iter()
+                                .cloned()
+                                .map(|peer| (peer.fingerprint.clone(), peer))
+                                .collect();
+                        let _ = db::replace_trusted_peers(&db_conn, &trusted_map);
+                        db_trusted = legacy.trusted_peers;
+                    }
+                }
+            }
 
             // Create AppState
-            let mut config = persisted.app_config.unwrap_or_else(|| AppConfig {
+            let mut config = db_config.unwrap_or_else(|| AppConfig {
                 device_name: identity.device_name.clone(),
                 ..Default::default()
             });
@@ -62,7 +84,6 @@ pub fn run() {
                 config.device_name = identity.device_name.clone();
             }
 
-            let db_conn = db::init_db(&handle).expect("Failed to initialize SQLite database");
             let state = Arc::new(AppState::new(identity, config, db_conn));
             if !crypto::secret_store::secure_store_available() {
                 handle.emit("system_error", serde_json::json!({
@@ -82,7 +103,7 @@ pub fn run() {
             tauri::async_runtime::block_on(async {
                 let mut trusted = state.trusted_peers.write().await;
                 trusted.clear();
-                for peer in persisted.trusted_peers {
+                for peer in db_trusted {
                     trusted.insert(peer.fingerprint.clone(), peer);
                 }
             });

@@ -46,6 +46,26 @@ export const sendingPeerFingerprints = computed(() => {
 let unlistens: Array<() => void> = [];
 let clearSystemErrorTimer: ReturnType<typeof setTimeout> | null = null;
 
+function actionableMessage(summary: string, nextSteps: string[]): string {
+  if (nextSteps.length === 0) return summary;
+  return `${summary} Next: ${nextSteps.join(" ")}`;
+}
+
+function transferErrorNextSteps(reasonCode: string): string[] {
+  switch (reasonCode) {
+    case "E_TIMEOUT":
+      return ["Check both devices are online and retry."];
+    case "E_DISK_FULL":
+      return ["Free disk space on receiver, then retry failed files."];
+    case "E_IDENTITY_MISMATCH":
+      return ["Stop transfer and verify fingerprint before retrying."];
+    case "E_PATH_CONFLICT":
+      return ["Adjust conflict strategy in Settings or rename source files, then retry."];
+    default:
+      return ["Open Security/History for details, then retry."];
+  }
+}
+
 function setSystemError(message: string, timeoutMs = 10_000) {
   systemError.value = message;
   if (clearSystemErrorTimer) {
@@ -304,7 +324,12 @@ export async function initAppStore() {
       if (err.transfer_id) {
         addOrUpdateTerminalError(err.transfer_id, "Failed", err.reason_code, err.revision);
       }
-      setSystemError(`Transfer error (${err.phase}): ${err.reason_code}`);
+      setSystemError(
+        actionableMessage(
+          `Transfer error (${err.phase}): ${err.reason_code}`,
+          transferErrorNextSteps(err.reason_code),
+        ),
+      );
     }),
   );
 
@@ -314,12 +339,17 @@ export async function initAppStore() {
         const rollbackName = payload.rollback_device_name || "previous value";
         const attemptedName = payload.attempted_device_name || "new value";
         setSystemError(
-          `Device name update failed and was rolled back (${attemptedName} -> ${rollbackName}). ${payload.message}`,
+          actionableMessage(
+            `Device name update failed and was rolled back (${attemptedName} -> ${rollbackName}). ${payload.message}`,
+            ["Keep current name or retry with another device name in Settings."],
+          ),
           0,
         );
         return;
       }
-      setSystemError(payload.message);
+      setSystemError(
+        actionableMessage(payload.message, ["Check network/service status in Settings."]),
+      );
     }),
   );
 
@@ -329,7 +359,10 @@ export async function initAppStore() {
       const actual = payload.actual_fp || payload.cert_fp || "unknown";
       const phase = payload.phase ? ` (${payload.phase})` : "";
       setSystemError(
-        `Security warning${phase}: peer identity mismatch (expected ${expected}, got ${actual}).`,
+        actionableMessage(
+          `Security warning${phase}: peer identity mismatch (expected ${expected}, got ${actual}).`,
+          ["Do not continue transfer until fingerprint is verified out-of-band."],
+        ),
         20_000,
       );
     }),
@@ -338,7 +371,10 @@ export async function initAppStore() {
   unlistens.push(
     await onFingerprintChanged((payload) => {
       setSystemError(
-        `Security warning: paired peer fingerprint changed on session ${payload.session_id} (previous ${payload.previous_fp}, current ${payload.current_fp}).`,
+        actionableMessage(
+          `Security warning: paired peer fingerprint changed on session ${payload.session_id} (previous ${payload.previous_fp}, current ${payload.current_fp}).`,
+          ["Unpair and re-verify this device before sending sensitive files."],
+        ),
         30_000,
       );
     }),

@@ -163,6 +163,19 @@ async function save() {
           <div class="runtime-label">Bytes Received</div>
           <div class="runtime-value">{{ metrics.bytes_received }}</div>
         </div>
+        <div class="runtime-card">
+          <div class="runtime-label">Average Duration</div>
+          <div class="runtime-value">{{ metrics.average_duration_ms }} ms</div>
+        </div>
+        <div class="runtime-card">
+          <div class="runtime-label">Failure Distribution</div>
+          <div class="runtime-value">
+            <span v-if="Object.keys(metrics.failure_distribution || {}).length === 0">No failures</span>
+            <span v-else>
+              {{ Object.entries(metrics.failure_distribution).map(([k, v]) => `${k}:${v}`).join(" · ") }}
+            </span>
+          </div>
+        </div>
       </div>
       <div class="actions">
         <button @click="loadRuntime" class="btn-secondary">Refresh Runtime</button>

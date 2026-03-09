@@ -161,7 +161,19 @@ export async function getRuntimeStatus(): Promise<RuntimeStatus> {
 }
 
 export async function getTransferMetrics(): Promise<TransferMetrics> {
-  return invokeCommand("get_transfer_metrics");
+  const metrics = await invokeCommand<Partial<TransferMetrics>>("get_transfer_metrics");
+  return {
+    completed: metrics.completed ?? 0,
+    partial: metrics.partial ?? 0,
+    failed: metrics.failed ?? 0,
+    cancelled_by_sender: metrics.cancelled_by_sender ?? 0,
+    cancelled_by_receiver: metrics.cancelled_by_receiver ?? 0,
+    rejected: metrics.rejected ?? 0,
+    bytes_sent: metrics.bytes_sent ?? 0,
+    bytes_received: metrics.bytes_received ?? 0,
+    average_duration_ms: metrics.average_duration_ms ?? 0,
+    failure_distribution: metrics.failure_distribution ?? {},
+  };
 }
 
 export function onDeviceDiscovered(callback: (device: DeviceView) => void) {

@@ -32,16 +32,18 @@ fn db_direction_invalid_value_returns_error() {
             bytes_transferred INTEGER NOT NULL,
             total_bytes INTEGER NOT NULL,
             revision INTEGER NOT NULL DEFAULT 0,
-            error TEXT,
-            ended_at INTEGER NOT NULL
+            started_at INTEGER NOT NULL DEFAULT 0,
+            ended_at INTEGER NOT NULL,
+            reason_code TEXT,
+            error TEXT
         )",
         [],
     )
     .expect("create history table");
     conn.execute(
         "INSERT INTO transfers_history
-            (id, direction, peer_fingerprint, peer_name, items, status, bytes_transferred, total_bytes, revision, error, ended_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 0, NULL, 1)",
+            (id, direction, peer_fingerprint, peer_name, items, status, bytes_transferred, total_bytes, revision, started_at, ended_at, reason_code, error)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 0, 0, 1, NULL, NULL)",
         rusqlite::params![
             "bad-direction",
             "BROKEN_DIRECTION",

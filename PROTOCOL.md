@@ -15,6 +15,7 @@
 > - 已落地：Probe ALPN `dashdrop-probe/1` 接线（Discovery 调度、Server 识别后快速关闭）。
 > - 已落地：sender `Accept/Reject` 超时控制、`USER_RESPONSE_TIMEOUT_SECS=60`、目录 `Complete/Ack` 生命周期、`reason_code` 协议编码、fingerprint 限流、probe close `0xD0`。
 > - 已落地：接收端冲突策略执行（覆盖/重命名/跳过）与并发流上限配置接线（运行时可配）。
+> - 已落地：partial 结果失败项可被发送端按文件级重试（无需整任务重发）。
 > - 部分待补：协议文档中的“真实端到端集成测试要求”尚未完全达成（当前为单测+契约测试增强）。
 
 ---

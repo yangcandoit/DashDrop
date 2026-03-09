@@ -27,8 +27,11 @@ Current project status (single source of truth): [STATUS.md](./STATUS.md)
   - History 终态自动刷新、incoming 大小格式化、本地筛选已完成
   - History 已支持时间窗口筛选（24h/7d/30d）
   - Transfers 已支持批量取消活动任务与发送任务重试
+  - PartialCompleted 场景已支持“失败文件级重试”（不是整任务重发）
   - Trusted Devices 已支持配对时间、最近使用时间与别名编辑
   - Settings 已支持冲突策略（重命名/覆盖/跳过）与并发流配置
+  - 指标已持久化聚合（平均耗时/失败分布/终态计数/收发字节）
+  - 持久化已收口为 SQLite（`state.json` 仅用于一次性迁移读取）
 - 安全闭环：
   - 已落地 `security_events` 审计存储与查询命令
   - `fingerprint_changed` / `identity_mismatch` 均有 UI 告警消费路径

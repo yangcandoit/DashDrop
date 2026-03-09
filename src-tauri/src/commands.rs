@@ -3,7 +3,7 @@ use crate::state::{AppState, DeviceInfo, Platform, ReachabilityStatus, SessionIn
 use crate::transport::connect_to_peer;
 use crate::transport::sender::send_files;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,6 +21,18 @@ pub struct ConnectByAddressResult {
     pub name: String,
     pub trusted: bool,
     pub address: String,
+}
+
+async fn persist_runtime_state(state: &Arc<AppState>) -> Result<(), String> {
+    let config = state.config.read().await.clone();
+    let trusted = state.trusted_peers.read().await.clone();
+    let guard = state
+        .db
+        .lock()
+        .map_err(|_| "DB lock poisoned".to_string())?;
+    crate::db::save_app_config(&guard, &config).map_err(|e| e.to_string())?;
+    crate::db::replace_trusted_peers(&guard, &trusted).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 async fn accept_pending_transfer(
@@ -42,6 +54,35 @@ async fn reject_pending_transfer(pending_accepts: &PendingAcceptMap, transfer_id
     let tx = pending_accepts.write().await.remove(transfer_id);
     if let Some(sender) = tx {
         let _ = sender.send(false);
+    }
+}
+
+fn select_retry_paths(task: &crate::state::TransferTask) -> Result<Vec<String>, String> {
+    let Some(all_paths) = task.source_paths.clone() else {
+        return Err("retry source paths unavailable for this transfer".into());
+    };
+    let failed_ids = task.failed_file_ids.clone().unwrap_or_default();
+    if failed_ids.is_empty() {
+        return Ok(all_paths);
+    }
+
+    let mut unique = HashSet::new();
+    let mut subset_paths = Vec::new();
+    if let Some(mapping) = task.source_path_by_file_id.as_ref() {
+        for file_id in failed_ids {
+            if let Some(path) = mapping.get(&file_id) {
+                let path = path.clone();
+                if unique.insert(path.clone()) {
+                    subset_paths.push(path);
+                }
+            }
+        }
+    }
+
+    if subset_paths.is_empty() {
+        Ok(all_paths)
+    } else {
+        Ok(subset_paths)
     }
 }
 
@@ -73,12 +114,7 @@ pub async fn pair_device(fp: String, app: AppHandle, state: AppStateRef<'_>) -> 
         }
     };
     state.add_trust(fp, name).await;
-    {
-        let trusted = state.trusted_peers.read().await;
-        let config = state.config.read().await;
-        crate::persistence::save_state(&app, &config, &trusted)
-            .map_err(|e| format!("failed to persist pairing data: {e:#}"))?;
-    }
+    persist_runtime_state(&state).await?;
     Ok(())
 }
 
@@ -100,12 +136,7 @@ pub async fn unpair_device(
             app.emit("device_updated", &payload).ok();
         }
     }
-    {
-        let trusted = state.trusted_peers.read().await;
-        let config = state.config.read().await;
-        crate::persistence::save_state(&app, &config, &trusted)
-            .map_err(|e| format!("failed to persist pairing data: {e:#}"))?;
-    }
+    persist_runtime_state(&state).await?;
     Ok(())
 }
 
@@ -113,7 +144,7 @@ pub async fn unpair_device(
 pub async fn set_trusted_alias(
     fp: String,
     alias: Option<String>,
-    app: AppHandle,
+    _app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<(), String> {
     let normalized = alias.and_then(|a| {
@@ -133,10 +164,7 @@ pub async fn set_trusted_alias(
         true
     };
     if changed {
-        let trusted = state.trusted_peers.read().await;
-        let config = state.config.read().await;
-        crate::persistence::save_state(&app, &config, &trusted)
-            .map_err(|e| format!("failed to persist alias: {e:#}"))?;
+        persist_runtime_state(&state).await?;
     }
     Ok(())
 }
@@ -255,6 +283,9 @@ pub async fn send_files_cmd(
                         if !is_terminal {
                             t.status = crate::state::TransferStatus::Failed;
                             t.revision += 1;
+                            t.terminal_reason_code = Some("E_PROTOCOL".to_string());
+                            t.failed_file_ids =
+                                Some(t.items.iter().map(|item| item.file_id).collect());
                             t.error = Some(e.to_string());
                             t.ended_at = Some(std::time::Instant::now());
                             t.ended_at_unix = Some(
@@ -449,6 +480,8 @@ async fn cancel_transfer_inner(transfer_id: &str, app: &AppHandle, state: &Arc<A
             t.status = next_status;
             t.revision += 1;
         }
+        t.terminal_reason_code = Some("E_CANCELLED_BY_USER".to_string());
+        t.failed_file_ids = Some(t.items.iter().map(|item| item.file_id).collect());
         t.ended_at = Some(std::time::Instant::now());
         t.ended_at_unix = Some(
             std::time::SystemTime::now()
@@ -538,7 +571,7 @@ pub async fn retry_transfer(
     app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<(), String> {
-    let (peer_fp, source_paths) = {
+    let (peer_fp, retry_paths) = {
         let transfers = state.transfers.read().await;
         let Some(task) = transfers.get(&transfer_id) else {
             return Err(format!("transfer {transfer_id} not found in active cache"));
@@ -546,12 +579,17 @@ pub async fn retry_transfer(
         if task.direction != crate::state::TransferDirection::Send {
             return Err("retry is only supported for outgoing transfers".into());
         }
-        let Some(paths) = task.source_paths.clone() else {
-            return Err("retry source paths unavailable for this transfer".into());
-        };
-        (task.peer_fingerprint.clone(), paths)
+        if matches!(
+            task.status,
+            crate::state::TransferStatus::Draft
+                | crate::state::TransferStatus::PendingAccept
+                | crate::state::TransferStatus::Transferring
+        ) {
+            return Err("retry is only available after transfer reaches a terminal state".into());
+        }
+        (task.peer_fingerprint.clone(), select_retry_paths(task)?)
     };
-    send_files_cmd(peer_fp, source_paths, app, State::clone(&state)).await
+    send_files_cmd(peer_fp, retry_paths, app, State::clone(&state)).await
 }
 
 #[cfg(test)]
@@ -559,11 +597,11 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::state::{TransferDirection, TransferStatus};
+    use crate::state::{FileItemMeta, TransferDirection, TransferStatus, TransferTask};
     use tokio::sync::oneshot;
     use tokio::sync::RwLock;
 
-    use super::{accept_pending_transfer, reject_pending_transfer};
+    use super::{accept_pending_transfer, reject_pending_transfer, select_retry_paths};
 
     #[tokio::test]
     async fn accept_pending_transfer_sends_true() {
@@ -611,6 +649,77 @@ mod tests {
         };
         assert_eq!(sender_terminal, TransferStatus::CancelledBySender);
         assert_eq!(receiver_terminal, TransferStatus::CancelledByReceiver);
+    }
+
+    #[test]
+    fn retry_paths_selects_only_failed_file_entries() {
+        let mut mapping = HashMap::new();
+        mapping.insert(1, "/tmp/a.txt".to_string());
+        mapping.insert(2, "/tmp/b.txt".to_string());
+        let task = TransferTask {
+            id: "t1".into(),
+            direction: TransferDirection::Send,
+            peer_fingerprint: "fp".into(),
+            peer_name: "peer".into(),
+            items: vec![
+                FileItemMeta {
+                    file_id: 1,
+                    name: "a.txt".into(),
+                    rel_path: "a.txt".into(),
+                    size: 1,
+                },
+                FileItemMeta {
+                    file_id: 2,
+                    name: "b.txt".into(),
+                    rel_path: "b.txt".into(),
+                    size: 1,
+                },
+            ],
+            status: TransferStatus::PartialCompleted,
+            bytes_transferred: 1,
+            total_bytes: 2,
+            revision: 2,
+            started_at_unix: 1,
+            ended_at_unix: Some(2),
+            terminal_reason_code: Some("E_HASH_MISMATCH".into()),
+            error: None,
+            source_paths: Some(vec!["/tmp/a.txt".into(), "/tmp/b.txt".into()]),
+            source_path_by_file_id: Some(mapping),
+            failed_file_ids: Some(vec![2]),
+            conn: None,
+            ended_at: None,
+        };
+        let selected = select_retry_paths(&task).expect("retry paths");
+        assert_eq!(selected, vec!["/tmp/b.txt".to_string()]);
+    }
+
+    #[test]
+    fn retry_paths_falls_back_to_all_paths_when_mapping_missing() {
+        let task = TransferTask {
+            id: "t2".into(),
+            direction: TransferDirection::Send,
+            peer_fingerprint: "fp".into(),
+            peer_name: "peer".into(),
+            items: vec![],
+            status: TransferStatus::Failed,
+            bytes_transferred: 0,
+            total_bytes: 0,
+            revision: 1,
+            started_at_unix: 1,
+            ended_at_unix: Some(2),
+            terminal_reason_code: Some("E_PROTOCOL".into()),
+            error: None,
+            source_paths: Some(vec!["/tmp/a.txt".into(), "/tmp/b.txt".into()]),
+            source_path_by_file_id: None,
+            failed_file_ids: Some(vec![99]),
+            conn: None,
+            ended_at: None,
+        };
+        let selected = select_retry_paths(&task).expect("fallback paths");
+        assert_eq!(
+            selected,
+            vec!["/tmp/a.txt".to_string(), "/tmp/b.txt".to_string()]
+        );
     }
 }
 
@@ -687,12 +796,7 @@ pub async fn set_app_config(
             ));
         }
     }
-    {
-        let trusted = state.trusted_peers.read().await;
-        let config = state.config.read().await;
-        crate::persistence::save_state(&app, &config, &trusted)
-            .map_err(|e| format!("failed to persist app config: {e:#}"))?;
-    }
+    persist_runtime_state(&state).await?;
     Ok(())
 }
 
@@ -763,5 +867,6 @@ pub async fn get_runtime_status(
 pub async fn get_transfer_metrics(
     state: AppStateRef<'_>,
 ) -> Result<crate::state::TransferMetrics, String> {
-    Ok(state.transfer_metrics().await)
+    let guard = state.db.lock().map_err(|_| "DB lock poisoned")?;
+    crate::db::get_transfer_metrics(&guard).map_err(|e| e.to_string())
 }
