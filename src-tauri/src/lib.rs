@@ -146,7 +146,7 @@ pub fn run() {
             // Start async subsystems
             let state2 = Arc::clone(&state);
             let handle2 = handle.clone();
-            tokio::spawn(async move {
+            tauri::async_runtime::spawn(async move {
                 // 1. Start QUIC server → get port
                 let port = match transport::start_server(
                     state2.identity.clone(),
@@ -194,7 +194,7 @@ pub fn run() {
 
             // Start Memory Cleanup Background loop
             let state_cleanup = Arc::clone(&state);
-            tokio::spawn(async move {
+            tauri::async_runtime::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
                 loop {
                     interval.tick().await;
