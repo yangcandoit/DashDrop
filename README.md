@@ -16,7 +16,7 @@ Current project status (single source of truth): [STATUS.md](./STATUS.md)
   - `npm run build` 已接入 CI 并通过
   - `npm run test:e2e`（Playwright UI E2E）已接入 CI 并通过
   - `npm run test:e2e:contract`（契约脚本级 E2E）已接入 CI 并通过
-  - 已新增安全扫描工作流：`security-audit.yml`（cargo audit + npm audit）与 `codeql.yml`
+  - 已新增安全扫描：`security-audit.yml`（cargo audit + npm audit）+ GitHub Code Scanning default setup
   - 已新增 `dependabot.yml`（Actions/npm/cargo 依赖周更）
   - 已新增安装包发布流水线增强：标准化产物命名、烟测、可选签名/公证钩子、发布校验和
   - 已新增发布与升级模板文档：`docs/RELEASE_NOTES_TEMPLATE.md`、`docs/UPGRADE_MIGRATION_TEMPLATE.md`

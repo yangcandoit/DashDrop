@@ -84,7 +84,7 @@ Estimated completion:
   - `npm run test:e2e`
 - Added GitHub security workflows:
   - `.github/workflows/security-audit.yml` (`cargo audit` + `npm audit`)
-  - `.github/workflows/codeql.yml` (JavaScript/TypeScript CodeQL scan)
+  - GitHub Code Scanning default setup (避免与 advanced CodeQL workflow 冲突)
 - Added dependency automation:
   - `.github/dependabot.yml` (GitHub Actions + npm + cargo weekly updates)
 - Build installer workflow hardened:

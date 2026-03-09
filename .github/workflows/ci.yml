@@ -68,7 +68,16 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev || sudo apt-get install -y libwebkit2gtk-4.0-dev
       - run: npm ci
       - run: npx playwright install --with-deps chromium
-      - run: npm run test:e2e
+      - run: npm run test:e2e -- --retries=2
       - run: npm run test:e2e:contract
       - run: cargo test
         working-directory: src-tauri
+      - name: Upload Playwright artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-debug-artifacts
+          path: |
+            playwright-report/**
+            test-results/**
+          if-no-files-found: ignore

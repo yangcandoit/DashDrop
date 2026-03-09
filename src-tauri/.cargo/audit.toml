@@ -1,0 +1,7 @@
+[advisories]
+# Temporary ignore:
+# - RUSTSEC-2026-0009 is currently pinned transitively via mac-notification-sys (=0.6.10)
+#   from tauri-plugin-notification/notify-rust chain; no compatible override is available yet.
+ignore = [
+  "RUSTSEC-2026-0009",
+]

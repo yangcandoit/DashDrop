@@ -45,7 +45,7 @@
   - [x] E2E（`npm run test:e2e` Playwright UI 自动化）
   - [x] E2E contract（`npm run test:e2e:contract` 脚本级契约）
   - [x] `cargo clippy --all-targets --all-features`
-- [x] 安全扫描门禁与定时任务（`.github/workflows/security-audit.yml` + `.github/workflows/codeql.yml`）。
+- [x] 安全扫描门禁与定时任务（`.github/workflows/security-audit.yml` + GitHub Code Scanning default setup）。
 - [x] 依赖自动更新（`.github/dependabot.yml` 覆盖 GitHub Actions / npm / cargo）。
 - [x] 安装包流水线与发布资产上传（`.github/workflows/build-installers.yml`，含 `SHA256SUMS.txt`）。
 
