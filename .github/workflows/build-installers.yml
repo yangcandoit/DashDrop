@@ -193,30 +193,33 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-bundle
-          shopt -s globstar nullglob
-          files=(
-            src-tauri/target/release/bundle/**/*.msi
-            src-tauri/target/release/bundle/**/*.exe
-            src-tauri/target/release/bundle/**/*.dmg
-            src-tauri/target/release/bundle/**/*.app.tar.gz
-            src-tauri/target/release/bundle/**/*.app
-            src-tauri/target/release/bundle/**/*.AppImage
-            src-tauri/target/release/bundle/**/*.deb
-            src-tauri/target/release/bundle/**/*.rpm
-          )
-          if [[ ${#files[@]} -eq 0 ]]; then
-            echo "No installer bundles found."
-            exit 1
-          fi
-          for src in "${files[@]}"; do
+          count=0
+
+          while IFS= read -r -d '' src; do
             base="$(basename "${src}")"
             if [[ -d "${src}" && "${base}" == *.app ]]; then
               tarball="${APP_NAME}-${{ steps.release_meta.outputs.label }}-${{ matrix.platform }}-${base}.tar.gz"
               tar -czf "release-bundle/${tarball}" -C "$(dirname "${src}")" "${base}"
+              count=$((count + 1))
             else
               cp "${src}" "release-bundle/${APP_NAME}-${{ steps.release_meta.outputs.label }}-${{ matrix.platform }}-${base}"
+              count=$((count + 1))
             fi
-          done
+          done < <(find src-tauri/target/release/bundle -type d -name '*.app' -print0)
+
+          while IFS= read -r -d '' src; do
+            base="$(basename "${src}")"
+            cp "${src}" "release-bundle/${APP_NAME}-${{ steps.release_meta.outputs.label }}-${{ matrix.platform }}-${base}"
+            count=$((count + 1))
+          done < <(find src-tauri/target/release/bundle -type f \( \
+            -name '*.msi' -o -name '*.exe' -o -name '*.dmg' -o -name '*.app.tar.gz' -o \
+            -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \
+          \) -print0)
+
+          if [[ "${count}" -eq 0 ]]; then
+            echo "No installer bundles found."
+            exit 1
+          fi
           ls -lh release-bundle
 
       - name: Smoke check bundled artifacts
