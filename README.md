@@ -7,7 +7,7 @@ Current project status (single source of truth): [STATUS.md](./STATUS.md)
 
 ---
 
-## 📌 当前状态（截至 2026-03-09）
+## 📌 当前状态（截至 2026-03-10）
 
 - 构建与测试：
   - `cargo check` 已接入 CI 并通过
@@ -27,6 +27,7 @@ Current project status (single source of truth): [STATUS.md](./STATUS.md)
   - 已引入稳定 DTO（`DeviceView/SessionView/TransferView`），前端不再依赖 `SocketAddr/Instant`
 - 功能补齐：
   - 已实现 `connect_by_address`（返回远端指纹摘要并进入确认/可选配对流程）
+  - Nearby 对未信任设备发送前增加指纹确认弹窗（可选立即配对）
   - 已实现 trusted-only auto-accept（`auto_accept_trusted_only`）
   - 已实现 Reachable Probe（ALPN `dashdrop-probe/1`）与 `Offline` 状态收敛（15s 宽限）
   - History 终态自动刷新、incoming 大小格式化、本地筛选已完成
@@ -41,6 +42,8 @@ Current project status (single source of truth): [STATUS.md](./STATUS.md)
   - 已落地 `security_events` 审计存储与查询命令
   - `fingerprint_changed` / `identity_mismatch` 均有 UI 告警消费路径
   - Linux/Windows keyring 不可用时支持降级并在设置页显示高风险提示
+  - 限流策略已同时覆盖 IP 级与 fingerprint 级连接/Offer窗口
+  - 启动配置目录解析失败时改为显式报错，不再静默回退到当前目录
 - 用户体验：
   - 已提供首启 Onboarding（本地持久化关闭）
 - 仍在进行：

@@ -234,8 +234,8 @@ async fn handle_resolved(
         device.trusted = trusted;
         device.last_seen = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         if !device.sessions.is_empty()
             && matches!(
                 device.reachability,

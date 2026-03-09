@@ -284,6 +284,10 @@ pub struct AppState {
     /// Incoming offer rate limiter keyed by peer fingerprint.
     pub offer_rate_limits: Arc<tokio::sync::Mutex<HashMap<String, (u32, std::time::Instant)>>>,
 
+    /// Incoming connection rate limiter keyed by peer certificate fingerprint.
+    pub incoming_conn_rate_limits:
+        Arc<tokio::sync::Mutex<HashMap<String, (u32, std::time::Instant)>>>,
+
     /// Deduplicate noisy fingerprint-changed warnings by session/fingerprint tuple.
     /// key = "{session_id}|{previous_fp}|{current_fp}", value = last_emitted_unix
     pub fingerprint_change_alerts: Arc<tokio::sync::Mutex<HashMap<String, u64>>>,
@@ -315,6 +319,7 @@ impl AppState {
             local_port: Arc::new(RwLock::new(0)),
             pending_accepts: Arc::new(RwLock::new(HashMap::new())),
             offer_rate_limits: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            incoming_conn_rate_limits: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             fingerprint_change_alerts: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             endpoint: tokio::sync::OnceCell::new(),
             mdns: tokio::sync::OnceCell::new(),

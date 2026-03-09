@@ -25,6 +25,7 @@
 - [x] 明确并实现“安全存储不可用”策略（本轮为“降级可用 + 明确告警”）。
 - [x] 建立安全事件审计最小集（`identity_mismatch` / `handshake_failed` 已落地 SQLite）。
 - [x] `fingerprint_changed` 告警链路与审计落地（事件 emit + UI 消费 + SQLite 记录）。
+- [x] 未信任设备发送前强制指纹确认（Nearby 首次发送确认弹窗，可选立即配对）。
 
 ### 3. 传输一致性
 - [x] 校验所有失败事件 payload 统一为：`transfer_id + reason + phase`（已通过统一 emit 函数收口）。

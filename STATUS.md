@@ -1,6 +1,6 @@
 # DashDrop Status
 
-Last updated: 2026-03-09
+Last updated: 2026-03-10
 
 ## Overall
 
@@ -41,9 +41,12 @@ Estimated completion:
 - Transfer `reason_code` now uses protocol-style `E_*` mapping instead of Rust `Debug` names.
 - Sender directory items now emit directory `Complete` and await receiver `Ack` (no silent directory bypass).
 - Incoming offer rate limiting now includes fingerprint-level policy (trusted=10/min, untrusted=3/min).
+- Incoming connection rate limiting now includes fingerprint-level windows in addition to IP windows.
 - Probe close code now uses `0xD0` to match architecture/protocol docs.
 - `set_app_config` mDNS rename re-register failure now emits user-visible `system_error` and rolls back config.
 - `set_app_config` rollback error now carries structured `code/context` payload for precise frontend rendering.
+- Discovery updates no longer use production `unwrap()` on system time conversion.
+- Startup config directory resolution is now strict and fails fast if path resolution is unavailable.
 - Runtime persistence now uses SQLite as the single store (`app_config_store`, `trusted_peers_store`, `transfers_history`, `security_events`).
 - Legacy `state.json` is retained as read-only one-time migration input.
 - Sender spawn error fallback now marks all non-terminal states (including `Draft`) as `Failed`.
@@ -62,6 +65,7 @@ Estimated completion:
 - `sendingTo` behavior moved from local component ref to global transfer-lifecycle-derived state.
 - Transfers page supports connect-by-address entry (with fingerprint confirmation prompt).
 - Connect-by-address now supports confirm -> optional remember/pair flow (`pair_device`).
+- Nearby first-send to untrusted device now requires explicit fingerprint confirmation before transfer.
 - Transfers page supports active-task batch cancel and outgoing transfer retry.
 - PartialCompleted transfer retry now performs failed-file-only retry (uses stored `failed_file_ids` + source map).
 - Incoming request total size is now human-formatted.
@@ -124,6 +128,8 @@ Estimated completion:
 - Playwright E2E currently uses injected mock IPC backend (real UI + mocked backend contract), not a full Tauri runtime orchestration test.
 - Backend新增 `src-tauri/tests/phase_d_contract.rs` 为跨模块合同集成测试；真实多进程/多主机 QUIC 编排压测仍可继续扩展。
 - Code-signing / notarization currently remains optional hooks; production certificates and notarization credentials still need to be configured in repository secrets.
+- First-contact trust model remains TOFU; UI now enforces fingerprint confirmation for untrusted targets, but QR/out-of-band cryptographic verification is still planned for v0.2.
+- Linux GUI stack still includes GTK3/WebKit2GTK transitively via Tauri runtime; long-term mitigation is upgrading runtime dependency chain.
 
 ## Validation snapshot
 

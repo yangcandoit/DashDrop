@@ -27,6 +27,19 @@ pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppSta
     // 1. Extract peer TLS certificate fingerprint
     let peer_cert_fp = extract_peer_fp(&conn)?;
 
+    if check_connection_rate_limit(&state, &peer_cert_fp)
+        .await
+        .is_some()
+    {
+        tracing::warn!(
+            peer_fp = %peer_cert_fp,
+            phase = "incoming",
+            "incoming connection rate limited"
+        );
+        conn.close(quinn::VarInt::from_u32(1), b"rate limited");
+        return Ok(());
+    }
+
     // 2. Auxiliary identity signal: compare against mDNS-by-IP and emit warning if mismatched.
     // Security decision is enforced by initiator-side fingerprint binding.
     let mismatch = {
@@ -255,6 +268,28 @@ async fn check_offer_rate_limit(state: &Arc<AppState>, peer_fp: &str) -> Option<
         3
     };
     let mut limiter = state.offer_rate_limits.lock().await;
+    let (count, window_start) = limiter
+        .entry(peer_fp.to_string())
+        .or_insert((0, Instant::now()));
+    if window_start.elapsed() > Duration::from_secs(60) {
+        *count = 0;
+        *window_start = Instant::now();
+    }
+    *count += 1;
+    if *count > limit {
+        Some(ErrorCode::RateLimited)
+    } else {
+        None
+    }
+}
+
+async fn check_connection_rate_limit(state: &Arc<AppState>, peer_fp: &str) -> Option<ErrorCode> {
+    let limit = if state.is_trusted(peer_fp).await {
+        40
+    } else {
+        12
+    };
+    let mut limiter = state.incoming_conn_rate_limits.lock().await;
     let (count, window_start) = limiter
         .entry(peer_fp.to_string())
         .or_insert((0, Instant::now()));

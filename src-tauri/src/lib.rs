@@ -28,6 +28,20 @@ fn show_startup_error_dialog<R: tauri::Runtime, T: tauri::Manager<R>>(app: &T, m
         .show(|_| {});
 }
 
+fn resolve_config_dir<R: tauri::Runtime, T: tauri::Manager<R>>(
+    app: &T,
+) -> anyhow::Result<PathBuf> {
+    if let Ok(override_dir) = std::env::var("DASHDROP_CONFIG_DIR") {
+        return Ok(PathBuf::from(override_dir));
+    }
+
+    let base = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| anyhow::anyhow!("failed to resolve app config directory: {e}"))?;
+    Ok(base.join("dashdrop"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -47,14 +61,15 @@ pub fn run() {
             let handle = app.handle().clone();
 
             // Config directory: ~/.config/dashdrop/ (or via env var for testing)
-            let config_dir = std::env::var("DASHDROP_CONFIG_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| {
-                    app.path()
-                        .app_config_dir()
-                        .unwrap_or_else(|_| PathBuf::from("."))
-                        .join("dashdrop")
-                });
+            let config_dir = match resolve_config_dir(app) {
+                Ok(path) => path,
+                Err(e) => {
+                    let message = format!("Failed to resolve configuration directory.\n\n{e:#}");
+                    tracing::error!("{message}");
+                    show_startup_error_dialog(app, &message);
+                    return Err(anyhow::anyhow!(message).into());
+                }
+            };
 
             // Initialize identity
             let identity = match Identity::load_or_create(&config_dir) {
