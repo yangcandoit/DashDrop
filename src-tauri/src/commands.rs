@@ -251,7 +251,10 @@ pub async fn send_files_cmd(
         if connect_errors.is_empty() {
             "All connection attempts failed".to_string()
         } else {
-            format!("All connection attempts failed ({})", connect_errors.join(" | "))
+            format!(
+                "All connection attempts failed ({})",
+                connect_errors.join(" | ")
+            )
         }
     })?;
 
@@ -406,7 +409,10 @@ pub async fn connect_by_address(
         if connect_errors.is_empty() {
             "all connection attempts failed".to_string()
         } else {
-            format!("all connection attempts failed ({})", connect_errors.join(" | "))
+            format!(
+                "all connection attempts failed ({})",
+                connect_errors.join(" | ")
+            )
         }
     })?;
     let fingerprint = crate::transport::handshake::extract_peer_fp(&conn)

@@ -18,7 +18,7 @@ fn is_usable_peer_addr(addr: &SocketAddr) -> bool {
         return false;
     }
     match addr {
-        SocketAddr::V4(v4) => !v4.ip().is_link_local(),
+        SocketAddr::V4(_v4) => true,
         // Link-local IPv6 without scope id is typically not routable to peer.
         SocketAddr::V6(v6) => !(v6.ip().is_unicast_link_local() && v6.scope_id() == 0),
     }

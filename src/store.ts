@@ -394,8 +394,10 @@ export async function initAppStore() {
           actionableMessage(
             payload.message,
             [
-              "Allow Local Network access for DashDrop in system privacy settings.",
-              "Confirm both peers are on the same LAN, then relaunch the app.",
+              "Allow Local Network access for DashDrop in macOS privacy settings.",
+              "On Windows, ensure UDP port 5353 is allowed in Windows Defender Firewall.",
+              "On Linux, check if avahi-daemon is conflicting on port 5353 or ufw is blocking it.",
+              "Alternatively, use 'Connect by Address' if mDNS is unavailable.",
             ],
           ),
           0,

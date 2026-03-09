@@ -195,11 +195,7 @@ pub fn emit_transfer_error_with_detail(
     if let Some(d) = detail {
         payload["detail"] = serde_json::json!(d);
     }
-    emit_json(
-        app,
-        "transfer_error",
-        payload,
-    );
+    emit_json(app, "transfer_error", payload);
 }
 
 #[cfg(test)]

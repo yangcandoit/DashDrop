@@ -36,8 +36,10 @@ impl Identity {
         let (key_der, cert_der) = if cert_path.exists() {
             let cd = fs::read(&cert_path).context("read identity cert")?;
             let key_der = if secure_store {
-                match crate::crypto::secret_store::load_private_key(KEYCHAIN_SERVICE, &secure_account)
-                {
+                match crate::crypto::secret_store::load_private_key(
+                    KEYCHAIN_SERVICE,
+                    &secure_account,
+                ) {
                     Ok(Some(kd)) => kd,
                     Ok(None) => {
                         if key_path.exists() {
@@ -73,7 +75,8 @@ impl Identity {
                                 fs::write(&key_path, &new_kd)
                                     .context("write regenerated identity key fallback")?;
                             }
-                            fs::write(&cert_path, &new_cd).context("write regenerated identity cert")?;
+                            fs::write(&cert_path, &new_cd)
+                                .context("write regenerated identity cert")?;
                             return Self::from_parts(new_kd, new_cd);
                         }
                     }
@@ -88,7 +91,8 @@ impl Identity {
                             let (new_kd, new_cd) = Self::generate()?;
                             fs::write(&key_path, &new_kd)
                                 .context("write regenerated identity key fallback")?;
-                            fs::write(&cert_path, &new_cd).context("write regenerated identity cert")?;
+                            fs::write(&cert_path, &new_cd)
+                                .context("write regenerated identity cert")?;
                             return Self::from_parts(new_kd, new_cd);
                         }
                     }
@@ -105,8 +109,7 @@ impl Identity {
                     KEYCHAIN_SERVICE,
                     &secure_account,
                     &kd,
-                )
-                {
+                ) {
                     tracing::warn!("write identity key to secure store failed: {e:#}");
                     secure_store = false;
                     fs::write(&key_path, &kd).context("write identity key fallback")?;

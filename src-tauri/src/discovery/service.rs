@@ -48,18 +48,33 @@ async fn register_on_daemon(mdns: &ServiceDaemon, state: &Arc<AppState>) -> Resu
 
     let instance_name = sanitize_mdns_name(&device_name);
 
+    let mut ips = Vec::new();
+    if let Ok(interfaces) = if_addrs::get_if_addrs() {
+        for iface in interfaces {
+            if iface.is_loopback() {
+                continue;
+            }
+            ips.push(iface.addr.ip());
+        }
+    }
+
+    let ip_str = ips
+        .iter()
+        .map(|ip| ip.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
     let fqdn = format!("{}.local.", instance_name);
 
     let service_info = ServiceInfo::new(
         SERVICE_TYPE,
         &instance_name,
         &fqdn,
-        "", // empty addr = use all interfaces
+        ip_str.as_str(),
         port,
         Some(properties),
     )
-    .context("build ServiceInfo")?
-    .enable_addr_auto();
+    .context("build ServiceInfo")?;
 
     let fullname = service_info.get_fullname().to_string();
 

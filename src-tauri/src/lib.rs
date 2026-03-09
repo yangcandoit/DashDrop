@@ -28,9 +28,7 @@ fn show_startup_error_dialog<R: tauri::Runtime, T: tauri::Manager<R>>(app: &T, m
         .show(|_| {});
 }
 
-fn resolve_config_dir<R: tauri::Runtime, T: tauri::Manager<R>>(
-    app: &T,
-) -> anyhow::Result<PathBuf> {
+fn resolve_config_dir<R: tauri::Runtime, T: tauri::Manager<R>>(app: &T) -> anyhow::Result<PathBuf> {
     if let Ok(override_dir) = std::env::var("DASHDROP_CONFIG_DIR") {
         return Ok(PathBuf::from(override_dir));
     }
