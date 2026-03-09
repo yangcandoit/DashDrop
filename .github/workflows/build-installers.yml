@@ -6,8 +6,43 @@ on:
     tags:
       - "v*"
 
+concurrency:
+  group: installers-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+          sudo apt-get install -y libwebkit2gtk-4.1-dev || sudo apt-get install -y libwebkit2gtk-4.0-dev
+      - name: Install JS deps
+        run: npm ci
+      - name: Frontend build
+        run: npm run build
+      - run: cargo check
+        working-directory: src-tauri
+      - run: cargo test
+        working-directory: src-tauri
+
   bundle:
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
@@ -21,6 +56,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -30,6 +66,7 @@ jobs:
           cache: npm
 
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
       - name: Install Linux system deps
         if: runner.os == 'Linux'
@@ -52,8 +89,16 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dashdrop-${{ matrix.platform }}
-          path: src-tauri/target/release/bundle/**/*
+          path: |
+            src-tauri/target/release/bundle/**/*.msi
+            src-tauri/target/release/bundle/**/*.exe
+            src-tauri/target/release/bundle/**/*.dmg
+            src-tauri/target/release/bundle/**/*.app.tar.gz
+            src-tauri/target/release/bundle/**/*.AppImage
+            src-tauri/target/release/bundle/**/*.deb
+            src-tauri/target/release/bundle/**/*.rpm
           if-no-files-found: error
+          retention-days: 14
 
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
@@ -67,7 +112,12 @@ jobs:
         with:
           pattern: dashdrop-*
           path: release-assets
-          merge-multiple: false
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd release-assets
+          find . -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
 
       - name: Publish GitHub Release assets
         uses: softprops/action-gh-release@v2
@@ -77,3 +127,4 @@ jobs:
           generate_release_notes: true
           files: |
             release-assets/**/*
+          fail_on_unmatched_files: true
