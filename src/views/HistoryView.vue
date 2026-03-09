@@ -179,14 +179,15 @@ const filteredHistory = computed(() => {
   height: 100%;
   display: flex;
   flex-direction: column;
-  background: linear-gradient(190deg, rgba(255, 255, 255, 0.34), transparent 32%);
+  background: var(--surface);
 }
 
 .view-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 26px 28px 12px;
+  padding: 20px 22px 12px;
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 .title-wrap {
@@ -197,7 +198,7 @@ const filteredHistory = computed(() => {
 
 .content {
   flex: 1;
-  padding: 0 28px 24px;
+  padding: 14px 22px 22px;
   overflow-y: auto;
 }
 
@@ -215,7 +216,7 @@ const filteredHistory = computed(() => {
   padding: 8px 10px;
   border-radius: 10px;
   border: 1px solid var(--border-subtle);
-  background: rgba(255, 255, 255, 0.75);
+  background: #fff;
   color: var(--text-secondary);
 }
 
@@ -224,9 +225,9 @@ const filteredHistory = computed(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(255, 255, 255, 0.42);
-  border: 1px dashed var(--border-subtle);
-  border-radius: 16px;
+  background: var(--surface-muted);
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
 }
 
 .history-list {
@@ -240,11 +241,10 @@ const filteredHistory = computed(() => {
   justify-content: space-between;
   align-items: center;
   gap: 14px;
-  padding: 14px;
-  background: rgba(255, 255, 255, 0.75);
+  padding: 12px;
+  background: #fff;
   border: 1px solid var(--border-subtle);
-  border-radius: 14px;
-  box-shadow: var(--shadow-card);
+  border-radius: 12px;
 }
 
 .card-left {
@@ -273,7 +273,7 @@ const filteredHistory = computed(() => {
   padding: 4px 8px;
   border-radius: 999px;
   border: 1px solid var(--border-subtle);
-  background: rgba(255,255,255,0.1);
+  background: #f2f2f7;
   font-weight: 600;
   letter-spacing: 0.02em;
 }
@@ -283,8 +283,8 @@ const filteredHistory = computed(() => {
 .status-badge.cancelledbyuser,
 .status-badge.cancelledbysender,
 .status-badge.cancelledbyreceiver,
-.status-badge.rejected { background: rgba(154, 93, 28, 0.12); color: #9a5d1c; }
-.status-badge.partialcompleted { background: rgba(178, 79, 52, 0.14); color: #7f3f2b; }
+.status-badge.rejected { background: rgba(178, 106, 0, 0.12); color: #8a5300; }
+.status-badge.partialcompleted { background: rgba(178, 106, 0, 0.12); color: #8a5300; }
 
 .folder-btn {
   min-height: 28px;

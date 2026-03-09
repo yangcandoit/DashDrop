@@ -195,14 +195,15 @@ onMounted(loadPeers);
   display: flex;
   flex-direction: column;
   position: relative;
-  background: linear-gradient(190deg, rgba(255, 255, 255, 0.33), transparent 32%);
+  background: var(--surface);
 }
 
 .view-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 26px 28px 12px;
+  padding: 20px 22px 12px;
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 .title-wrap {
@@ -213,7 +214,7 @@ onMounted(loadPeers);
 
 .content {
   flex: 1;
-  padding: 0 28px 24px;
+  padding: 14px 22px 22px;
   overflow-y: auto;
 }
 
@@ -224,9 +225,9 @@ onMounted(loadPeers);
   gap: 10px;
   align-items: center;
   justify-content: center;
-  background: rgba(255, 255, 255, 0.45);
-  border: 1px dashed var(--border-subtle);
-  border-radius: 16px;
+  background: var(--surface-muted);
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
 }
 
 .empty-illus {
@@ -248,11 +249,10 @@ onMounted(loadPeers);
   justify-content: space-between;
   align-items: center;
   gap: 12px;
-  padding: 14px;
-  border-radius: 14px;
+  padding: 12px;
+  border-radius: 12px;
   border: 1px solid var(--border-subtle);
-  background: rgba(255, 255, 255, 0.75);
-  box-shadow: var(--shadow-card);
+  background: #fff;
 }
 
 .name-row {
@@ -291,8 +291,8 @@ onMounted(loadPeers);
 }
 
 .online-chip.offline {
-  color: #8b806a;
-  background: rgba(164, 152, 129, 0.12);
+  color: var(--text-muted);
+  background: #f2f2f7;
 }
 
 .fingerprint {

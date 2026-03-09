@@ -16,28 +16,20 @@ let dragDropUnlisten: (() => void) | null = null;
 
 onMounted(async () => {
   dragDropUnlisten = await getCurrentWebview().onDragDropEvent(async (event) => {
-    if (event.payload.type !== 'drop') {
-      return;
-    }
+    if (event.payload.type !== 'drop') return;
 
     const paths = event.payload.paths;
     const targetFp = activeDropTargetFp.value;
     activeDropTargetFp.value = null;
 
     if (!targetFp) {
-      await message('Drop files directly on a device card.', {
-        title: 'No target device',
-        kind: 'warning',
-      });
+      await message('Drop files directly on a device card.', { title: 'No target device', kind: 'warning' });
       return;
     }
 
     const target = devices.value.find((d) => d.fingerprint === targetFp);
     if (!target) {
-      await message('Selected device is no longer available.', {
-        title: 'Device unavailable',
-        kind: 'warning',
-      });
+      await message('Selected device is no longer available.', { title: 'Device unavailable', kind: 'warning' });
       return;
     }
 
@@ -106,7 +98,7 @@ const sendGivenPathsToDevice = async (paths: string[], device: DeviceView) => {
       </div>
       <div class="header-actions" v-if="myIdentity">
         <div class="my-identity">
-          <span class="identity-label">This device</span>
+          <span class="identity-label">This Device</span>
           <span class="identity-name">{{ myIdentity.device_name }}</span>
         </div>
         <button @click="emit('openSettings')" class="btn btn-secondary">Settings</button>
@@ -146,31 +138,32 @@ const sendGivenPathsToDevice = async (paths: string[], device: DeviceView) => {
   height: 100%;
   display: flex;
   flex-direction: column;
-  background: linear-gradient(160deg, rgba(255, 255, 255, 0.4), transparent 35%);
+  background: var(--surface);
 }
 
 .view-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  gap: 14px;
-  padding: 26px 28px 14px;
+  gap: 12px;
+  padding: 20px 22px 12px;
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 .title-wrap {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
 }
 
 .subtitle {
-  font-size: 0.86rem;
+  font-size: 0.9rem;
 }
 
 .header-actions {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
 }
 
 .my-identity {
@@ -178,69 +171,57 @@ const sendGivenPathsToDevice = async (paths: string[], device: DeviceView) => {
   flex-direction: column;
   align-items: flex-end;
   gap: 2px;
-  padding: 7px 10px;
+  padding: 6px 10px;
   border-radius: 10px;
   border: 1px solid var(--border-subtle);
-  background: rgba(255, 255, 255, 0.5);
+  background: var(--surface-muted);
 }
 
 .identity-label {
-  font-size: 0.66rem;
+  font-size: 0.68rem;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.06em;
   color: var(--text-subtle);
 }
 
 .identity-name {
-  font-size: 0.86rem;
+  font-size: 0.88rem;
   font-weight: 600;
   color: var(--text-secondary);
 }
 
 .content {
   flex: 1;
-  padding: 0 28px 26px;
-  display: flex;
-  flex-direction: column;
-  gap: 20px;
+  padding: 14px 22px 22px;
   overflow-y: auto;
-}
-
-.devices-section {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
 }
 
 .devices-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 10px;
 }
 
 .empty-state {
-  min-height: 210px;
+  min-height: 200px;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: 8px;
-  border: 1px dashed var(--border-subtle);
-  border-radius: 18px;
-  background: rgba(255, 255, 255, 0.42);
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  background: var(--surface-muted);
   color: var(--text-secondary);
 }
 
 .incoming-hint {
-  margin: 0 28px 20px auto;
-  padding: 7px 10px;
+  margin: 0 22px 16px auto;
+  padding: 6px 10px;
   border-radius: 999px;
   border: 1px solid var(--border-subtle);
-  background: rgba(255, 255, 255, 0.75);
-  color: var(--text-secondary);
+  color: var(--text-muted);
   font-size: 0.76rem;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
 }
 
 @media (max-width: 820px) {
@@ -252,6 +233,10 @@ const sendGivenPathsToDevice = async (paths: string[], device: DeviceView) => {
   .header-actions {
     width: 100%;
     justify-content: space-between;
+  }
+
+  .devices-grid {
+    grid-template-columns: 1fr;
   }
 }
 </style>

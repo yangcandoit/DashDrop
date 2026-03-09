@@ -19,13 +19,26 @@ fn classify_runtime_send_error(detail: &str) -> (&'static str, &'static str) {
     let s = detail.to_ascii_lowercase();
     if s.contains("timeout") || s.contains("timed out") {
         ("E_TIMEOUT", "Timeout")
+    } else if s.contains("message too large") {
+        ("E_PROTOCOL", "OfferTooLarge")
+    } else if s.contains("expected offer")
+        || s.contains("expected accept/reject")
+        || s.contains("expected hello")
+        || s.contains("read hello failed")
+        || s.contains("read offer failed")
+    {
+        ("E_PROTOCOL", "ProtocolSequenceError")
     } else if s.contains("identity mismatch") {
         ("E_IDENTITY_MISMATCH", "IdentityMismatch")
     } else if s.contains("version") && s.contains("mismatch") {
         ("E_VERSION_MISMATCH", "VersionMismatch")
     } else if s.contains("rate limit") {
         ("E_RATE_LIMITED", "RateLimited")
-    } else if s.contains("read len") || s.contains("read body") {
+    } else if s.contains("read len")
+        || s.contains("read body")
+        || s.contains("control stream")
+        || s.contains("stream closed")
+    {
         ("E_PROTOCOL", "ControlStreamClosed")
     } else {
         ("E_PROTOCOL", "SystemError")

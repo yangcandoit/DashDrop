@@ -133,10 +133,8 @@ watch(() => props.status, (newStatus) => {
 
 .status-badge {
   font-size: 0.8rem;
-  font-weight: 650;
-  color: #7b3a28;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
+  font-weight: 600;
+  color: var(--text-secondary);
 }
 
 .status-badge.error { color: var(--danger); }
@@ -144,16 +142,16 @@ watch(() => props.status, (newStatus) => {
 
 .progress-track {
   height: 6px;
-  background: rgba(90, 75, 51, 0.16);
-  border-radius: var(--radius-full);
+  background: rgba(60, 60, 67, 0.14);
+  border-radius: 999px;
   overflow: hidden;
   position: relative;
 }
 
 .progress-fill {
   height: 100%;
-  background: linear-gradient(130deg, #d59879 0%, #b24f34 100%);
-  border-radius: var(--radius-full);
+  background: var(--accent);
+  border-radius: 999px;
   transition: width 0.3s ease-out;
 }
 
@@ -169,11 +167,11 @@ watch(() => props.status, (newStatus) => {
 .progress-fill.active {
   background-image: linear-gradient(
     45deg,
-    rgba(255, 255, 255, 0.15) 25%,
+    rgba(255, 255, 255, 0.2) 25%,
     transparent 25%,
     transparent 50%,
-    rgba(255, 255, 255, 0.15) 50%,
-    rgba(255, 255, 255, 0.15) 75%,
+    rgba(255, 255, 255, 0.2) 50%,
+    rgba(255, 255, 255, 0.2) 75%,
     transparent 75%,
     transparent
   );

@@ -10,6 +10,17 @@ use crate::transport::protocol::{
     SUPPORTED_VERSIONS, WIRE_VERSION,
 };
 
+async fn reject_control_stream(
+    send: &mut quinn::SendStream,
+    reason: ErrorCode,
+    context: &str,
+) -> Result<()> {
+    if let Err(e) = write_message(send, &DashMessage::Reject(RejectPayload { reason })).await {
+        tracing::warn!("failed to send reject ({context}): {e:#}");
+    }
+    Ok(())
+}
+
 /// Called for each accepted incoming QUIC connection.
 /// Performs: cert fp binding → Hello exchange → route to receiver.
 pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppState>) -> Result<()> {
@@ -121,13 +132,36 @@ pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppSta
     let (mut send, mut recv) = conn.accept_bi().await.context("accept bi stream")?;
 
     // Read peer's Hello first
-    let peer_hello = match read_message(&mut recv).await? {
-        DashMessage::Hello(h) => h,
-        other => bail!("expected Hello, got {:?}", other),
+    let peer_hello = match read_message(&mut recv).await {
+        Ok(DashMessage::Hello(h)) => h,
+        Ok(other) => {
+            reject_control_stream(
+                &mut send,
+                ErrorCode::Protocol(format!("expected Hello, got {:?}", other)),
+                "incoming_hello_type",
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(e) => {
+            reject_control_stream(
+                &mut send,
+                ErrorCode::Protocol(format!("read Hello failed: {e:#}")),
+                "incoming_hello_read",
+            )
+            .await?;
+            return Ok(());
+        }
     };
 
     if peer_hello.wire_version != 0 {
-        bail!("unknown wire_version: {}", peer_hello.wire_version);
+        reject_control_stream(
+            &mut send,
+            ErrorCode::VersionMismatch,
+            "incoming_wire_version",
+        )
+        .await?;
+        return Ok(());
     }
 
     // Send our Hello back
@@ -154,15 +188,39 @@ pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppSta
     };
 
     // 4. Wait for Offer on this stream
-    let offer = match read_message(&mut recv).await? {
-        DashMessage::Offer(o) => o,
-        DashMessage::Cancel(_) => bail!("peer cancelled before offer"),
-        other => bail!("expected Offer, got {:?}", other),
+    let offer = match read_message(&mut recv).await {
+        Ok(DashMessage::Offer(o)) => o,
+        Ok(DashMessage::Cancel(_)) => {
+            reject_control_stream(
+                &mut send,
+                ErrorCode::Cancelled,
+                "incoming_cancel_before_offer",
+            )
+            .await?;
+            return Ok(());
+        }
+        Ok(other) => {
+            reject_control_stream(
+                &mut send,
+                ErrorCode::Protocol(format!("expected Offer, got {:?}", other)),
+                "incoming_offer_type",
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(e) => {
+            reject_control_stream(
+                &mut send,
+                ErrorCode::Protocol(format!("read Offer failed: {e:#}")),
+                "incoming_offer_read",
+            )
+            .await?;
+            return Ok(());
+        }
     };
 
     if let Some(reason) = check_offer_rate_limit(&state, &peer_cert_fp).await {
-        let reject = DashMessage::Reject(RejectPayload { reason });
-        write_message(&mut send, &reject).await?;
+        let _ = reject_control_stream(&mut send, reason, "incoming_offer_rate_limit").await;
         return Ok(());
     }
 

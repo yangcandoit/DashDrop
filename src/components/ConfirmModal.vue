@@ -57,7 +57,7 @@ const emit = defineEmits<{
   width: min(460px, 100%);
   border-radius: 16px;
   border: 1px solid var(--border-subtle);
-  background: #fffcf6;
+  background: #fff;
   box-shadow: var(--shadow-soft);
   padding: 18px;
   display: flex;

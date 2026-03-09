@@ -55,21 +55,20 @@ const dismissSystemError = () => {
     <nav class="app-rail">
       <div class="brand-block">
         <div class="brand-title">DashDrop</div>
-        <p class="brand-subtitle">Local transfer desk</p>
       </div>
       <ul class="rail-nav">
-        <li v-for="(item, index) in navItems" :key="item.id">
-          <button 
-            class="rail-btn" 
+        <li v-for="item in navItems" :key="item.id">
+          <button
+            class="rail-btn"
             :class="{ active: currentView === item.id }"
             @click="currentView = item.id"
           >
-            <span class="rail-index">{{ String(index + 1).padStart(2, '0') }}</span>
-            <span>{{ item.label }}</span>
+            {{ item.label }}
           </button>
         </li>
       </ul>
     </nav>
+
     <main class="app-workspace">
       <SystemNotice
         v-if="systemError"
@@ -85,15 +84,11 @@ const dismissSystemError = () => {
         <SettingsView v-if="currentView === 'Settings'" @back="currentView = 'Nearby'" />
       </div>
     </main>
+
     <div v-if="showOnboarding" class="onboarding-backdrop">
       <section class="onboarding-card">
         <h3>Before You Start</h3>
-        <p class="text-muted">Use this checklist for safer first-time transfers:</p>
-        <ul>
-          <li>Verify fingerprint when pairing unfamiliar devices.</li>
-          <li>Enable auto-accept only for trusted devices.</li>
-          <li>Keep both devices on the same local network.</li>
-        </ul>
+        <p class="text-muted">Verify fingerprint before sending to a new device.</p>
         <button class="btn btn-primary" @click="dismissOnboarding">Continue</button>
       </section>
     </div>
@@ -103,49 +98,33 @@ const dismissSystemError = () => {
 <style scoped>
 .app-shell {
   display: flex;
-  gap: 18px;
-  padding: 18px;
+  gap: 12px;
+  padding: 12px;
   width: 100vw;
   height: 100vh;
   box-sizing: border-box;
 }
 
 .app-rail {
-  width: 250px;
-  border-radius: 24px;
-  background: var(--surface-strong);
+  width: 200px;
+  border-radius: 16px;
+  background: var(--surface);
   border: 1px solid var(--border-subtle);
-  box-shadow: var(--shadow-soft);
   display: flex;
   flex-direction: column;
-  padding: 24px 18px;
-  overflow: hidden;
+  padding: 14px;
 }
 
 .brand-block {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-bottom: 28px;
-  padding: 6px 8px 12px;
+  margin-bottom: 10px;
+  padding-bottom: 10px;
   border-bottom: 1px solid var(--border-subtle);
 }
 
 .brand-title {
-  width: 100%;
-  font-family: var(--font-display);
-  font-size: 1.55rem;
-  letter-spacing: -0.01em;
+  font-size: 1.32rem;
+  font-weight: 600;
   color: var(--text-primary);
-}
-
-.brand-subtitle {
-  width: 100%;
-  margin: 0;
-  color: var(--text-muted);
-  font-size: 0.78rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
 }
 
 .rail-nav {
@@ -154,56 +133,41 @@ const dismissSystemError = () => {
   margin: 0;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
 }
 
 .rail-btn {
   width: 100%;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 12px 12px;
-  border-radius: 14px;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid transparent;
   background: transparent;
-  border: 1px solid var(--border-subtle);
-  color: var(--text-muted);
-  font-size: 0.9rem;
-  font-weight: 600;
-  letter-spacing: 0.02em;
+  color: var(--text-secondary);
+  font-size: 0.92rem;
+  font-weight: 500;
   cursor: pointer;
-  transition: transform 220ms ease, border-color 220ms ease, background-color 220ms ease, color 220ms ease;
 }
 
 .rail-btn:hover {
-  transform: translateX(2px);
-  color: var(--text-primary);
-  border-color: var(--border-strong);
-  background: rgba(255, 255, 255, 0.45);
+  background: var(--surface-muted);
 }
 
 .rail-btn.active {
-  color: var(--text-primary);
-  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
-  background: linear-gradient(120deg, color-mix(in srgb, var(--accent) 22%, #fff), rgba(255, 255, 255, 0.92));
-}
-
-.rail-index {
-  min-width: 24px;
-  font-size: 0.72rem;
-  font-weight: 700;
-  color: var(--text-subtle);
+  background: color-mix(in srgb, var(--accent) 10%, #fff);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+  color: #005bb5;
 }
 
 .app-workspace {
   flex: 1;
-  position: relative;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  border-radius: 24px;
+  border-radius: 16px;
   border: 1px solid var(--border-subtle);
   background: var(--surface);
-  box-shadow: var(--shadow-soft);
 }
 
 .workspace-body {
@@ -215,8 +179,7 @@ const dismissSystemError = () => {
   position: fixed;
   inset: 0;
   z-index: 1000;
-  background: rgba(33, 30, 24, 0.48);
-  backdrop-filter: blur(8px);
+  background: rgba(0, 0, 0, 0.2);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -224,59 +187,30 @@ const dismissSystemError = () => {
 }
 
 .onboarding-card {
-  width: min(560px, 100%);
-  border-radius: 20px;
+  width: min(420px, 100%);
+  border-radius: 14px;
   border: 1px solid var(--border-subtle);
-  background: #fffcf6;
-  box-shadow: 0 30px 70px rgba(33, 29, 22, 0.22);
-  padding: 24px;
+  background: var(--surface);
+  box-shadow: var(--shadow-soft);
+  padding: 18px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
-}
-
-.onboarding-card h3 {
-  margin: 0;
-  font-family: var(--font-display);
-  font-size: 1.5rem;
-}
-
-.onboarding-card ul {
-  margin: 0 0 8px;
-  padding-left: 18px;
-  color: var(--text-secondary);
-}
-
-.onboarding-card li {
-  margin-bottom: 8px;
+  gap: 12px;
 }
 
 @media (max-width: 900px) {
   .app-shell {
-    padding: 10px;
-    gap: 10px;
+    padding: 8px;
+    gap: 8px;
   }
 
   .app-rail {
-    width: 180px;
-    padding: 14px 10px;
+    width: 170px;
+    padding: 10px;
   }
 
   .brand-title {
     font-size: 1.2rem;
-  }
-
-  .brand-subtitle {
-    font-size: 0.65rem;
-  }
-
-  .rail-btn {
-    padding: 10px 8px;
-    font-size: 0.78rem;
-  }
-
-  .rail-index {
-    display: none;
   }
 }
 </style>

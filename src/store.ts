@@ -62,7 +62,10 @@ function transferErrorNextSteps(reasonCode: string): string[] {
     case "E_PATH_CONFLICT":
       return ["Adjust conflict strategy in Settings or rename source files, then retry."];
     case "E_PROTOCOL":
-      return ["Open Security or History, then retry after both peers are reachable."];
+      return [
+        "Ensure both peers run the same DashDrop version.",
+        "If needed, unpair and pair again, then retry.",
+      ];
     default:
       return ["Open Security/History for details, then retry."];
   }
@@ -93,7 +96,13 @@ function summarizeTransferError(err: { reason_code: string; terminal_cause: stri
   const rawDetail = err.detail || (!err.reason_code.startsWith("E_") ? err.reason_code : "");
   const detail = rawDetail.toLowerCase();
   if (detail.includes("read len") || detail.includes("read body")) {
-    return "Connection closed before control stream completed";
+    return "Peer closed control stream before accept/reject";
+  }
+  if (err.terminal_cause === "ProtocolSequenceError") {
+    return "Peer rejected protocol sequence (possible version mismatch)";
+  }
+  if (err.terminal_cause === "OfferTooLarge") {
+    return "Transfer offer is too large (too many entries in one batch)";
   }
   if (detail.includes("quic handshake")) {
     return "Secure channel handshake failed";

@@ -319,7 +319,7 @@ const handleCancelAll = async () => {
   height: 100%;
   display: flex;
   flex-direction: column;
-  background: linear-gradient(190deg, rgba(255, 255, 255, 0.35), transparent 34%);
+  background: var(--surface);
   position: relative;
 }
 
@@ -327,21 +327,22 @@ const handleCancelAll = async () => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 26px 28px 12px;
+  padding: 20px 22px 12px;
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 .title-wrap {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
 }
 
 .content {
   flex: 1;
-  padding: 0 28px 24px;
+  padding: 14px 22px 22px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 10px;
   overflow-y: auto;
 }
 
@@ -356,9 +357,9 @@ const handleCancelAll = async () => {
   flex-direction: column;
   gap: 8px;
   padding: 12px;
-  border-radius: 16px;
-  border: 1px solid rgba(154, 93, 28, 0.22);
-  background: rgba(154, 93, 28, 0.08);
+  border-radius: 12px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-muted);
 }
 
 .incoming-list {
@@ -372,10 +373,10 @@ const handleCancelAll = async () => {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 14px;
-  border-radius: 12px;
-  border: 1px solid rgba(154, 93, 28, 0.18);
-  background: rgba(255, 255, 255, 0.68);
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border-subtle);
+  background: #fff;
 }
 
 .incoming-main .peer {
@@ -384,8 +385,8 @@ const handleCancelAll = async () => {
 
 .incoming-main .meta,
 .incoming-main .risk {
-  font-size: 0.85rem;
-  color: #8e4f17;
+  font-size: 0.83rem;
+  color: var(--text-muted);
 }
 
 .incoming-actions {
@@ -398,9 +399,9 @@ const handleCancelAll = async () => {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(255, 255, 255, 0.4);
-  border: 1px dashed var(--border-subtle);
-  border-radius: 16px;
+  background: var(--surface-muted);
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
 }
 
 .transfers-list {
@@ -410,14 +411,13 @@ const handleCancelAll = async () => {
 }
 
 .transfer-card {
-  padding: 14px;
-  background: rgba(255, 255, 255, 0.72);
-  border-radius: 14px;
+  padding: 12px;
+  background: #fff;
+  border-radius: 12px;
   border: 1px solid var(--border-subtle);
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  box-shadow: var(--shadow-card);
+  gap: 8px;
 }
 
 .transfer-meta {
@@ -435,7 +435,7 @@ const handleCancelAll = async () => {
 
 .transfer-files {
   margin-top: 4px;
-  font-size: 0.78rem;
+  font-size: 0.8rem;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -448,15 +448,14 @@ const handleCancelAll = async () => {
 }
 
 .mini-btn {
-  min-height: 28px;
+  min-height: 26px;
   padding: 4px 8px;
   border-radius: 8px;
   border: 1px solid var(--border-subtle);
-  background: #fffdf9;
+  background: #fff;
   color: var(--text-secondary);
   font-size: 0.75rem;
   font-weight: 600;
-  letter-spacing: 0.02em;
   cursor: pointer;
 }
 
@@ -471,20 +470,18 @@ const handleCancelAll = async () => {
 .rate-chip {
   display: inline-flex;
   align-items: center;
-  border: 1px solid rgba(47, 107, 82, 0.28);
-  color: #2f6b52;
-  background: rgba(47, 107, 82, 0.08);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  color: #005bb5;
+  background: color-mix(in srgb, var(--accent) 8%, #fff);
   border-radius: 999px;
   padding: 2px 8px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
+  font-weight: 600;
 }
 
 .dialog-backdrop {
   position: absolute;
   inset: 0;
-  background: rgba(33, 30, 24, 0.38);
-  backdrop-filter: blur(6px);
+  background: rgba(0, 0, 0, 0.2);
   display: flex;
   justify-content: center;
   align-items: center;
@@ -494,9 +491,9 @@ const handleCancelAll = async () => {
 
 .dialog-card {
   width: min(620px, 100%);
-  border-radius: 18px;
+  border-radius: 12px;
   border: 1px solid var(--border-subtle);
-  background: #fffcf6;
+  background: #fff;
   box-shadow: var(--shadow-soft);
   display: flex;
   flex-direction: column;
@@ -519,14 +516,13 @@ const handleCancelAll = async () => {
 
 .field-label {
   font-size: 0.78rem;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
+  font-weight: 600;
   color: var(--text-subtle);
 }
 
 .field-input {
   width: 100%;
-  min-height: 42px;
+  min-height: 38px;
   border-radius: 10px;
   border: 1px solid var(--border-subtle);
   background: #fff;
@@ -540,9 +536,9 @@ const handleCancelAll = async () => {
 
 .peer-preview {
   margin-top: 4px;
-  border-radius: 12px;
+  border-radius: 10px;
   border: 1px solid var(--border-subtle);
-  background: rgba(255, 255, 255, 0.7);
+  background: var(--surface-muted);
   padding: 10px;
   display: flex;
   flex-direction: column;
@@ -557,10 +553,9 @@ const handleCancelAll = async () => {
 }
 
 .preview-key {
-  font-size: 0.76rem;
+  font-size: 0.74rem;
   color: var(--text-subtle);
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
+  font-weight: 600;
 }
 
 .preview-value {
@@ -571,12 +566,12 @@ const handleCancelAll = async () => {
 .fingerprint {
   font-size: 0.74rem;
   line-height: 1.5;
-  color: #6a3f2b;
+  color: var(--text-secondary);
   word-break: break-all;
   padding: 4px 6px;
   border-radius: 8px;
-  border: 1px solid rgba(178, 79, 52, 0.25);
-  background: rgba(255, 249, 245, 0.75);
+  border: 1px solid var(--border-subtle);
+  background: #fff;
 }
 
 .remember-row {
@@ -589,9 +584,9 @@ const handleCancelAll = async () => {
 }
 
 .connect-error {
-  border: 1px solid rgba(157, 58, 51, 0.3);
-  background: rgba(157, 58, 51, 0.08);
-  color: #8a3129;
+  border: 1px solid rgba(198, 40, 40, 0.28);
+  background: rgba(198, 40, 40, 0.06);
+  color: #9d1b1b;
   border-radius: 10px;
   padding: 8px 10px;
   font-size: 0.82rem;

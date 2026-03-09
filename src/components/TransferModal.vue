@@ -123,8 +123,7 @@ const handleReject = async () => {
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(39, 33, 25, 0.38);
-  backdrop-filter: blur(4px);
+  background: rgba(0, 0, 0, 0.2);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -147,7 +146,7 @@ const handleReject = async () => {
   align-items: center;
   gap: 16px;
   padding: 16px;
-  background: rgba(255, 255, 255, 0.52);
+  background: var(--surface-muted);
   border: 1px solid var(--border-subtle);
   border-radius: 10px;
 }
@@ -156,14 +155,14 @@ const handleReject = async () => {
   width: 48px;
   height: 48px;
   border-radius: 10px;
-  background: linear-gradient(165deg, rgba(178, 79, 52, 0.16), rgba(214, 174, 140, 0.35));
+  background: #f2f2f7;
   display: flex;
   align-items: center;
   justify-content: center;
   font-size: 1.2rem;
-  font-family: var(--font-display);
+  font-family: var(--font-body);
   font-weight: 600;
-  color: #6f3224;
+  color: var(--text-secondary);
 }
 
 .text-sm {
@@ -172,9 +171,9 @@ const handleReject = async () => {
 
 .security-warning {
   padding: 12px 16px;
-  border: 1px solid rgba(154, 93, 28, 0.25);
-  background: rgba(154, 93, 28, 0.08);
-  color: #8e4f17;
+  border: 1px solid rgba(178, 106, 0, 0.25);
+  background: rgba(178, 106, 0, 0.08);
+  color: #8a5300;
   border-radius: 10px;
   font-size: 0.9rem;
   line-height: 1.4;
@@ -186,8 +185,8 @@ const handleReject = async () => {
   word-break: break-all;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
   font-size: 0.8em;
-  background: rgba(255, 255, 255, 0.55);
-  border: 1px solid rgba(154, 93, 28, 0.2);
+  background: #fff;
+  border: 1px solid var(--border-subtle);
   padding: 4px 6px;
   border-radius: 6px;
 }
@@ -208,7 +207,7 @@ const handleReject = async () => {
 }
 
 .files {
-  background: rgba(255, 255, 255, 0.62);
+  background: #fff;
   border: 1px solid var(--border-subtle);
   border-radius: 10px;
   padding: 8px;
@@ -225,7 +224,7 @@ const handleReject = async () => {
 }
 
 .file-item:hover {
-  background: rgba(255, 255, 255, 0.74);
+  background: #f2f2f7;
 }
 
 .file-name {

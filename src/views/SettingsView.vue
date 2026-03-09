@@ -210,13 +210,14 @@ async function save() {
   height: 100%;
   display: flex;
   flex-direction: column;
-  background: linear-gradient(190deg, rgba(255, 255, 255, 0.33), transparent 32%);
+  background: var(--surface);
 }
 
 .app-header {
   display: flex;
   align-items: center;
-  padding: 26px 28px 12px;
+  padding: 20px 22px 12px;
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 .header-left {
@@ -232,12 +233,12 @@ async function save() {
 }
 
 .content {
-  margin: 0 28px 24px;
-  padding: 24px;
-  border-radius: 18px;
+  margin: 14px 22px 22px;
+  padding: 18px;
+  border-radius: 12px;
   display: flex;
   flex-direction: column;
-  gap: 24px;
+  gap: 16px;
 }
 
 .security-warning {
@@ -270,7 +271,7 @@ async function save() {
   padding: 10px 12px;
   border-radius: 10px;
   border: 1px solid var(--border-subtle);
-  background: rgba(255, 255, 255, 0.72);
+  background: #fff;
   color: var(--text-secondary);
   font-size: 1rem;
   width: 100%;
@@ -291,7 +292,7 @@ async function save() {
   padding: 10px 12px;
   border-radius: 10px;
   border: 1px solid var(--border-subtle);
-  background: rgba(255, 255, 255, 0.7);
+  background: #fff;
 }
 
 .runtime-label {

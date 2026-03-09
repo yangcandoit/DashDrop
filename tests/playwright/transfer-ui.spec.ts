@@ -231,17 +231,13 @@ test("incoming -> reject -> history visible", async ({ page }) => {
   await expect(page.locator(".status-badge.rejected").first()).toBeVisible();
 });
 
-test("connect by address prompt/confirm flow", async ({ page }) => {
-  page.on("dialog", async (dialog) => {
-    if (dialog.type() === "prompt") {
-      await dialog.accept("127.0.0.1:7001");
-      return;
-    }
-    await dialog.accept();
-  });
-
+test("connect by address dialog/confirm flow", async ({ page }) => {
   await page.getByRole("button", { name: "Transfers" }).click();
   await page.getByRole("button", { name: "Connect by Address" }).click();
+  await page.getByLabel("Peer address").fill("127.0.0.1:7001");
+  await page.locator(".dialog-actions").getByRole("button", { name: "Connect" }).click();
+  await expect(page.getByText("Manual Peer")).toBeVisible();
+  await page.getByRole("button", { name: "Confirm Fingerprint" }).click();
 
   const state = await page.evaluate(() => (window as any).__getTestState());
   expect(state.connectByAddressCalls).toContain("127.0.0.1:7001");
