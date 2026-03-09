@@ -46,35 +46,20 @@ async fn register_on_daemon(mdns: &ServiceDaemon, state: &Arc<AppState>) -> Resu
     properties.insert("platform".to_string(), Platform::current().to_string());
     properties.insert("caps".to_string(), "file".to_string());
 
-    let instance_name = sanitize_mdns_name(&device_name);
-
-    let mut ips = Vec::new();
-    if let Ok(interfaces) = if_addrs::get_if_addrs() {
-        for iface in interfaces {
-            if iface.is_loopback() {
-                continue;
-            }
-            ips.push(iface.addr.ip());
-        }
-    }
-
-    let ip_str = ips
-        .iter()
-        .map(|ip| ip.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-
-    let fqdn = format!("{}.local.", instance_name);
+    let instance_name = sanitize_mdns_instance_name(&device_name);
+    let host_label = sanitize_mdns_host_label(&device_name, &fp);
+    let fqdn = format!("{host_label}.local.");
 
     let service_info = ServiceInfo::new(
         SERVICE_TYPE,
         &instance_name,
         &fqdn,
-        ip_str.as_str(),
+        "", // empty addr = use all interfaces
         port,
         Some(properties),
     )
-    .context("build ServiceInfo")?;
+    .context("build ServiceInfo")?
+    .enable_addr_auto();
 
     let fullname = service_info.get_fullname().to_string();
 
@@ -85,7 +70,7 @@ async fn register_on_daemon(mdns: &ServiceDaemon, state: &Arc<AppState>) -> Resu
     Ok(())
 }
 
-fn sanitize_mdns_name(name: &str) -> String {
+fn sanitize_mdns_instance_name(name: &str) -> String {
     let s: String = name
         .chars()
         .map(|c| {
@@ -100,5 +85,35 @@ fn sanitize_mdns_name(name: &str) -> String {
         "DashDrop".into()
     } else {
         s
+    }
+}
+
+fn sanitize_mdns_host_label(device_name: &str, fingerprint: &str) -> String {
+    // Host labels must be DNS-safe. Include fp suffix to reduce collisions.
+    let mut base = device_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    base = base.trim_matches('-').to_string();
+    if base.is_empty() {
+        base = "dashdrop".to_string();
+    }
+
+    let short_fp = fingerprint.chars().take(8).collect::<String>().to_ascii_lowercase();
+    let mut label = format!("{base}-{short_fp}");
+    if label.len() > 63 {
+        label.truncate(63);
+        label = label.trim_matches('-').to_string();
+    }
+    if label.is_empty() {
+        "dashdrop".to_string()
+    } else {
+        label
     }
 }

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -95,12 +95,26 @@ pub struct SessionIndexEntry {
 }
 
 impl DeviceInfo {
-    /// Pick the best reachable addresses (most recently seen session).
+    /// Build address candidates across all known sessions, preferring newest sessions first.
     pub fn best_addrs(&self) -> Option<Vec<SocketAddr>> {
-        self.sessions
-            .values()
-            .max_by_key(|s| s.last_seen_instant)
-            .map(|s| s.addrs.clone())
+        let mut sessions: Vec<&SessionInfo> = self.sessions.values().collect();
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.last_seen_unix));
+
+        let mut addrs = Vec::new();
+        let mut seen = HashSet::new();
+        for session in sessions {
+            for addr in &session.addrs {
+                if seen.insert(*addr) {
+                    addrs.push(*addr);
+                }
+            }
+        }
+
+        if addrs.is_empty() {
+            None
+        } else {
+            Some(addrs)
+        }
     }
 }
 
