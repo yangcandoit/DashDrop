@@ -140,7 +140,16 @@ jobs:
           fi
 
       - name: Build Tauri installers
-        run: npm run tauri build
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${RUNNER_OS}" == "macOS" ]]; then
+            # DMG generation is currently unstable on GitHub macOS runners.
+            # Produce a deterministic app bundle artifact instead.
+            npm run tauri build -- --bundles app
+          else
+            npm run tauri build
+          fi
 
       - name: Optional Windows code signing
         if: runner.os == 'Windows' && env.WINDOWS_CERT_BASE64 != '' && env.WINDOWS_CERT_PASSWORD != ''
@@ -190,6 +199,7 @@ jobs:
             src-tauri/target/release/bundle/**/*.exe
             src-tauri/target/release/bundle/**/*.dmg
             src-tauri/target/release/bundle/**/*.app.tar.gz
+            src-tauri/target/release/bundle/**/*.app
             src-tauri/target/release/bundle/**/*.AppImage
             src-tauri/target/release/bundle/**/*.deb
             src-tauri/target/release/bundle/**/*.rpm
@@ -200,7 +210,12 @@ jobs:
           fi
           for src in "${files[@]}"; do
             base="$(basename "${src}")"
-            cp "${src}" "release-bundle/${APP_NAME}-${{ steps.release_meta.outputs.label }}-${{ matrix.platform }}-${base}"
+            if [[ -d "${src}" && "${base}" == *.app ]]; then
+              tarball="${APP_NAME}-${{ steps.release_meta.outputs.label }}-${{ matrix.platform }}-${base}.tar.gz"
+              tar -czf "release-bundle/${tarball}" -C "$(dirname "${src}")" "${base}"
+            else
+              cp "${src}" "release-bundle/${APP_NAME}-${{ steps.release_meta.outputs.label }}-${{ matrix.platform }}-${base}"
+            fi
           done
           ls -lh release-bundle
 
