@@ -98,8 +98,8 @@ jobs:
           fi
           echo "label=${label}" >> "${GITHUB_OUTPUT}"
 
-      - name: Build Tauri installers
-        run: npm run tauri build
+      - name: Prepare signing environment
+        shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -109,6 +109,38 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${TAURI_SIGNING_PRIVATE_KEY}" && -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD}" ]]; then
+            echo "TAURI_SIGNING_PRIVATE_KEY=${TAURI_SIGNING_PRIVATE_KEY}" >> "${GITHUB_ENV}"
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=${TAURI_SIGNING_PRIVATE_KEY_PASSWORD}" >> "${GITHUB_ENV}"
+            echo "Updater signing is enabled."
+          else
+            echo "Updater signing is disabled (missing TAURI signing key/password)."
+          fi
+
+          if [[ "${RUNNER_OS}" == "macOS" ]]; then
+            missing=()
+            for key in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+              if [[ -z "${!key}" ]]; then
+                missing+=("${key}")
+              fi
+            done
+            if [[ ${#missing[@]} -eq 0 ]]; then
+              echo "APPLE_CERTIFICATE=${APPLE_CERTIFICATE}" >> "${GITHUB_ENV}"
+              echo "APPLE_CERTIFICATE_PASSWORD=${APPLE_CERTIFICATE_PASSWORD}" >> "${GITHUB_ENV}"
+              echo "APPLE_SIGNING_IDENTITY=${APPLE_SIGNING_IDENTITY}" >> "${GITHUB_ENV}"
+              echo "APPLE_ID=${APPLE_ID}" >> "${GITHUB_ENV}"
+              echo "APPLE_PASSWORD=${APPLE_PASSWORD}" >> "${GITHUB_ENV}"
+              echo "APPLE_TEAM_ID=${APPLE_TEAM_ID}" >> "${GITHUB_ENV}"
+              echo "macOS signing/notarization is enabled."
+            else
+              echo "macOS signing/notarization is disabled (missing: ${missing[*]})."
+            fi
+          fi
+
+      - name: Build Tauri installers
+        run: npm run tauri build
 
       - name: Optional Windows code signing
         if: runner.os == 'Windows' && env.WINDOWS_CERT_BASE64 != '' && env.WINDOWS_CERT_PASSWORD != ''
