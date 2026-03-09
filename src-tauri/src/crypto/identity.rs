@@ -31,40 +31,67 @@ impl Identity {
         let key_path = config_dir.join("identity.key");
         let cert_path = config_dir.join("identity.cert");
         let secure_account = format!("config:{}", config_dir.display());
-        let secure_store = crate::crypto::secret_store::secure_store_available();
+        let mut secure_store = crate::crypto::secret_store::secure_store_available();
 
         let (key_der, cert_der) = if cert_path.exists() {
             let cd = fs::read(&cert_path).context("read identity cert")?;
             let key_der = if secure_store {
-                if let Some(kd) = crate::crypto::secret_store::load_private_key(
-                    KEYCHAIN_SERVICE,
-                    &secure_account,
-                )? {
-                    kd
-                } else if key_path.exists() {
-                    // One-time migration from legacy plaintext key file.
-                    let kd = fs::read(&key_path).context("read legacy identity key")?;
-                    crate::crypto::secret_store::save_private_key(
-                        KEYCHAIN_SERVICE,
-                        &secure_account,
-                        &kd,
-                    )
-                    .context("migrate key into secure store")?;
-                    let _ = fs::remove_file(&key_path);
-                    kd
-                } else {
-                    tracing::warn!(
-                        "Certificate exists but private key missing; regenerating identity"
-                    );
-                    let (new_kd, new_cd) = Self::generate()?;
-                    crate::crypto::secret_store::save_private_key(
-                        KEYCHAIN_SERVICE,
-                        &secure_account,
-                        &new_kd,
-                    )
-                    .context("save regenerated key into secure store")?;
-                    fs::write(&cert_path, &new_cd).context("write regenerated identity cert")?;
-                    return Self::from_parts(new_kd, new_cd);
+                match crate::crypto::secret_store::load_private_key(KEYCHAIN_SERVICE, &secure_account)
+                {
+                    Ok(Some(kd)) => kd,
+                    Ok(None) => {
+                        if key_path.exists() {
+                            // One-time migration from legacy plaintext key file.
+                            let kd = fs::read(&key_path).context("read legacy identity key")?;
+                            if let Err(e) = crate::crypto::secret_store::save_private_key(
+                                KEYCHAIN_SERVICE,
+                                &secure_account,
+                                &kd,
+                            ) {
+                                tracing::warn!(
+                                    "secure store migration failed, keeping local key fallback: {e:#}"
+                                );
+                                secure_store = false;
+                                kd
+                            } else {
+                                let _ = fs::remove_file(&key_path);
+                                kd
+                            }
+                        } else {
+                            tracing::warn!(
+                                "Certificate exists but private key missing; regenerating identity"
+                            );
+                            let (new_kd, new_cd) = Self::generate()?;
+                            if let Err(e) = crate::crypto::secret_store::save_private_key(
+                                KEYCHAIN_SERVICE,
+                                &secure_account,
+                                &new_kd,
+                            ) {
+                                tracing::warn!(
+                                    "secure store save failed, falling back to local key file: {e:#}"
+                                );
+                                fs::write(&key_path, &new_kd)
+                                    .context("write regenerated identity key fallback")?;
+                            }
+                            fs::write(&cert_path, &new_cd).context("write regenerated identity cert")?;
+                            return Self::from_parts(new_kd, new_cd);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "secure store read failed, falling back to local key file: {e:#}"
+                        );
+                        secure_store = false;
+                        if key_path.exists() {
+                            fs::read(&key_path).context("read identity key fallback")?
+                        } else {
+                            let (new_kd, new_cd) = Self::generate()?;
+                            fs::write(&key_path, &new_kd)
+                                .context("write regenerated identity key fallback")?;
+                            fs::write(&cert_path, &new_cd).context("write regenerated identity cert")?;
+                            return Self::from_parts(new_kd, new_cd);
+                        }
+                    }
                 }
             } else {
                 fs::read(&key_path).context("read identity key")?
@@ -74,12 +101,16 @@ impl Identity {
             tracing::info!("Generating new device identity...");
             let (kd, cd) = Self::generate()?;
             if secure_store {
-                crate::crypto::secret_store::save_private_key(
+                if let Err(e) = crate::crypto::secret_store::save_private_key(
                     KEYCHAIN_SERVICE,
                     &secure_account,
                     &kd,
                 )
-                .context("write identity key to secure store")?;
+                {
+                    tracing::warn!("write identity key to secure store failed: {e:#}");
+                    secure_store = false;
+                    fs::write(&key_path, &kd).context("write identity key fallback")?;
+                }
             } else {
                 fs::write(&key_path, &kd).context("write identity key")?;
                 #[cfg(unix)]

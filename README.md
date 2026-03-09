@@ -251,6 +251,21 @@ npm run tauri dev
 npm run tauri build
 ```
 
+## 安装排障（未签名构建）
+
+如果你安装的是 CI 生成的未签名包（尤其是 macOS），系统可能拦截启动。
+
+- macOS 出现 `"DashDrop" is damaged and can’t be opened`：
+  ```bash
+  xattr -dr com.apple.quarantine /Applications/DashDrop.app
+  codesign --force --deep --sign - /Applications/DashDrop.app
+  open /Applications/DashDrop.app
+  ```
+- Windows 双击后立即退出：
+  请查看启动日志：
+  - `%APPDATA%\\DashDrop\\startup-error.log`
+  - `%TEMP%\\dashdrop-startup-error.log`
+
 ---
 
 ## 📄 License

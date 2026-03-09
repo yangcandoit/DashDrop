@@ -91,6 +91,8 @@ Estimated completion:
   - normalized release asset names
   - per-platform smoke checks
   - optional macOS notarization and Windows code-signing hooks
+  - unsigned macOS artifacts now get CI ad-hoc signing before DMG packaging
+  - release artifacts now include `INSTALL_NOTES.txt` for unsigned macOS/Windows diagnostics
   - tag release uploads with `SHA256SUMS.txt`
 - Added release/upgrade documentation templates:
   - `docs/RELEASE_NOTES_TEMPLATE.md`
