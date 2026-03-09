@@ -202,6 +202,7 @@ pub async fn send_files_cmd(
 
     // Connect (try available addrs)
     let mut conn_opt = None;
+    let mut connect_errors: Vec<String> = Vec::new();
     for addr in remote_addrs {
         tracing::debug!("Trying to connect to {}", addr);
         match connect_to_peer(&state, addr).await {
@@ -211,11 +212,18 @@ pub async fn send_files_cmd(
             }
             Err(e) => {
                 tracing::warn!("Failed to connect to {}: {e:#}", addr);
+                connect_errors.push(format!("{addr}: {e}"));
             }
         }
     }
 
-    let conn = conn_opt.ok_or_else(|| "All connection attempts failed".to_string())?;
+    let conn = conn_opt.ok_or_else(|| {
+        if connect_errors.is_empty() {
+            "All connection attempts failed".to_string()
+        } else {
+            format!("All connection attempts failed ({})", connect_errors.join(" | "))
+        }
+    })?;
 
     // Hard-bind selected device fingerprint to the peer certificate.
     let (fp_match, actual_fp) = crate::transport::handshake::peer_fp_matches(&conn, &peer_fp)
@@ -347,18 +355,27 @@ pub async fn connect_by_address(
     }
 
     let mut connected = None;
+    let mut connect_errors: Vec<String> = Vec::new();
     for addr in resolved {
         match connect_to_peer(&state, addr).await {
             Ok(conn) => {
                 connected = Some((addr, conn));
                 break;
             }
-            Err(e) => tracing::warn!("connect_by_address failed to {addr}: {e:#}"),
+            Err(e) => {
+                tracing::warn!("connect_by_address failed to {addr}: {e:#}");
+                connect_errors.push(format!("{addr}: {e}"));
+            }
         }
     }
 
-    let (selected_addr, conn) =
-        connected.ok_or_else(|| "all connection attempts failed".to_string())?;
+    let (selected_addr, conn) = connected.ok_or_else(|| {
+        if connect_errors.is_empty() {
+            "all connection attempts failed".to_string()
+        } else {
+            format!("all connection attempts failed ({})", connect_errors.join(" | "))
+        }
+    })?;
     let fingerprint = crate::transport::handshake::extract_peer_fp(&conn)
         .map_err(|e| format!("failed to read peer fingerprint: {e:#}"))?;
     if let Err(e) = crate::transport::handshake::do_hello_as_initiator(&conn).await {

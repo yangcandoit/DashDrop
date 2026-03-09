@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -11,6 +12,17 @@ use crate::state::{AppState, DeviceInfo, Platform, SessionIndexEntry, SessionInf
 
 const OFFLINE_GRACE_SECS: u64 = 15;
 const DEVICE_LOST_RETENTION_SECS: u64 = 45;
+
+fn is_usable_peer_addr(addr: &SocketAddr) -> bool {
+    if addr.ip().is_loopback() || addr.ip().is_unspecified() || addr.ip().is_multicast() {
+        return false;
+    }
+    match addr {
+        SocketAddr::V4(v4) => !v4.ip().is_link_local(),
+        // Link-local IPv6 without scope id is typically not routable to peer.
+        SocketAddr::V6(v6) => !(v6.ip().is_unicast_link_local() && v6.scope_id() == 0),
+    }
+}
 
 fn remove_session_from_state(
     remove_key: &str,
@@ -172,11 +184,17 @@ async fn handle_resolved(
 
     let port = info.get_port();
 
-    let addrs: Vec<SocketAddr> = info
+    let mut addrs: Vec<SocketAddr> = info
         .get_addresses()
         .iter()
         .map(|ip| SocketAddr::new(*ip, port))
+        .filter(is_usable_peer_addr)
         .collect();
+
+    // Prefer IPv4 first for cross-platform LAN interoperability.
+    addrs.sort_by_key(|a| if a.is_ipv4() { 0 } else { 1 });
+    let mut seen = HashSet::new();
+    addrs.retain(|a| seen.insert(*a));
 
     if addrs.is_empty() {
         tracing::debug!("No addresses resolved for {name}");
