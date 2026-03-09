@@ -108,8 +108,11 @@ const filteredHistory = computed(() => {
 <template>
   <div class="view-container animate-fade-in">
     <header class="view-header">
-      <h2>History</h2>
-      <button class="btn btn-secondary" style="padding: 6px 12px;" @click="emit('openSettings')">⚙️</button>
+      <div class="title-wrap">
+        <h2>History</h2>
+        <p class="text-muted">Recent completed and failed transfers</p>
+      </div>
+      <button class="btn btn-secondary" @click="emit('openSettings')">Settings</button>
     </header>
     <main class="content">
       <section class="filters">
@@ -148,9 +151,6 @@ const filteredHistory = computed(() => {
       <div v-else class="history-list">
         <div v-for="t in filteredHistory" :key="t.id" class="history-card">
           <div class="card-left">
-            <div class="icon">
-              {{ t.direction === 'Send' ? '⬆️' : '⬇️' }}
-            </div>
             <div class="details">
               <div class="peer-name">{{ t.direction === 'Send' ? 'To ' : 'From ' }}{{ t.peer_name }}</div>
               <div class="meta text-muted">{{ t.items.length }} files • {{ formatSize(t.total_bytes) }}</div>
@@ -163,7 +163,7 @@ const filteredHistory = computed(() => {
             <button 
               v-if="t.status === 'Completed' && t.direction === 'Receive'" 
               @click="openFolder(t.id)" 
-              class="btn btn-secondary" style="padding: 4px 8px; font-size: 0.8rem;">
+              class="btn btn-secondary folder-btn">
               Folder
             </button>
           </div>
@@ -179,18 +179,25 @@ const filteredHistory = computed(() => {
   height: 100%;
   display: flex;
   flex-direction: column;
+  background: linear-gradient(190deg, rgba(255, 255, 255, 0.34), transparent 32%);
 }
 
 .view-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 24px 32px;
+  padding: 26px 28px 12px;
+}
+
+.title-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
 .content {
   flex: 1;
-  padding: 0 32px 32px;
+  padding: 0 28px 24px;
   overflow-y: auto;
 }
 
@@ -204,11 +211,12 @@ const filteredHistory = computed(() => {
 .filter-input,
 .filter-select {
   width: 100%;
+  min-height: 38px;
   padding: 8px 10px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border-light);
-  background: var(--bg-surface);
-  color: var(--text-primary);
+  border-radius: 10px;
+  border: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.75);
+  color: var(--text-secondary);
 }
 
 .empty-state {
@@ -216,9 +224,9 @@ const filteredHistory = computed(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(255,255,255,0.02);
-  border: 1px dashed var(--border-light);
-  border-radius: var(--radius-xl);
+  background: rgba(255, 255, 255, 0.42);
+  border: 1px dashed var(--border-subtle);
+  border-radius: 16px;
 }
 
 .history-list {
@@ -231,27 +239,18 @@ const filteredHistory = computed(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 16px;
-  background: var(--bg-surface);
-  border: 1px solid var(--border-light);
-  border-radius: var(--radius-md);
+  gap: 14px;
+  padding: 14px;
+  background: rgba(255, 255, 255, 0.75);
+  border: 1px solid var(--border-subtle);
+  border-radius: 14px;
+  box-shadow: var(--shadow-card);
 }
 
 .card-left {
   display: flex;
   align-items: center;
-  gap: 16px;
-}
-
-.icon {
-  font-size: 1.5rem;
-  width: 40px;
-  height: 40px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(255,255,255,0.05);
-  border-radius: 50%;
+  gap: 10px;
 }
 
 .peer-name {
@@ -270,21 +269,43 @@ const filteredHistory = computed(() => {
 }
 
 .status-badge {
-  font-size: 0.75rem;
-  padding: 2px 8px;
-  border-radius: 12px;
+  font-size: 0.72rem;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
   background: rgba(255,255,255,0.1);
-  font-weight: 500;
+  font-weight: 600;
+  letter-spacing: 0.02em;
 }
 
-.status-badge.completed { background: rgba(16, 185, 129, 0.2); color: #34d399; }
-.status-badge.failed { background: rgba(239, 68, 68, 0.2); color: #f87171; }
-.status-badge.cancelledbyuser, .status-badge.cancelledbysender, .status-badge.cancelledbyreceiver, .status-badge.rejected { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
-.status-badge.partialcompleted { background: rgba(59, 130, 246, 0.2); color: #60a5fa; }
+.status-badge.completed { background: rgba(47, 107, 82, 0.12); color: #2f6b52; }
+.status-badge.failed { background: rgba(157, 58, 51, 0.12); color: #9d3a33; }
+.status-badge.cancelledbyuser,
+.status-badge.cancelledbysender,
+.status-badge.cancelledbyreceiver,
+.status-badge.rejected { background: rgba(154, 93, 28, 0.12); color: #9a5d1c; }
+.status-badge.partialcompleted { background: rgba(178, 79, 52, 0.14); color: #7f3f2b; }
+
+.folder-btn {
+  min-height: 28px;
+  padding: 4px 8px;
+  font-size: 0.75rem;
+}
 
 @media (max-width: 960px) {
   .filters {
     grid-template-columns: 1fr;
+  }
+
+  .view-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+  }
+
+  .history-card {
+    flex-direction: column;
+    align-items: flex-start;
   }
 }
 </style>

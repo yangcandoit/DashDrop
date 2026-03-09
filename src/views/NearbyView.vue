@@ -5,7 +5,7 @@ import DeviceCard from '../components/DeviceCard.vue';
 import { sendFiles } from '../ipc';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import type { DeviceView } from '../types';
-import { myIdentity, devices, incomingQueue, sendingPeerFingerprints, systemError } from '../store';
+import { myIdentity, devices, incomingQueue, sendingPeerFingerprints } from '../store';
 
 const emit = defineEmits(['openSettings']);
 
@@ -78,29 +78,43 @@ const sendGivenPathsToDevice = async (paths: string[], device: DeviceView) => {
     await sendFiles(device.fingerprint, paths);
   } catch (e: unknown) {
     console.error('Failed to send files:', e);
-    await message(`Failed to send files to ${device.name}:\n${String(e)}`, { title: 'Transfer Failed', kind: 'error' });
+    const detail = String(e || '').toLowerCase();
+    let userReason = 'Unknown transport error.';
+    if (detail.includes('all connection attempts failed')) {
+      userReason = 'Peer is unreachable on all known addresses.';
+    } else if (detail.includes('quic handshake')) {
+      userReason = 'Secure handshake failed.';
+    } else if (detail.includes('identity mismatch')) {
+      userReason = 'Identity verification failed.';
+    } else if (detail.includes('timeout')) {
+      userReason = 'Peer did not respond in time.';
+    }
+    await message(
+      `Failed to send files to ${device.name}.\nReason: ${userReason}\nOpen Transfers or Security Events for details, then retry.`,
+      { title: 'Transfer Failed', kind: 'error' },
+    );
   }
 };
 </script>
 
 <template>
   <div class="nearby-view">
-    <div v-if="systemError" class="system-error-banner" @click="systemError = null">
-      ⚠️ {{ systemError }} <span style="opacity:0.7;font-size:0.8em">(click to dismiss)</span>
-    </div>
     <header class="view-header">
-      <h2>Nearby</h2>
-      <div class="my-identity" v-if="myIdentity">
-        <div class="status-dot"></div>
-        <span class="text-muted">{{ myIdentity.device_name }}</span>
-        <button @click="emit('openSettings')" class="btn-icon" style="margin-left:8px; cursor: pointer; background: transparent; border: none; font-size: 1.2rem;" title="Settings">⚙️</button>
+      <div class="title-wrap">
+        <h2>Nearby</h2>
+        <p class="text-muted subtitle">Select a device card to start transfer</p>
+      </div>
+      <div class="header-actions" v-if="myIdentity">
+        <div class="my-identity">
+          <span class="identity-label">This device</span>
+          <span class="identity-name">{{ myIdentity.device_name }}</span>
+        </div>
+        <button @click="emit('openSettings')" class="btn btn-secondary">Settings</button>
       </div>
     </header>
 
     <main class="content">
       <div class="devices-section">
-        <p class="text-muted subtitle">Click a device to send files</p>
-
         <div class="devices-grid" v-if="devices.length > 0">
           <DeviceCard
             v-for="device in devices"
@@ -114,8 +128,8 @@ const sendGivenPathsToDevice = async (paths: string[], device: DeviceView) => {
         </div>
 
         <div class="empty-state" v-else>
-          <div class="radar-ping"></div>
-          <p class="text-muted">Looking for nearby devices...</p>
+          <p>Scanning local network</p>
+          <p class="text-muted">Keep both devices awake and on the same Wi-Fi/LAN.</p>
         </div>
       </div>
     </main>
@@ -132,102 +146,112 @@ const sendGivenPathsToDevice = async (paths: string[], device: DeviceView) => {
   height: 100%;
   display: flex;
   flex-direction: column;
+  background: linear-gradient(160deg, rgba(255, 255, 255, 0.4), transparent 35%);
 }
 
 .view-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 24px 32px;
-  background: linear-gradient(to bottom, rgba(15, 17, 21, 0.8), transparent);
+  gap: 14px;
+  padding: 26px 28px 14px;
+}
+
+.title-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.subtitle {
+  font-size: 0.86rem;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .my-identity {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 16px;
-  background: var(--bg-surface-elevated);
-  border-radius: var(--radius-full);
-  border: 1px solid var(--border-light);
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  padding: 7px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.5);
 }
 
-.status-dot {
-  width: 8px;
-  height: 8px;
-  background: var(--success);
-  border-radius: 50%;
-  box-shadow: 0 0 8px rgba(16, 185, 129, 0.6);
+.identity-label {
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-subtle);
+}
+
+.identity-name {
+  font-size: 0.86rem;
+  font-weight: 600;
+  color: var(--text-secondary);
 }
 
 .content {
   flex: 1;
-  padding: 0 32px 32px;
+  padding: 0 28px 26px;
   display: flex;
   flex-direction: column;
-  gap: 32px;
+  gap: 20px;
   overflow-y: auto;
 }
 
 .devices-section {
   display: flex;
   flex-direction: column;
-  gap: 16px;
-}
-
-.subtitle {
-  margin-top: -8px;
+  gap: 14px;
 }
 
 .devices-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-  gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+  gap: 12px;
 }
 
 .empty-state {
-  height: 200px;
+  min-height: 210px;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 24px;
-  background: rgba(255, 255, 255, 0.02);
-  border: 1px dashed var(--border-light);
-  border-radius: var(--radius-xl);
-}
-
-.radar-ping {
-  width: 48px;
-  height: 48px;
-  border-radius: 50%;
-  background: rgba(59, 130, 246, 0.2);
-  animation: pulse-glow 2s infinite cubic-bezier(0.4, 0, 0.6, 1);
-}
-
-.system-error-banner {
-  background: rgba(239, 68, 68, 0.15);
-  border-bottom: 1px solid rgba(239, 68, 68, 0.3);
-  color: #fca5a5;
-  padding: 10px 32px;
-  font-size: 0.9rem;
-  cursor: pointer;
-  transition: background 0.2s ease;
-}
-
-.system-error-banner:hover {
-  background: rgba(239, 68, 68, 0.25);
+  gap: 8px;
+  border: 1px dashed var(--border-subtle);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.42);
+  color: var(--text-secondary);
 }
 
 .incoming-hint {
-  position: absolute;
-  bottom: 18px;
-  right: 24px;
-  padding: 8px 12px;
-  border-radius: var(--radius-md);
-  background: rgba(59, 130, 246, 0.15);
-  border: 1px solid rgba(59, 130, 246, 0.35);
-  color: #93c5fd;
-  font-size: 0.85rem;
+  margin: 0 28px 20px auto;
+  padding: 7px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.75);
+  color: var(--text-secondary);
+  font-size: 0.76rem;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+@media (max-width: 820px) {
+  .view-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .header-actions {
+    width: 100%;
+    justify-content: space-between;
+  }
 }
 </style>

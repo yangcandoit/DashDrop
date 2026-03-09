@@ -25,6 +25,25 @@ const insecureStorage = ref(false);
 const runtimeStatus = ref<RuntimeStatus | null>(null);
 const metrics = ref<TransferMetrics | null>(null);
 
+const formatSize = (bytes: number) => {
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(1)} KB`;
+  const mb = kb / 1024;
+  if (mb < 1024) return `${mb.toFixed(1)} MB`;
+  const gb = mb / 1024;
+  return `${gb.toFixed(1)} GB`;
+};
+
+const formatDuration = (ms: number) => {
+  if (ms < 1000) return `${ms} ms`;
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)} s`;
+  const minutes = Math.floor(seconds / 60);
+  const remain = Math.round(seconds % 60);
+  return `${minutes}m ${remain}s`;
+};
+
 const loadRuntime = async () => {
   runtimeStatus.value = await getRuntimeStatus();
   metrics.value = await getTransferMetrics();
@@ -84,7 +103,7 @@ async function save() {
   <div class="settings-view">
     <header class="app-header">
       <div class="header-left">
-        <button class="btn-icon" @click="emit('back')">← Back</button>
+        <button class="btn btn-secondary" @click="emit('back')">Back</button>
         <h2>Settings</h2>
       </div>
     </header>
@@ -100,14 +119,14 @@ async function save() {
         <label>Device Fingerprint</label>
         <div class="path-picker">
           <input type="text" :value="fingerprint" class="input-field" readonly style="font-family: monospace; font-size: 0.85em; opacity: 0.8;" />
-          <button @click="copyFingerprint" class="btn-secondary">Copy</button>
+          <button @click="copyFingerprint" class="btn btn-secondary">Copy</button>
         </div>
       </div>
       <div class="form-group">
         <label>Download Directory</label>
         <div class="path-picker">
           <input type="text" v-model="form.download_dir" class="input-field" placeholder="Default (~/Downloads/DashDrop)" />
-          <button @click="pickFolder" class="btn-secondary">Browse</button>
+          <button @click="pickFolder" class="btn btn-secondary">Browse</button>
         </div>
       </div>
       <div class="form-group">
@@ -157,15 +176,15 @@ async function save() {
         </div>
         <div class="runtime-card">
           <div class="runtime-label">Bytes Sent</div>
-          <div class="runtime-value">{{ metrics.bytes_sent }}</div>
+          <div class="runtime-value">{{ formatSize(metrics.bytes_sent) }}</div>
         </div>
         <div class="runtime-card">
           <div class="runtime-label">Bytes Received</div>
-          <div class="runtime-value">{{ metrics.bytes_received }}</div>
+          <div class="runtime-value">{{ formatSize(metrics.bytes_received) }}</div>
         </div>
         <div class="runtime-card">
           <div class="runtime-label">Average Duration</div>
-          <div class="runtime-value">{{ metrics.average_duration_ms }} ms</div>
+          <div class="runtime-value">{{ formatDuration(metrics.average_duration_ms) }}</div>
         </div>
         <div class="runtime-card">
           <div class="runtime-label">Failure Distribution</div>
@@ -178,8 +197,8 @@ async function save() {
         </div>
       </div>
       <div class="actions">
-        <button @click="loadRuntime" class="btn-secondary">Refresh Runtime</button>
-        <button @click="save" class="btn-primary">Save Changes</button>
+        <button @click="loadRuntime" class="btn btn-secondary">Refresh Runtime</button>
+        <button @click="save" class="btn btn-primary">Save Changes</button>
       </div>
     </main>
   </div>
@@ -191,13 +210,13 @@ async function save() {
   height: 100%;
   display: flex;
   flex-direction: column;
+  background: linear-gradient(190deg, rgba(255, 255, 255, 0.33), transparent 32%);
 }
 
 .app-header {
   display: flex;
   align-items: center;
-  padding: 24px 32px;
-  background: linear-gradient(to bottom, rgba(15, 17, 21, 0.8), transparent);
+  padding: 26px 28px 12px;
 }
 
 .header-left {
@@ -208,22 +227,14 @@ async function save() {
 
 .header-left h2 {
   margin: 0;
-  font-size: 1.5rem;
+  font-size: 1.42rem;
   font-weight: 600;
 }
 
-.btn-icon {
-  background: transparent;
-  border: none;
-  color: var(--text-primary);
-  font-size: 1rem;
-  cursor: pointer;
-  padding: 8px;
-}
-
 .content {
-  margin: 0 32px 32px 32px;
+  margin: 0 28px 24px;
   padding: 24px;
+  border-radius: 18px;
   display: flex;
   flex-direction: column;
   gap: 24px;
@@ -231,10 +242,10 @@ async function save() {
 
 .security-warning {
   padding: 10px 12px;
-  border-radius: 8px;
-  border: 1px solid rgba(239, 68, 68, 0.5);
-  background: rgba(127, 29, 29, 0.25);
-  color: #fca5a5;
+  border-radius: 10px;
+  border: 1px solid rgba(157, 58, 51, 0.35);
+  background: rgba(157, 58, 51, 0.08);
+  color: #7f2f2a;
   font-size: 0.9rem;
 }
 
@@ -246,7 +257,7 @@ async function save() {
 
 .form-group label {
   font-size: 0.9rem;
-  color: var(--text-secondary);
+  color: var(--text-muted);
 }
 
 .checkbox-label {
@@ -257,10 +268,10 @@ async function save() {
 
 .input-field {
   padding: 10px 12px;
-  border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  background: rgba(0, 0, 0, 0.2);
-  color: var(--text-primary);
+  border-radius: 10px;
+  border: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--text-secondary);
   font-size: 1rem;
   width: 100%;
 }
@@ -268,25 +279,6 @@ async function save() {
 .path-picker {
   display: flex;
   gap: 12px;
-}
-
-.btn-secondary {
-  padding: 10px 16px;
-  border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  background: rgba(255, 255, 255, 0.05);
-  color: var(--text-primary);
-  cursor: pointer;
-}
-
-.btn-primary {
-  padding: 12px 24px;
-  border-radius: 8px;
-  border: none;
-  background: var(--accent-gradient);
-  color: white;
-  font-weight: 600;
-  cursor: pointer;
 }
 
 .runtime-grid {
@@ -297,14 +289,14 @@ async function save() {
 
 .runtime-card {
   padding: 10px 12px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border-light);
-  background: var(--bg-surface);
+  border-radius: 10px;
+  border: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.7);
 }
 
 .runtime-label {
   font-size: 0.8rem;
-  color: var(--text-secondary);
+  color: var(--text-muted);
 }
 
 .runtime-value {
@@ -317,5 +309,11 @@ async function save() {
   display: flex;
   gap: 10px;
   align-items: center;
+}
+
+@media (max-width: 780px) {
+  .runtime-grid {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { ref } from 'vue';
-import { 
-  acceptTransfer, rejectTransfer, acceptAndPairTransfer 
+import {
+  acceptTransfer,
+  rejectTransfer,
+  acceptAndPairTransfer
 } from '../ipc';
 import type { FileItemMeta } from '../types';
 
@@ -33,7 +35,7 @@ const handleAccept = async () => {
   try {
     await acceptTransfer(props.transferId);
   } catch (error) {
-    console.error("Failed to accept transfer:", error);
+    console.error('Failed to accept transfer:', error);
   } finally {
     isProcessing.value = false;
     emit('close');
@@ -45,7 +47,7 @@ const handleAcceptAndPair = async () => {
   try {
     await acceptAndPairTransfer(props.transferId, props.senderFp);
   } catch (error) {
-    console.error("Failed to accept & pair:", error);
+    console.error('Failed to accept & pair:', error);
   } finally {
     isProcessing.value = false;
     emit('close');
@@ -57,7 +59,7 @@ const handleReject = async () => {
   try {
     await rejectTransfer(props.transferId);
   } catch (error) {
-    console.error("Failed to reject transfer:", error);
+    console.error('Failed to reject transfer:', error);
   } finally {
     isProcessing.value = false;
     emit('close');
@@ -69,23 +71,20 @@ const handleReject = async () => {
   <div class="modal-backdrop">
     <div class="modal glass-panel animate-fade-in">
       <h2>Incoming Transfer</h2>
-      
+
       <div class="sender-info">
-        <div class="avatar text-gradient">{{ senderName.charAt(0).toUpperCase() }}</div>
+        <div class="avatar">{{ senderName.charAt(0).toUpperCase() }}</div>
         <div>
           <h3>{{ senderName }}</h3>
-          <p class="text-muted text-sm">wants to send you files</p>
+          <p class="text-muted text-sm">wants to send files</p>
         </div>
       </div>
 
       <div class="security-warning" v-if="!trusted">
-        <svg viewBox="0 0 24 24" fill="none" class="icon-warn" stroke="currentColor" stroke-width="2">
-          <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-        </svg>
         <div>
-          <span>This is the first time connecting with this device. Verify identity if possible:</span>
-          <br>
-          <code style="margin-top: 8px; display: inline-block; word-break: break-all; font-family: monospace; font-size: 0.85em; background: rgba(0,0,0,0.2); padding: 4px; border-radius: 4px;">{{ senderFp }}</code>
+          <span>First-time peer. Verify fingerprint before accepting sensitive files:</span>
+          <br />
+          <code class="fingerprint">{{ senderFp }}</code>
         </div>
       </div>
 
@@ -96,9 +95,6 @@ const handleReject = async () => {
         </div>
         <div class="files">
           <div v-for="item in items.slice(0, 3)" :key="item.file_id" class="file-item">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="icon-sm">
-              <path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-            </svg>
             <span class="file-name" :title="item.rel_path">{{ item.name }}</span>
             <span class="file-size text-muted">{{ formatBytes(item.size) }}</span>
           </div>
@@ -127,7 +123,7 @@ const handleReject = async () => {
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.6);
+  background: rgba(39, 33, 25, 0.38);
   backdrop-filter: blur(4px);
   display: flex;
   align-items: center;
@@ -140,7 +136,7 @@ const handleReject = async () => {
   width: 100%;
   max-width: 440px;
   padding: 24px;
-  border-radius: var(--radius-xl);
+  border-radius: 16px;
   display: flex;
   flex-direction: column;
   gap: 20px;
@@ -151,37 +147,49 @@ const handleReject = async () => {
   align-items: center;
   gap: 16px;
   padding: 16px;
-  background: rgba(255, 255, 255, 0.03);
-  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.52);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
 }
 
 .avatar {
   width: 48px;
   height: 48px;
-  border-radius: 50%;
-  background: rgba(59, 130, 246, 0.1);
+  border-radius: 10px;
+  background: linear-gradient(165deg, rgba(178, 79, 52, 0.16), rgba(214, 174, 140, 0.35));
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 1.5rem;
+  font-size: 1.2rem;
+  font-family: var(--font-display);
   font-weight: 600;
+  color: #6f3224;
+}
+
+.text-sm {
+  font-size: 0.84rem;
 }
 
 .security-warning {
-  display: flex;
-  align-items: flex-start;
-  gap: 12px;
   padding: 12px 16px;
-  background: rgba(245, 158, 11, 0.1);
-  color: var(--warning);
-  border-radius: var(--radius-md);
+  border: 1px solid rgba(154, 93, 28, 0.25);
+  background: rgba(154, 93, 28, 0.08);
+  color: #8e4f17;
+  border-radius: 10px;
   font-size: 0.9rem;
   line-height: 1.4;
 }
 
-.icon-warn {
-  width: 20px;
-  flex-shrink: 0;
+.fingerprint {
+  margin-top: 8px;
+  display: inline-block;
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+  font-size: 0.8em;
+  background: rgba(255, 255, 255, 0.55);
+  border: 1px solid rgba(154, 93, 28, 0.2);
+  padding: 4px 6px;
+  border-radius: 6px;
 }
 
 .file-list {
@@ -195,13 +203,14 @@ const handleReject = async () => {
   justify-content: space-between;
   font-size: 0.9rem;
   font-weight: 500;
-  color: var(--text-secondary);
+  color: var(--text-muted);
   padding: 0 4px;
 }
 
 .files {
-  background: var(--bg-surface-elevated);
-  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.62);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
   padding: 8px;
   max-height: 200px;
   overflow-y: auto;
@@ -210,19 +219,13 @@ const handleReject = async () => {
 .file-item {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   padding: 8px;
-  border-radius: var(--radius-sm);
+  border-radius: 8px;
 }
 
 .file-item:hover {
-  background: var(--bg-surface-hover);
-}
-
-.icon-sm {
-  width: 16px;
-  height: 16px;
-  color: var(--text-tertiary);
+  background: rgba(255, 255, 255, 0.74);
 }
 
 .file-name {
@@ -239,7 +242,7 @@ const handleReject = async () => {
 
 .more {
   justify-content: center;
-  color: var(--text-tertiary);
+  color: var(--text-muted);
   font-style: italic;
 }
 
@@ -257,13 +260,13 @@ const handleReject = async () => {
 
 .outline {
   background: transparent !important;
-  color: var(--text-primary) !important;
-  border: 1px solid var(--accent-primary) !important;
+  color: var(--text-secondary) !important;
+  border: 1px solid var(--border-strong) !important;
   box-shadow: none !important;
 }
 
 .outline:hover {
-  background: rgba(59, 130, 246, 0.1) !important;
+  background: rgba(255, 255, 255, 0.7) !important;
 }
 
 button:disabled {

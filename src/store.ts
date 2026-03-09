@@ -61,6 +61,8 @@ function transferErrorNextSteps(reasonCode: string): string[] {
       return ["Stop transfer and verify fingerprint before retrying."];
     case "E_PATH_CONFLICT":
       return ["Adjust conflict strategy in Settings or rename source files, then retry."];
+    case "E_PROTOCOL":
+      return ["Open Security or History, then retry after both peers are reachable."];
     default:
       return ["Open Security/History for details, then retry."];
   }
@@ -72,22 +74,40 @@ function normalizeReasonCode(reasonCode: string): string {
 
 function summarizeTransferError(err: { reason_code: string; terminal_cause: string; detail?: string }): string {
   const code = normalizeReasonCode(err.reason_code);
+  if (code === "E_TIMEOUT") {
+    return "Timed out while waiting for peer response";
+  }
+  if (code === "E_DISK_FULL") {
+    return "Receiver reported insufficient disk space";
+  }
+  if (code === "E_IDENTITY_MISMATCH") {
+    return "Peer identity verification failed";
+  }
+  if (code === "E_PATH_CONFLICT") {
+    return "Receiver encountered a file conflict";
+  }
   if (code !== "E_PROTOCOL") {
-    return code;
+    return code.replace(/^E_/, "").replace(/_/g, " ").toLowerCase();
   }
 
   const rawDetail = err.detail || (!err.reason_code.startsWith("E_") ? err.reason_code : "");
   const detail = rawDetail.toLowerCase();
   if (detail.includes("read len") || detail.includes("read body")) {
-    return `${code} (control stream closed)`;
+    return "Connection closed before control stream completed";
   }
   if (detail.includes("quic handshake")) {
-    return `${code} (quic handshake failed)`;
+    return "Secure channel handshake failed";
+  }
+  if (detail.includes("all connection attempts failed")) {
+    return "Peer is unreachable on all advertised addresses";
+  }
+  if (detail.includes("connection attempts failed")) {
+    return "Could not establish a reliable connection to peer";
   }
   if (err.terminal_cause && err.terminal_cause !== "SystemError") {
-    return `${code} (${err.terminal_cause})`;
+    return `Protocol failure during ${err.terminal_cause}`;
   }
-  return code;
+  return "Protocol error during transfer";
 }
 
 function setSystemError(message: string, timeoutMs = 10_000) {
@@ -351,7 +371,7 @@ export async function initAppStore() {
       }
       setSystemError(
         actionableMessage(
-          `Transfer error (${err.phase}): ${summarizeTransferError(err)}`,
+          `Transfer failed during ${err.phase}: ${summarizeTransferError(err)}`,
           transferErrorNextSteps(normalizedReasonCode),
         ),
       );

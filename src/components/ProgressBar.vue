@@ -132,17 +132,19 @@ watch(() => props.status, (newStatus) => {
 }
 
 .status-badge {
-  font-size: 0.85rem;
-  font-weight: 500;
-  color: var(--accent-primary);
+  font-size: 0.8rem;
+  font-weight: 650;
+  color: #7b3a28;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
 }
 
-.status-badge.error { color: var(--error); }
+.status-badge.error { color: var(--danger); }
 .status-badge.success { color: var(--success); }
 
 .progress-track {
   height: 6px;
-  background: var(--bg-surface-elevated);
+  background: rgba(90, 75, 51, 0.16);
   border-radius: var(--radius-full);
   overflow: hidden;
   position: relative;
@@ -150,13 +152,13 @@ watch(() => props.status, (newStatus) => {
 
 .progress-fill {
   height: 100%;
-  background: var(--accent-gradient);
+  background: linear-gradient(130deg, #d59879 0%, #b24f34 100%);
   border-radius: var(--radius-full);
   transition: width 0.3s ease-out;
 }
 
 .progress-track.error .progress-fill {
-  background: var(--error);
+  background: var(--danger);
 }
 
 .progress-track.success .progress-fill {

@@ -1,8 +1,19 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 import { activeTransfers, incomingQueue } from '../store';
 import ProgressBar from '../components/ProgressBar.vue';
-import { acceptTransfer, acceptAndPairTransfer, cancelAllTransfers, cancelTransfer, connectByAddress, openTransferFolder, pairDevice, rejectTransfer, retryTransfer } from '../ipc';
+import {
+  acceptTransfer,
+  acceptAndPairTransfer,
+  cancelAllTransfers,
+  cancelTransfer,
+  connectByAddress,
+  openTransferFolder,
+  pairDevice,
+  rejectTransfer,
+  retryTransfer,
+} from '../ipc';
+import type { ConnectByAddressResult } from '../types';
 
 const emit = defineEmits(['openSettings']);
 
@@ -10,6 +21,13 @@ const hasTransfers = computed(() => Object.keys(activeTransfers.value).length > 
 const hasActiveRunning = computed(() =>
   Object.values(activeTransfers.value).some((t) => t.status === 'PendingAccept' || t.status === 'Transferring'),
 );
+
+const showConnectDialog = ref(false);
+const connectAddress = ref('');
+const connectLoading = ref(false);
+const connectError = ref<string | null>(null);
+const connectResult = ref<ConnectByAddressResult | null>(null);
+const rememberDevice = ref(true);
 
 const handleAccept = async (id: string) => {
   await acceptTransfer(id);
@@ -33,25 +51,87 @@ const formatSize = (bytes: number) => {
   return `${gb.toFixed(1)} GB`;
 };
 
-const handleConnectByAddress = async () => {
+const formatRate = (bytesPerSecond: number) => `${formatSize(bytesPerSecond)}/s`;
+
+const transferRate = (t: { status: string; started_at_unix?: number; bytes_transferred: number }) => {
+  if (t.status !== 'Transferring' || !t.started_at_unix || t.bytes_transferred <= 0) {
+    return null;
+  }
+  const elapsedSec = Math.max(1, Math.floor(Date.now() / 1000) - t.started_at_unix);
+  return t.bytes_transferred / elapsedSec;
+};
+
+const transferItemsPreview = (items: Array<{ name: string }>) => {
+  if (!items.length) return 'No items';
+  const visible = items.slice(0, 3).map((i) => i.name).join(', ');
+  if (items.length <= 3) return visible;
+  return `${visible} +${items.length - 3}`;
+};
+
+const errorToMessage = (error: unknown): string => {
+  const text = String(error || '').trim();
+  if (!text) return 'Unable to connect to that address right now.';
+  if (text.toLowerCase().includes('handshake')) {
+    return 'Handshake failed. Verify both devices run compatible versions and are on the same LAN.';
+  }
+  if (text.toLowerCase().includes('identity')) {
+    return 'Identity verification failed. Confirm fingerprint out-of-band before retrying.';
+  }
+  if (text.toLowerCase().includes('connection attempts failed')) {
+    return 'No route to the peer from this network. Check address, firewall and local network.';
+  }
+  return text;
+};
+
+const openConnectDialog = () => {
+  showConnectDialog.value = true;
+  connectAddress.value = '';
+  connectError.value = null;
+  connectResult.value = null;
+  rememberDevice.value = true;
+};
+
+const closeConnectDialog = () => {
+  if (connectLoading.value) return;
+  showConnectDialog.value = false;
+};
+
+const lookupPeerByAddress = async () => {
+  const address = connectAddress.value.trim();
+  if (!address) {
+    connectError.value = 'Enter a host:port value.';
+    return;
+  }
+
+  connectLoading.value = true;
+  connectError.value = null;
+  connectResult.value = null;
+
   try {
-    const address = window.prompt('Enter peer address (host:port)');
-    if (!address) return;
-    const result = await connectByAddress(address.trim());
-    const ok = window.confirm(
-      `Connected to ${result.address}\nFingerprint: ${result.fingerprint}\n\nConfirm this identity before sending files.`,
-    );
-    if (!ok) return;
-    if (!result.trusted) {
-      const remember = window.confirm(
-        `Remember and pair this device?\n${result.name}\n${result.fingerprint}`,
-      );
-      if (remember) {
-        await pairDevice(result.fingerprint);
-      }
-    }
+    const result = await connectByAddress(address);
+    connectResult.value = result;
+    rememberDevice.value = !result.trusted;
   } catch (e) {
-    console.error('Connect by address failed', e);
+    connectError.value = errorToMessage(e);
+  } finally {
+    connectLoading.value = false;
+  }
+};
+
+const confirmConnectIdentity = async () => {
+  if (!connectResult.value) return;
+
+  connectLoading.value = true;
+  connectError.value = null;
+  try {
+    if (rememberDevice.value && !connectResult.value.trusted) {
+      await pairDevice(connectResult.value.fingerprint);
+    }
+    showConnectDialog.value = false;
+  } catch (e) {
+    connectError.value = errorToMessage(e);
+  } finally {
+    connectLoading.value = false;
   }
 };
 
@@ -63,8 +143,7 @@ const canRetry = (status: string, direction: string) =>
     status === 'Rejected' ||
     status === 'PartialCompleted');
 
-const retryLabel = (status: string) =>
-  status === 'PartialCompleted' ? 'Retry Failed Files' : 'Retry';
+const retryLabel = (status: string) => (status === 'PartialCompleted' ? 'Retry Failed Files' : 'Retry');
 
 const handleRetry = async (transferId: string) => {
   try {
@@ -86,15 +165,19 @@ const handleCancelAll = async () => {
 <template>
   <div class="view-container animate-fade-in">
     <header class="view-header">
-      <h2>Transfers</h2>
-      <button class="btn btn-secondary" style="padding: 6px 12px;" @click="emit('openSettings')">⚙️</button>
+      <div class="title-wrap">
+        <h2>Transfers</h2>
+        <p class="text-muted">Incoming requests, active jobs and retries</p>
+      </div>
+      <button class="btn btn-secondary" @click="emit('openSettings')">Settings</button>
     </header>
+
     <main class="content">
       <div class="top-actions">
         <button class="btn btn-secondary" :disabled="!hasActiveRunning" @click="handleCancelAll">
           Cancel All Active
         </button>
-        <button class="btn btn-secondary" @click="handleConnectByAddress">
+        <button class="btn btn-secondary" @click="openConnectDialog">
           Connect by Address
         </button>
       </div>
@@ -109,12 +192,14 @@ const handleCancelAll = async () => {
                 {{ request.items.length }} items • {{ formatSize(request.total_size) }}
               </div>
               <div v-if="!request.trusted" class="risk text-muted">
-                Untrusted device • verify fingerprint {{ request.sender_fp.slice(-8) }}
+                Verify fingerprint {{ request.sender_fp.slice(-8) }}
               </div>
             </div>
             <div class="incoming-actions">
               <button class="btn btn-secondary" @click="handleReject(request.transfer_id)">Reject</button>
-              <button class="btn btn-secondary" v-if="!request.trusted" @click="handleAcceptAndPair(request.transfer_id, request.sender_fp)">Accept & Pair</button>
+              <button class="btn btn-secondary" v-if="!request.trusted" @click="handleAcceptAndPair(request.transfer_id, request.sender_fp)">
+                Accept & Pair
+              </button>
               <button class="btn btn-primary" @click="handleAccept(request.transfer_id)">Accept</button>
             </div>
           </article>
@@ -123,35 +208,45 @@ const handleCancelAll = async () => {
 
       <div class="transfers-list" v-if="hasTransfers">
         <div v-for="t in activeTransfers" :key="t.id" class="transfer-card">
-          <div class="transfer-meta" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-            <span class="peer-name">{{ t.direction === 'Send' ? 'To ' : 'From ' }}{{ t.peer_name }}</span>
-            <div class="transfer-actions" style="display: flex; gap: 8px;">
-              <button 
-                v-if="t.status === 'Transferring' || t.status === 'PendingAccept'" 
-                @click="cancelTransfer(t.id)" 
-                style="font-size: 0.8rem; padding: 4px 8px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.2); background: transparent; color: inherit; cursor: pointer;">
+          <div class="transfer-meta">
+            <div class="transfer-main">
+              <span class="peer-name">{{ t.direction === 'Send' ? 'To ' : 'From ' }}{{ t.peer_name }}</span>
+              <p class="transfer-files text-muted">{{ transferItemsPreview(t.items) }}</p>
+            </div>
+            <div class="transfer-actions">
+              <button
+                v-if="t.status === 'Transferring' || t.status === 'PendingAccept'"
+                @click="cancelTransfer(t.id)"
+                class="mini-btn"
+              >
                 Cancel
               </button>
-              <button 
-                v-if="t.status === 'Completed' && t.direction === 'Receive'" 
-                @click="openTransferFolder(t.id)" 
-                style="font-size: 0.8rem; padding: 4px 8px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.2); background: transparent; color: inherit; cursor: pointer;">
+              <button
+                v-if="t.status === 'Completed' && t.direction === 'Receive'"
+                @click="openTransferFolder(t.id)"
+                class="mini-btn"
+              >
                 Open Folder
               </button>
               <button
                 v-if="canRetry(t.status, t.direction)"
                 @click="handleRetry(t.id)"
-                style="font-size: 0.8rem; padding: 4px 8px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.2); background: transparent; color: inherit; cursor: pointer;">
+                class="mini-btn"
+              >
                 {{ retryLabel(t.status) }}
               </button>
             </div>
           </div>
-          <ProgressBar 
-            :progress="t.total_bytes > 0 ? (t.bytes_transferred / t.total_bytes) : 0"
+          <ProgressBar
+            :progress="t.total_bytes > 0 ? t.bytes_transferred / t.total_bytes : 0"
             :status="t.status"
             :bytesReceived="t.bytes_transferred"
             :totalBytes="t.total_bytes"
           />
+          <div class="transfer-foot">
+            <span class="text-muted">{{ formatSize(t.bytes_transferred) }} / {{ formatSize(t.total_bytes) }}</span>
+            <span v-if="transferRate(t)" class="rate-chip">{{ formatRate(transferRate(t) || 0) }}</span>
+          </div>
         </div>
       </div>
 
@@ -159,6 +254,62 @@ const handleCancelAll = async () => {
         <p class="text-muted">No active transfers.</p>
       </div>
     </main>
+
+    <div v-if="showConnectDialog" class="dialog-backdrop" @click.self="closeConnectDialog">
+      <section class="dialog-card">
+        <div class="dialog-header">
+          <h3>Connect by Address</h3>
+          <button class="btn btn-secondary" :disabled="connectLoading" @click="closeConnectDialog">Close</button>
+        </div>
+
+        <div class="dialog-body">
+          <label class="field-label" for="connect-address">Peer address</label>
+          <input
+            id="connect-address"
+            v-model="connectAddress"
+            class="field-input"
+            placeholder="192.168.1.7:50306"
+            :disabled="connectLoading"
+            @keyup.enter="lookupPeerByAddress"
+          />
+          <p class="text-muted field-help">Use host:port from a trusted peer in the same LAN.</p>
+
+          <div v-if="connectResult" class="peer-preview">
+            <div class="preview-row">
+              <span class="preview-key">Peer</span>
+              <span class="preview-value">{{ connectResult.name }}</span>
+            </div>
+            <div class="preview-row">
+              <span class="preview-key">Address</span>
+              <span class="preview-value">{{ connectResult.address }}</span>
+            </div>
+            <div class="preview-row">
+              <span class="preview-key">Fingerprint</span>
+              <code class="fingerprint">{{ connectResult.fingerprint }}</code>
+            </div>
+            <label v-if="!connectResult.trusted" class="remember-row">
+              <input type="checkbox" v-model="rememberDevice" :disabled="connectLoading" />
+              <span>Pair and remember this device after confirmation</span>
+            </label>
+          </div>
+
+          <div v-if="connectError" class="connect-error">{{ connectError }}</div>
+        </div>
+
+        <div class="dialog-actions">
+          <button class="btn btn-secondary" :disabled="connectLoading" @click="lookupPeerByAddress">
+            {{ connectLoading && !connectResult ? 'Connecting...' : 'Connect' }}
+          </button>
+          <button
+            class="btn btn-primary"
+            :disabled="!connectResult || connectLoading"
+            @click="confirmConnectIdentity"
+          >
+            {{ connectLoading && connectResult ? 'Saving...' : 'Confirm Fingerprint' }}
+          </button>
+        </div>
+      </section>
+    </div>
   </div>
 </template>
 
@@ -168,32 +319,46 @@ const handleCancelAll = async () => {
   height: 100%;
   display: flex;
   flex-direction: column;
+  background: linear-gradient(190deg, rgba(255, 255, 255, 0.35), transparent 34%);
+  position: relative;
 }
 
 .view-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 24px 32px;
+  padding: 26px 28px 12px;
+}
+
+.title-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
 .content {
   flex: 1;
-  padding: 0 32px 32px;
+  padding: 0 28px 24px;
   display: flex;
   flex-direction: column;
-  gap: 24px;
+  gap: 14px;
+  overflow-y: auto;
 }
 
 .top-actions {
   display: flex;
   justify-content: flex-end;
+  gap: 10px;
 }
 
 .incoming-section {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 16px;
+  border: 1px solid rgba(154, 93, 28, 0.22);
+  background: rgba(154, 93, 28, 0.08);
 }
 
 .incoming-list {
@@ -208,9 +373,9 @@ const handleCancelAll = async () => {
   justify-content: space-between;
   gap: 12px;
   padding: 14px;
-  border-radius: var(--radius-md);
-  border: 1px solid var(--border-light);
-  background: rgba(245, 158, 11, 0.08);
+  border-radius: 12px;
+  border: 1px solid rgba(154, 93, 28, 0.18);
+  background: rgba(255, 255, 255, 0.68);
 }
 
 .incoming-main .peer {
@@ -220,6 +385,7 @@ const handleCancelAll = async () => {
 .incoming-main .meta,
 .incoming-main .risk {
   font-size: 0.85rem;
+  color: #8e4f17;
 }
 
 .incoming-actions {
@@ -232,32 +398,259 @@ const handleCancelAll = async () => {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(255,255,255,0.02);
-  border: 1px dashed var(--border-light);
-  border-radius: var(--radius-xl);
+  background: rgba(255, 255, 255, 0.4);
+  border: 1px dashed var(--border-subtle);
+  border-radius: 16px;
 }
 
 .transfers-list {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  max-height: calc(100vh - 180px);
-  overflow-y: auto;
 }
 
 .transfer-card {
-  padding: 16px;
-  background: var(--bg-surface);
-  border-radius: var(--radius-md);
-  border: 1px solid var(--border-light);
+  padding: 14px;
+  background: rgba(255, 255, 255, 0.72);
+  border-radius: 14px;
+  border: 1px solid var(--border-subtle);
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
+  box-shadow: var(--shadow-card);
 }
 
 .transfer-meta {
   display: flex;
   justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 8px;
   font-weight: 500;
+}
+
+.transfer-main {
+  min-width: 0;
+}
+
+.transfer-files {
+  margin-top: 4px;
+  font-size: 0.78rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 460px;
+}
+
+.transfer-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.mini-btn {
+  min-height: 28px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  background: #fffdf9;
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+}
+
+.transfer-foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.78rem;
+}
+
+.rate-chip {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid rgba(47, 107, 82, 0.28);
+  color: #2f6b52;
+  background: rgba(47, 107, 82, 0.08);
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.dialog-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(33, 30, 24, 0.38);
+  backdrop-filter: blur(6px);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 18px;
+  z-index: 40;
+}
+
+.dialog-card {
+  width: min(620px, 100%);
+  border-radius: 18px;
+  border: 1px solid var(--border-subtle);
+  background: #fffcf6;
+  box-shadow: var(--shadow-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px;
+}
+
+.dialog-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.field-label {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-subtle);
+}
+
+.field-input {
+  width: 100%;
+  min-height: 42px;
+  border-radius: 10px;
+  border: 1px solid var(--border-subtle);
+  background: #fff;
+  color: var(--text-secondary);
+  padding: 9px 11px;
+}
+
+.field-help {
+  font-size: 0.8rem;
+}
+
+.peer-preview {
+  margin-top: 4px;
+  border-radius: 12px;
+  border: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.7);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.preview-row {
+  display: grid;
+  grid-template-columns: 90px 1fr;
+  gap: 8px;
+  align-items: start;
+}
+
+.preview-key {
+  font-size: 0.76rem;
+  color: var(--text-subtle);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.preview-value {
+  color: var(--text-secondary);
+  font-size: 0.86rem;
+}
+
+.fingerprint {
+  font-size: 0.74rem;
+  line-height: 1.5;
+  color: #6a3f2b;
+  word-break: break-all;
+  padding: 4px 6px;
+  border-radius: 8px;
+  border: 1px solid rgba(178, 79, 52, 0.25);
+  background: rgba(255, 249, 245, 0.75);
+}
+
+.remember-row {
+  margin-top: 4px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 0.84rem;
+}
+
+.connect-error {
+  border: 1px solid rgba(157, 58, 51, 0.3);
+  background: rgba(157, 58, 51, 0.08);
+  color: #8a3129;
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 0.82rem;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+@media (max-width: 820px) {
+  .view-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+  }
+
+  .top-actions {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .incoming-card {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .incoming-actions {
+    width: 100%;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+  }
+
+  .transfer-meta {
+    flex-direction: column;
+  }
+
+  .transfer-files {
+    max-width: 100%;
+  }
+
+  .dialog-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .preview-row {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+
+  .dialog-actions {
+    width: 100%;
+    justify-content: stretch;
+  }
+
+  .dialog-actions .btn {
+    flex: 1;
+  }
 }
 </style>

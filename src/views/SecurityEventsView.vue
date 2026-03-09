@@ -27,10 +27,13 @@ const formatTime = (unix: number) => new Date(unix * 1000).toLocaleString();
 <template>
   <div class="view-container animate-fade-in">
     <header class="view-header">
-      <h2>Security Events</h2>
-      <div style="display:flex; gap:8px;">
+      <div class="title-wrap">
+        <h2>Security Events</h2>
+        <p class="text-muted">Identity and handshake audit trail</p>
+      </div>
+      <div class="header-actions">
         <button class="btn btn-secondary" @click="load">Refresh</button>
-        <button class="btn btn-secondary" style="padding: 6px 12px;" @click="emit('openSettings')">⚙️</button>
+        <button class="btn btn-secondary" @click="emit('openSettings')">Settings</button>
       </div>
     </header>
     <main class="content">
@@ -61,18 +64,31 @@ const formatTime = (unix: number) => new Date(unix * 1000).toLocaleString();
   height: 100%;
   display: flex;
   flex-direction: column;
+  background: linear-gradient(190deg, rgba(255, 255, 255, 0.32), transparent 32%);
 }
 
 .view-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 24px 32px;
+  gap: 12px;
+  padding: 26px 28px 12px;
+}
+
+.title-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.header-actions {
+  display: flex;
+  gap: 8px;
 }
 
 .content {
   flex: 1;
-  padding: 0 32px 32px;
+  padding: 0 28px 24px;
   overflow-y: auto;
 }
 
@@ -81,9 +97,9 @@ const formatTime = (unix: number) => new Date(unix * 1000).toLocaleString();
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(255,255,255,0.02);
-  border: 1px dashed var(--border-light);
-  border-radius: var(--radius-xl);
+  background: rgba(255,255,255,0.45);
+  border: 1px dashed var(--border-subtle);
+  border-radius: 16px;
 }
 
 .events-list {
@@ -94,9 +110,10 @@ const formatTime = (unix: number) => new Date(unix * 1000).toLocaleString();
 
 .event-card {
   padding: 14px;
-  border-radius: var(--radius-md);
-  border: 1px solid var(--border-light);
-  background: var(--bg-surface);
+  border-radius: 14px;
+  border: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.74);
+  box-shadow: var(--shadow-card);
 }
 
 .event-head {
@@ -108,6 +125,7 @@ const formatTime = (unix: number) => new Date(unix * 1000).toLocaleString();
 
 .event-type {
   font-weight: 600;
+  color: var(--text-secondary);
 }
 
 .event-meta {
@@ -116,6 +134,13 @@ const formatTime = (unix: number) => new Date(unix * 1000).toLocaleString();
 
 .event-reason {
   margin-top: 8px;
+  color: var(--text-secondary);
+}
+
+@media (max-width: 860px) {
+  .view-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
 }
 </style>
-

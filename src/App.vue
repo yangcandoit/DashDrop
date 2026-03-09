@@ -1,23 +1,24 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue';
-import { initAppStore, destroyAppStore } from './store';
+import { initAppStore, destroyAppStore, systemError } from './store';
 import NearbyView from './views/NearbyView.vue';
 import TransfersView from './views/TransfersView.vue';
 import HistoryView from './views/HistoryView.vue';
 import TrustedDevicesView from './views/TrustedDevicesView.vue';
 import SecurityEventsView from './views/SecurityEventsView.vue';
 import SettingsView from './views/SettingsView.vue';
+import SystemNotice from './components/SystemNotice.vue';
 
 const currentView = ref('Nearby');
 const showOnboarding = ref(false);
 
 const navItems = [
-  { id: 'Nearby', label: 'Nearby', icon: '📡' },
-  { id: 'Transfers', label: 'Transfers', icon: '↗️' },
-  { id: 'History', label: 'History', icon: '🕒' },
-  { id: 'TrustedDevices', label: 'Trusted', icon: '🛡️' },
-  { id: 'SecurityEvents', label: 'Security', icon: '🚨' },
-  { id: 'Settings', label: 'Settings', icon: '⚙️' },
+  { id: 'Nearby', label: 'Nearby' },
+  { id: 'Transfers', label: 'Transfers' },
+  { id: 'History', label: 'History' },
+  { id: 'TrustedDevices', label: 'Trusted Devices' },
+  { id: 'SecurityEvents', label: 'Security Events' },
+  { id: 'Settings', label: 'Settings' },
 ];
 
 onMounted(() => {
@@ -43,143 +44,179 @@ const dismissOnboarding = () => {
     window.localStorage.setItem('dashdrop_onboarding_seen_v1', '1');
   }
 };
+
+const dismissSystemError = () => {
+  systemError.value = null;
+};
 </script>
 
 <template>
-  <div class="app-layout">
-    <nav class="sidebar">
-      <div class="logo-area">
-        <svg viewBox="0 0 24 24" fill="none" class="icon-logo" stroke="url(#gradient)" stroke-width="2.5">
-          <defs>
-            <linearGradient id="gradient" x1="0%" y1="0%" x2="100%" y2="100%">
-              <stop offset="0%" stop-color="#3b82f6" />
-              <stop offset="100%" stop-color="#8b5cf6" />
-            </linearGradient>
-          </defs>
-          <path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
-        </svg>
-        <h2 class="text-gradient" style="font-size: 1.4rem;">DashDrop</h2>
+  <div class="app-shell">
+    <nav class="app-rail">
+      <div class="brand-block">
+        <div class="brand-title">DashDrop</div>
+        <p class="brand-subtitle">Local transfer desk</p>
       </div>
-      <ul class="nav-list">
-        <li v-for="item in navItems" :key="item.id">
+      <ul class="rail-nav">
+        <li v-for="(item, index) in navItems" :key="item.id">
           <button 
-            class="nav-btn" 
+            class="rail-btn" 
             :class="{ active: currentView === item.id }"
             @click="currentView = item.id"
           >
-            <span class="nav-icon">{{ item.icon }}</span>
-            <span class="nav-label">{{ item.label }}</span>
+            <span class="rail-index">{{ String(index + 1).padStart(2, '0') }}</span>
+            <span>{{ item.label }}</span>
           </button>
         </li>
       </ul>
     </nav>
-    <main class="main-content">
-      <NearbyView v-if="currentView === 'Nearby'" @open-settings="currentView = 'Settings'" />
-      <TransfersView v-if="currentView === 'Transfers'" @open-settings="currentView = 'Settings'" />
-      <HistoryView v-if="currentView === 'History'" @open-settings="currentView = 'Settings'" />
-      <TrustedDevicesView v-if="currentView === 'TrustedDevices'" @open-settings="currentView = 'Settings'" />
-      <SecurityEventsView v-if="currentView === 'SecurityEvents'" @open-settings="currentView = 'Settings'" />
-      <SettingsView v-if="currentView === 'Settings'" @back="currentView = 'Nearby'" />
+    <main class="app-workspace">
+      <SystemNotice
+        v-if="systemError"
+        :message="systemError"
+        @dismiss="dismissSystemError"
+      />
+      <div class="workspace-body">
+        <NearbyView v-if="currentView === 'Nearby'" @open-settings="currentView = 'Settings'" />
+        <TransfersView v-if="currentView === 'Transfers'" @open-settings="currentView = 'Settings'" />
+        <HistoryView v-if="currentView === 'History'" @open-settings="currentView = 'Settings'" />
+        <TrustedDevicesView v-if="currentView === 'TrustedDevices'" @open-settings="currentView = 'Settings'" />
+        <SecurityEventsView v-if="currentView === 'SecurityEvents'" @open-settings="currentView = 'Settings'" />
+        <SettingsView v-if="currentView === 'Settings'" @back="currentView = 'Nearby'" />
+      </div>
     </main>
     <div v-if="showOnboarding" class="onboarding-backdrop">
       <section class="onboarding-card">
-        <h3>Welcome to DashDrop</h3>
-        <p class="text-muted">Before your first transfer:</p>
+        <h3>Before You Start</h3>
+        <p class="text-muted">Use this checklist for safer first-time transfers:</p>
         <ul>
-          <li>Verify device fingerprint before pairing unknown devices.</li>
-          <li>Use Trusted Devices for auto-accept on known peers only.</li>
-          <li>Keep both devices on the same LAN for best performance.</li>
+          <li>Verify fingerprint when pairing unfamiliar devices.</li>
+          <li>Enable auto-accept only for trusted devices.</li>
+          <li>Keep both devices on the same local network.</li>
         </ul>
-        <button class="btn-primary" @click="dismissOnboarding">Got it</button>
+        <button class="btn btn-primary" @click="dismissOnboarding">Continue</button>
       </section>
     </div>
   </div>
 </template>
 
 <style scoped>
-.app-layout {
+.app-shell {
   display: flex;
+  gap: 18px;
+  padding: 18px;
   width: 100vw;
   height: 100vh;
+  box-sizing: border-box;
+}
+
+.app-rail {
+  width: 250px;
+  border-radius: 24px;
+  background: var(--surface-strong);
+  border: 1px solid var(--border-subtle);
+  box-shadow: var(--shadow-soft);
+  display: flex;
+  flex-direction: column;
+  padding: 24px 18px;
   overflow: hidden;
 }
 
-.sidebar {
-  width: 220px;
-  background: var(--bg-surface-elevated);
-  border-right: 1px solid var(--border-light);
+.brand-block {
   display: flex;
   flex-direction: column;
-  padding: 24px 16px;
-  z-index: 10;
+  gap: 6px;
+  margin-bottom: 28px;
+  padding: 6px 8px 12px;
+  border-bottom: 1px solid var(--border-subtle);
 }
 
-.logo-area {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 40px;
-  padding: 0 8px;
+.brand-title {
+  width: 100%;
+  font-family: var(--font-display);
+  font-size: 1.55rem;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
 }
 
-.icon-logo {
-  width: 28px;
-  height: 28px;
+.brand-subtitle {
+  width: 100%;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
-.nav-list {
+.rail-nav {
   list-style: none;
   padding: 0;
   margin: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 
-.nav-btn {
+.rail-btn {
   width: 100%;
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 10px 14px;
-  border-radius: var(--radius-md);
+  gap: 10px;
+  padding: 12px 12px;
+  border-radius: 14px;
   background: transparent;
-  border: 1px solid transparent;
-  color: var(--text-secondary);
-  font-size: 0.95rem;
-  font-weight: 500;
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition: transform 220ms ease, border-color 220ms ease, background-color 220ms ease, color 220ms ease;
 }
 
-.nav-btn:hover {
-  background: var(--bg-surface-hover);
+.rail-btn:hover {
+  transform: translateX(2px);
   color: var(--text-primary);
+  border-color: var(--border-strong);
+  background: rgba(255, 255, 255, 0.45);
 }
 
-.nav-btn.active {
-  background: rgba(59, 130, 246, 0.1);
-  color: #60a5fa;
-  border-color: rgba(59, 130, 246, 0.2);
+.rail-btn.active {
+  color: var(--text-primary);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  background: linear-gradient(120deg, color-mix(in srgb, var(--accent) 22%, #fff), rgba(255, 255, 255, 0.92));
 }
 
-.nav-icon {
-  font-size: 1.1rem;
+.rail-index {
+  min-width: 24px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--text-subtle);
 }
 
-.main-content {
+.app-workspace {
   flex: 1;
   position: relative;
-  overflow-y: hidden;
-  background: var(--bg-app);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: 24px;
+  border: 1px solid var(--border-subtle);
+  background: var(--surface);
+  box-shadow: var(--shadow-soft);
+}
+
+.workspace-body {
+  flex: 1;
+  min-height: 0;
 }
 
 .onboarding-backdrop {
   position: fixed;
   inset: 0;
   z-index: 1000;
-  background: rgba(4, 8, 17, 0.7);
-  backdrop-filter: blur(6px);
+  background: rgba(33, 30, 24, 0.48);
+  backdrop-filter: blur(8px);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -188,25 +225,58 @@ const dismissOnboarding = () => {
 
 .onboarding-card {
   width: min(560px, 100%);
-  border-radius: var(--radius-xl);
-  border: 1px solid var(--border-light);
-  background: var(--bg-surface-elevated);
-  padding: 22px;
+  border-radius: 20px;
+  border: 1px solid var(--border-subtle);
+  background: #fffcf6;
+  box-shadow: 0 30px 70px rgba(33, 29, 22, 0.22);
+  padding: 24px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 14px;
 }
 
 .onboarding-card h3 {
   margin: 0;
+  font-family: var(--font-display);
+  font-size: 1.5rem;
 }
 
 .onboarding-card ul {
   margin: 0 0 8px;
-  padding-left: 20px;
+  padding-left: 18px;
+  color: var(--text-secondary);
 }
 
 .onboarding-card li {
-  margin-bottom: 6px;
+  margin-bottom: 8px;
+}
+
+@media (max-width: 900px) {
+  .app-shell {
+    padding: 10px;
+    gap: 10px;
+  }
+
+  .app-rail {
+    width: 180px;
+    padding: 14px 10px;
+  }
+
+  .brand-title {
+    font-size: 1.2rem;
+  }
+
+  .brand-subtitle {
+    font-size: 0.65rem;
+  }
+
+  .rail-btn {
+    padding: 10px 8px;
+    font-size: 0.78rem;
+  }
+
+  .rail-index {
+    display: none;
+  }
 }
 </style>
