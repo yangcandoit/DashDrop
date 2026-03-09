@@ -172,6 +172,7 @@ pub fn run() {
                     Err(e) => {
                         tracing::error!("Failed to start QUIC server: {e:#}");
                         handle2.emit("system_error", serde_json::json!({
+                            "code": "QUIC_SERVER_START_FAILED",
                             "subsystem": "quic_server",
                             "message": format!("Failed to start network listener: {e:#}")
                         })).ok();
@@ -187,6 +188,7 @@ pub fn run() {
                     Err(e) => {
                         tracing::error!("Failed to register mDNS: {e:#}");
                         handle2.emit("system_error", serde_json::json!({
+                            "code": "MDNS_REGISTER_FAILED",
                             "subsystem": "mdns",
                             "message": format!("Device discovery unavailable: {e:#}. Other devices won't see you.")
                         })).ok();
@@ -201,6 +203,7 @@ pub fn run() {
                 if let Err(e) = discovery::start_browser(mdns, handle2.clone(), state2).await {
                     tracing::error!("Failed to start mDNS browser: {e:#}");
                     handle2.emit("system_error", serde_json::json!({
+                        "code": "MDNS_BROWSER_FAILED",
                         "subsystem": "mdns_browser",
                         "message": format!("Scanning for nearby devices failed: {e:#}")
                     })).ok();

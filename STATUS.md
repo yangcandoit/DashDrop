@@ -47,6 +47,7 @@ Estimated completion:
 - `set_app_config` rollback error now carries structured `code/context` payload for precise frontend rendering.
 - Discovery updates no longer use production `unwrap()` on system time conversion.
 - Startup config directory resolution is now strict and fails fast if path resolution is unavailable.
+- macOS bundle now declares Local Network / Bonjour usage (`Info.plist`) for reliable discovery permission prompts.
 - Runtime persistence now uses SQLite as the single store (`app_config_store`, `trusted_peers_store`, `transfers_history`, `security_events`).
 - Legacy `state.json` is retained as read-only one-time migration input.
 - Sender spawn error fallback now marks all non-terminal states (including `Draft`) as `Failed`.
@@ -77,6 +78,7 @@ Estimated completion:
 - `system_error` now supports structured handling (`code`) so rename rollback warnings are persistent until user dismisses.
 - Error banner messaging now uses a unified actionable template (`summary + Next steps`).
 - `identity_mismatch` warning now auto-clears; `fingerprint_changed` warning is now consumed and shown.
+- mDNS startup failures (`MDNS_REGISTER_FAILED` / `MDNS_BROWSER_FAILED`) are now surfaced as persistent actionable errors.
 - Added first-use onboarding modal (local persisted dismissal, test mode auto-skip).
 
 ### CI and tests

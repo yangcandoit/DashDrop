@@ -389,6 +389,29 @@ export async function initAppStore() {
 
   unlistens.push(
     await onSystemError((payload) => {
+      if (payload.code === "MDNS_REGISTER_FAILED" || payload.code === "MDNS_BROWSER_FAILED") {
+        setSystemError(
+          actionableMessage(
+            payload.message,
+            [
+              "Allow Local Network access for DashDrop in system privacy settings.",
+              "Confirm both peers are on the same LAN, then relaunch the app.",
+            ],
+          ),
+          0,
+        );
+        return;
+      }
+      if (payload.code === "QUIC_SERVER_START_FAILED") {
+        setSystemError(
+          actionableMessage(
+            payload.message,
+            ["Close other network tools using the same stack and relaunch DashDrop."],
+          ),
+          0,
+        );
+        return;
+      }
       if (payload.code === "MDNS_REREGISTER_FAILED") {
         const rollbackName = payload.rollback_device_name || "previous value";
         const attemptedName = payload.attempted_device_name || "new value";
