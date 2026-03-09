@@ -98,13 +98,14 @@ pub async fn start_server(
                                     &e.to_string(),
                                 );
                             }
-                            crate::transport::events::emit_transfer_error(
+                            crate::transport::events::emit_transfer_error_with_detail(
                                 &app2,
                                 None,
-                                &e.to_string(),
+                                "E_PROTOCOL",
                                 "IncomingConnectionError",
                                 "incoming",
                                 0,
+                                Some(&format!("{e:#}")),
                             );
                         }
                     }

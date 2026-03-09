@@ -15,6 +15,23 @@ type AppStateRef<'a> = State<'a, Arc<AppState>>;
 type PendingAcceptMap =
     Arc<tokio::sync::RwLock<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>;
 
+fn classify_runtime_send_error(detail: &str) -> (&'static str, &'static str) {
+    let s = detail.to_ascii_lowercase();
+    if s.contains("timeout") || s.contains("timed out") {
+        ("E_TIMEOUT", "Timeout")
+    } else if s.contains("identity mismatch") {
+        ("E_IDENTITY_MISMATCH", "IdentityMismatch")
+    } else if s.contains("version") && s.contains("mismatch") {
+        ("E_VERSION_MISMATCH", "VersionMismatch")
+    } else if s.contains("rate limit") {
+        ("E_RATE_LIMITED", "RateLimited")
+    } else if s.contains("read len") || s.contains("read body") {
+        ("E_PROTOCOL", "ControlStreamClosed")
+    } else {
+        ("E_PROTOCOL", "SystemError")
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectByAddressResult {
     pub fingerprint: String,
@@ -276,6 +293,8 @@ pub async fn send_files_cmd(
             }
             Err(e) => {
                 tracing::error!("Send failed: {e:#}");
+                let detail = format!("{e:#}");
+                let (reason_code, terminal_cause) = classify_runtime_send_error(&detail);
                 {
                     let mut guard = state.transfers.write().await;
                     if let Some(t) = guard.get_mut(&transfer_id_clone) {
@@ -291,10 +310,10 @@ pub async fn send_files_cmd(
                         if !is_terminal {
                             t.status = crate::state::TransferStatus::Failed;
                             t.revision += 1;
-                            t.terminal_reason_code = Some("E_PROTOCOL".to_string());
+                            t.terminal_reason_code = Some(reason_code.to_string());
                             t.failed_file_ids =
                                 Some(t.items.iter().map(|item| item.file_id).collect());
-                            t.error = Some(e.to_string());
+                            t.error = Some(detail.clone());
                             t.ended_at = Some(std::time::Instant::now());
                             t.ended_at_unix = Some(
                                 std::time::SystemTime::now()
@@ -320,18 +339,19 @@ pub async fn send_files_cmd(
                     &app,
                     &transfer_id_clone,
                     &crate::state::TransferStatus::Failed,
-                    &e.to_string(),
-                    "SystemError",
+                    reason_code,
+                    terminal_cause,
                     revision,
                     Some("send"),
                 );
-                crate::transport::events::emit_transfer_error(
+                crate::transport::events::emit_transfer_error_with_detail(
                     &app,
                     Some(&transfer_id_clone),
-                    &e.to_string(),
-                    "SystemError",
+                    reason_code,
+                    terminal_cause,
                     "send",
                     revision,
+                    Some(&detail),
                 );
             }
         }

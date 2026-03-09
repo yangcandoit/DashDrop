@@ -165,6 +165,7 @@ export interface TransferErrorPayload {
   terminal_cause: string;
   phase: string;
   revision: number;
+  detail?: string;
 }
 
 export interface IdentityMismatchPayload {

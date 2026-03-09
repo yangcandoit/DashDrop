@@ -165,16 +165,40 @@ pub fn emit_transfer_error(
     phase: &str,
     revision: u64,
 ) {
+    emit_transfer_error_with_detail(
+        app,
+        transfer_id,
+        reason_code,
+        terminal_cause,
+        phase,
+        revision,
+        None,
+    );
+}
+
+pub fn emit_transfer_error_with_detail(
+    app: &AppHandle,
+    transfer_id: Option<&str>,
+    reason_code: &str,
+    terminal_cause: &str,
+    phase: &str,
+    revision: u64,
+    detail: Option<&str>,
+) {
+    let mut payload = serde_json::json!({
+        "transfer_id": transfer_id,
+        "reason_code": reason_code,
+        "terminal_cause": terminal_cause,
+        "phase": phase,
+        "revision": revision,
+    });
+    if let Some(d) = detail {
+        payload["detail"] = serde_json::json!(d);
+    }
     emit_json(
         app,
         "transfer_error",
-        serde_json::json!({
-            "transfer_id": transfer_id,
-            "reason_code": reason_code,
-            "terminal_cause": terminal_cause,
-            "phase": phase,
-            "revision": revision,
-        }),
+        payload,
     );
 }
 

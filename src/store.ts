@@ -66,6 +66,30 @@ function transferErrorNextSteps(reasonCode: string): string[] {
   }
 }
 
+function normalizeReasonCode(reasonCode: string): string {
+  return reasonCode.startsWith("E_") ? reasonCode : "E_PROTOCOL";
+}
+
+function summarizeTransferError(err: { reason_code: string; terminal_cause: string; detail?: string }): string {
+  const code = normalizeReasonCode(err.reason_code);
+  if (code !== "E_PROTOCOL") {
+    return code;
+  }
+
+  const rawDetail = err.detail || (!err.reason_code.startsWith("E_") ? err.reason_code : "");
+  const detail = rawDetail.toLowerCase();
+  if (detail.includes("read len") || detail.includes("read body")) {
+    return `${code} (control stream closed)`;
+  }
+  if (detail.includes("quic handshake")) {
+    return `${code} (quic handshake failed)`;
+  }
+  if (err.terminal_cause && err.terminal_cause !== "SystemError") {
+    return `${code} (${err.terminal_cause})`;
+  }
+  return code;
+}
+
 function setSystemError(message: string, timeoutMs = 10_000) {
   systemError.value = message;
   if (clearSystemErrorTimer) {
@@ -321,13 +345,14 @@ export async function initAppStore() {
 
   unlistens.push(
     await onTransferError((err) => {
+      const normalizedReasonCode = normalizeReasonCode(err.reason_code);
       if (err.transfer_id) {
-        addOrUpdateTerminalError(err.transfer_id, "Failed", err.reason_code, err.revision);
+        addOrUpdateTerminalError(err.transfer_id, "Failed", normalizedReasonCode, err.revision);
       }
       setSystemError(
         actionableMessage(
-          `Transfer error (${err.phase}): ${err.reason_code}`,
-          transferErrorNextSteps(err.reason_code),
+          `Transfer error (${err.phase}): ${summarizeTransferError(err)}`,
+          transferErrorNextSteps(normalizedReasonCode),
         ),
       );
     }),

@@ -15,8 +15,8 @@ use tokio::sync::{oneshot, Mutex};
 
 use crate::state::{AppState, FileConflictStrategy, TransferDirection, TransferStatus};
 use crate::transport::events::{
-    emit_transfer_accepted, emit_transfer_complete, emit_transfer_error, emit_transfer_incoming,
-    emit_transfer_partial, emit_transfer_progress, emit_transfer_terminal,
+    emit_transfer_accepted, emit_transfer_complete, emit_transfer_error_with_detail,
+    emit_transfer_incoming, emit_transfer_partial, emit_transfer_progress, emit_transfer_terminal,
 };
 use crate::transport::path_validation::validate_rel_path;
 use crate::transport::protocol::{
@@ -331,18 +331,19 @@ pub async fn handle_offer(
             &app,
             &transfer_id,
             &TransferStatus::Failed,
-            &reason.to_string(),
+            reason.reason_code(),
             "ReceiverStorageError",
             transfer_revision(&state, &transfer_id).await,
             Some("receive_setup"),
         );
-        emit_transfer_error(
+        emit_transfer_error_with_detail(
             &app,
             Some(&transfer_id),
-            &reason.to_string(),
+            reason.reason_code(),
             "ReceiverStorageError",
             "receive_setup",
             transfer_revision(&state, &transfer_id).await,
+            Some(&e.to_string()),
         );
         return Ok(());
     }
@@ -403,18 +404,19 @@ pub async fn handle_offer(
                     &app,
                     &transfer_id,
                     &TransferStatus::Failed,
-                    &e.to_string(),
+                    e.reason_code(),
                     "NetworkDropped",
                     transfer_revision(&state, &transfer_id).await,
                     Some("receive"),
                 );
-                emit_transfer_error(
+                emit_transfer_error_with_detail(
                     &app,
                     Some(&transfer_id),
-                    &e.to_string(),
+                    e.reason_code(),
                     "NetworkDropped",
                     "receive",
                     transfer_revision(&state, &transfer_id).await,
+                    Some(&e.to_string()),
                 );
             }
             TransferOutcome::CancelledBySender => {
@@ -473,18 +475,19 @@ pub async fn handle_offer(
                 &app,
                 &transfer_id,
                 &TransferStatus::Failed,
-                &e.to_string(),
+                "E_PROTOCOL",
                 "NetworkDropped",
                 transfer_revision(&state, &transfer_id).await,
                 Some("receive"),
             );
-            emit_transfer_error(
+            emit_transfer_error_with_detail(
                 &app,
                 Some(&transfer_id),
-                &e.to_string(),
+                "E_PROTOCOL",
                 "NetworkDropped",
                 "receive",
                 transfer_revision(&state, &transfer_id).await,
+                Some(&format!("{e:#}")),
             );
         }
     }
