@@ -28,6 +28,14 @@ npm run dev
 
 # 构建生产版本
 npm run tauri build
+
+# 回归校验（提交前建议）
+cargo check --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml
+npm run build
+npm run test:e2e
+npm run test:e2e:contract
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features
 ```
 
 ---
@@ -35,7 +43,7 @@ npm run tauri build
 ## 代码规范
 
 ### Rust 后端
-- 强制 `cargo clippy` 无 warning
+- 目标：`cargo clippy` 无 warning（当前 warning 清单见 `STATUS.md`）
 - 所有公共函数需有文档注释 `/// ...`
 - 异步代码统一使用 `tokio`，禁止 `std::thread::sleep`
 - 错误处理使用 `thiserror` 定义自定义异常类型
@@ -43,7 +51,7 @@ npm run tauri build
 ### Vue 前端
 - TypeScript strict 模式，禁止 `any`
 - 组件文件统一 PascalCase 命名
-- 状态管理使用 Pinia
+- 状态管理以 `src/store.ts` 为当前单一入口（如后续迁移 Pinia，需同步更新文档）
 
 ---
 
@@ -58,7 +66,7 @@ npm run tauri build
 
 提交 PR 前请确保：
 - [ ] `cargo test` 通过
-- [ ] `cargo clippy` 无 warning
+- [ ] `cargo check` 通过
 - [ ] PR 描述中说明改动内容与测试方式
 
 ---

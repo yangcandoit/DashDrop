@@ -8,11 +8,20 @@
 > - **发现层与连接层身份绑定**：TLS 握手后强制校验 `cert_fp == mDNS fp`，两套身份不允许分歧
 > - **速率限制改为基于 fingerprint**，IP 在多网卡/IPv6 场景下不可靠
 
+> **实现状态快照（2026-03-09）**：
+> - 已落地：`transfer_started / transfer_incoming / transfer_accepted / transfer_progress` 进行中事件。
+> - 已落地：`transfer_complete / transfer_partial / transfer_rejected / transfer_cancelled_by_sender / transfer_cancelled_by_receiver / transfer_failed` 终态事件。
+> - 已落地：`transfer_progress` 不递增 revision，revision 仅在状态跃迁递增。
+> - 已落地：Probe ALPN `dashdrop-probe/1` 接线（Discovery 调度、Server 识别后快速关闭）。
+> - 已落地：sender `Accept/Reject` 超时控制、`USER_RESPONSE_TIMEOUT_SECS=60`、目录 `Complete/Ack` 生命周期、`reason_code` 协议编码、fingerprint 限流、probe close `0xD0`。
+> - 已落地：接收端冲突策略执行（覆盖/重命名/跳过）与并发流上限配置接线（运行时可配）。
+> - 部分待补：协议文档中的“真实端到端集成测试要求”尚未完全达成（当前为单测+契约测试增强）。
+
 ---
 
 ## 1. 协议版本
 
-当前实现版本：**v0.1**
+当前实现版本：**v0.1（实现中已吸收 v0.3 的关键状态契约约束）**
 
 **版本协商在 QUIC 连接后的 `Hello` 消息中进行，早于 `Offer`**。
 

@@ -8,7 +8,7 @@ pub const SUPPORTED_VERSIONS: &[u32] = &[1];
 pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024; // 16 MiB
 pub const CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
 pub const MAX_CONCURRENT_STREAMS: u32 = 4;
-pub const USER_RESPONSE_TIMEOUT_SECS: u64 = 300;
+pub const USER_RESPONSE_TIMEOUT_SECS: u64 = 60;
 
 // ─── Error Codes ─────────────────────────────────────────────────────────────
 
@@ -45,6 +45,26 @@ impl std::fmt::Display for ErrorCode {
             ErrorCode::PathConflict => write!(f, "Path conflict"),
             ErrorCode::UnsupportedFileType => write!(f, "Unsupported file type"),
             ErrorCode::Protocol(s) => write!(f, "Protocol error: {s}"),
+        }
+    }
+}
+
+impl ErrorCode {
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            ErrorCode::Rejected => "E_REJECTED_BY_PEER",
+            ErrorCode::DiskFull => "E_DISK_FULL",
+            ErrorCode::HashMismatch => "E_HASH_MISMATCH",
+            ErrorCode::VersionMismatch => "E_VERSION_MISMATCH",
+            ErrorCode::RateLimited => "E_RATE_LIMITED",
+            ErrorCode::Timeout => "E_TIMEOUT",
+            ErrorCode::Cancelled => "E_CANCELLED",
+            ErrorCode::PermissionDenied => "E_PERMISSION_DENIED",
+            ErrorCode::IdentityMismatch => "E_IDENTITY_MISMATCH",
+            ErrorCode::InvalidPath => "E_INVALID_PATH",
+            ErrorCode::PathConflict => "E_PATH_CONFLICT",
+            ErrorCode::UnsupportedFileType => "E_UNSUPPORTED_FILE_TYPE",
+            ErrorCode::Protocol(_) => "E_PROTOCOL",
         }
     }
 }
@@ -159,7 +179,8 @@ pub enum TransferOutcome {
     Success,
     PartialSuccess(Vec<FailedFile>),
     Failed(ErrorCode),
-    Cancelled,
+    CancelledBySender,
+    CancelledByReceiver,
 }
 
 // ─── CBOR Codec ──────────────────────────────────────────────────────────────
@@ -167,17 +188,16 @@ pub enum TransferOutcome {
 use anyhow::{Context, Result};
 
 /// Write a length-prefixed CBOR message to a QUIC send stream.
-pub async fn write_message(
-    send: &mut quinn::SendStream,
-    msg: &DashMessage,
-) -> Result<()> {
+pub async fn write_message(send: &mut quinn::SendStream, msg: &DashMessage) -> Result<()> {
     let mut buf = Vec::new();
     ciborium::into_writer(msg, &mut buf).context("CBOR serialize")?;
     let len = buf.len() as u32;
     if len as usize > MAX_MESSAGE_SIZE {
         anyhow::bail!("message too large to send: {} bytes", len);
     }
-    send.write_all(&len.to_be_bytes()).await.context("write len")?;
+    send.write_all(&len.to_be_bytes())
+        .await
+        .context("write len")?;
     send.write_all(&buf).await.context("write body")?;
     Ok(())
 }
@@ -196,4 +216,15 @@ pub async fn read_message(recv: &mut quinn::RecvStream) -> Result<DashMessage> {
     Ok(msg)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::ErrorCode;
 
+    #[test]
+    fn reason_codes_match_protocol_shape() {
+        assert_eq!(ErrorCode::HashMismatch.reason_code(), "E_HASH_MISMATCH");
+        assert_eq!(ErrorCode::Timeout.reason_code(), "E_TIMEOUT");
+        assert_eq!(ErrorCode::RateLimited.reason_code(), "E_RATE_LIMITED");
+        assert_eq!(ErrorCode::Protocol("x".into()).reason_code(), "E_PROTOCOL");
+    }
+}

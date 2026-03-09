@@ -1,22 +1,24 @@
-mod crypto;
-mod state;
-mod discovery;
-mod transport;
 mod commands;
+mod crypto;
+pub mod db;
+pub mod discovery;
+mod dto;
 mod persistence;
+pub mod state;
+pub mod transport;
 
+use crypto::Identity;
+use state::{AppConfig, AppState};
 use std::path::PathBuf;
 use std::sync::Arc;
-use state::{AppConfig, AppState};
-use crypto::Identity;
-use tauri::{Manager, Emitter};
+use tauri::{Emitter, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 
@@ -59,7 +61,24 @@ pub fn run() {
             if config.device_name.trim().is_empty() {
                 config.device_name = identity.device_name.clone();
             }
-            let state = Arc::new(AppState::new(identity, config));
+
+            let db_conn = db::init_db(&handle).expect("Failed to initialize SQLite database");
+            let state = Arc::new(AppState::new(identity, config, db_conn));
+            if !crypto::secret_store::secure_store_available() {
+                handle.emit("system_error", serde_json::json!({
+                    "subsystem": "security",
+                    "message": "System secure key store unavailable. Falling back to local key file storage."
+                })).ok();
+                if let Ok(db) = state.db.lock() {
+                    let _ = db::log_security_event(
+                        &db,
+                        "key_storage_degraded",
+                        "startup",
+                        Some(&state.identity.fingerprint),
+                        "secure key store unavailable; using local key file storage",
+                    );
+                }
+            }
             tauri::async_runtime::block_on(async {
                 let mut trusted = state.trusted_peers.write().await;
                 trusted.clear();
@@ -126,10 +145,14 @@ pub fn run() {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
                 loop {
                     interval.tick().await;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
                     let mut transfers = state_cleanup.transfers.write().await;
                     transfers.retain(|_, t| {
-                        if let Some(ended) = t.ended_at {
-                            ended.elapsed() < std::time::Duration::from_secs(crate::transport::protocol::USER_RESPONSE_TIMEOUT_SECS)
+                        if let Some(ended) = t.ended_at_unix {
+                            now.saturating_sub(ended) < 60
                         } else {
                             true
                         }
@@ -144,16 +167,26 @@ pub fn run() {
             commands::get_trusted_peers,
             commands::pair_device,
             commands::unpair_device,
+            commands::set_trusted_alias,
             commands::send_files_cmd,
+            commands::connect_by_address,
             commands::accept_transfer,
             commands::accept_and_pair_transfer,
             commands::reject_transfer,
             commands::cancel_transfer,
+            commands::cancel_all_transfers,
+            commands::retry_transfer,
             commands::open_transfer_folder,
             commands::get_app_config,
             commands::set_app_config,
             commands::get_local_identity,
             commands::get_transfers,
+            commands::get_transfer,
+            commands::get_transfer_history,
+            commands::get_security_events,
+            commands::get_security_posture,
+            commands::get_runtime_status,
+            commands::get_transfer_metrics,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

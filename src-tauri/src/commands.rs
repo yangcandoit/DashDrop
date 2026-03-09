@@ -1,31 +1,76 @@
-use std::path::PathBuf;
-use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State};
-use crate::state::{AppState, DeviceInfo, TrustedPeer};
+use crate::dto::{DeviceView, TransferView, TrustedPeerView};
+use crate::state::{AppState, DeviceInfo, Platform, ReachabilityStatus, SessionInfo};
 use crate::transport::connect_to_peer;
 use crate::transport::sender::send_files;
+use serde::Serialize;
+use std::collections::HashMap;
+use std::net::ToSocketAddrs;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
+use tauri::{AppHandle, Emitter, State};
 
 type AppStateRef<'a> = State<'a, Arc<AppState>>;
+
+type PendingAcceptMap =
+    Arc<tokio::sync::RwLock<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectByAddressResult {
+    pub fingerprint: String,
+    pub name: String,
+    pub trusted: bool,
+    pub address: String,
+}
+
+async fn accept_pending_transfer(
+    pending_accepts: &PendingAcceptMap,
+    transfer_id: &str,
+) -> Result<(), String> {
+    let tx = pending_accepts.write().await.remove(transfer_id);
+    if let Some(sender) = tx {
+        let _ = sender.send(true);
+        Ok(())
+    } else {
+        Err(format!(
+            "transfer {transfer_id} not found or already handled"
+        ))
+    }
+}
+
+async fn reject_pending_transfer(pending_accepts: &PendingAcceptMap, transfer_id: &str) {
+    let tx = pending_accepts.write().await.remove(transfer_id);
+    if let Some(sender) = tx {
+        let _ = sender.send(false);
+    }
+}
 
 // ─── Device commands ────────────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn get_devices(state: AppStateRef<'_>) -> Result<Vec<DeviceInfo>, String> {
+pub async fn get_devices(state: AppStateRef<'_>) -> Result<Vec<DeviceView>, String> {
     let devices = state.devices.read().await;
-    Ok(devices.values().cloned().collect())
+    Ok(devices.values().map(DeviceView::from).collect())
 }
 
 #[tauri::command]
-pub async fn get_trusted_peers(state: AppStateRef<'_>) -> Result<Vec<TrustedPeer>, String> {
+pub async fn get_trusted_peers(state: AppStateRef<'_>) -> Result<Vec<TrustedPeerView>, String> {
     let trusted = state.trusted_peers.read().await;
-    Ok(trusted.values().cloned().collect())
+    Ok(trusted.values().map(TrustedPeerView::from).collect())
 }
 
 #[tauri::command]
 pub async fn pair_device(fp: String, app: AppHandle, state: AppStateRef<'_>) -> Result<(), String> {
     let name = {
-        let devices = state.devices.read().await;
-        devices.get(&fp).map(|d| d.name.clone()).unwrap_or_else(|| "Unknown".into())
+        let mut devices = state.devices.write().await;
+        if let Some(device) = devices.get_mut(&fp) {
+            device.trusted = true;
+            let payload = DeviceView::from(&*device);
+            app.emit("device_updated", &payload).ok();
+            device.name.clone()
+        } else {
+            "Unknown".into()
+        }
     };
     state.add_trust(fp, name).await;
     {
@@ -38,13 +83,60 @@ pub async fn pair_device(fp: String, app: AppHandle, state: AppStateRef<'_>) -> 
 }
 
 #[tauri::command]
-pub async fn unpair_device(fp: String, app: AppHandle, state: AppStateRef<'_>) -> Result<(), String> {
-    state.trusted_peers.write().await.remove(&fp);
+pub async fn unpair_device(
+    fp: String,
+    app: AppHandle,
+    state: AppStateRef<'_>,
+) -> Result<(), String> {
+    let removed = state.trusted_peers.write().await.remove(&fp);
+    if removed.is_none() {
+        return Err(format!("trusted device {fp} not found"));
+    }
+    {
+        let mut devices = state.devices.write().await;
+        if let Some(device) = devices.get_mut(&fp) {
+            device.trusted = false;
+            let payload = DeviceView::from(&*device);
+            app.emit("device_updated", &payload).ok();
+        }
+    }
     {
         let trusted = state.trusted_peers.read().await;
         let config = state.config.read().await;
         crate::persistence::save_state(&app, &config, &trusted)
             .map_err(|e| format!("failed to persist pairing data: {e:#}"))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_trusted_alias(
+    fp: String,
+    alias: Option<String>,
+    app: AppHandle,
+    state: AppStateRef<'_>,
+) -> Result<(), String> {
+    let normalized = alias.and_then(|a| {
+        let trimmed = a.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    });
+    let changed = {
+        let mut trusted = state.trusted_peers.write().await;
+        let Some(peer) = trusted.get_mut(&fp) else {
+            return Err(format!("trusted device {fp} not found"));
+        };
+        peer.alias = normalized;
+        true
+    };
+    if changed {
+        let trusted = state.trusted_peers.read().await;
+        let config = state.config.read().await;
+        crate::persistence::save_state(&app, &config, &trusted)
+            .map_err(|e| format!("failed to persist alias: {e:#}"))?;
     }
     Ok(())
 }
@@ -63,9 +155,12 @@ pub async fn send_files_cmd(
     // Get peer addresses
     let remote_addrs = {
         let devices = state.devices.read().await;
-        let device = devices.get(&peer_fp)
+        let device = devices
+            .get(&peer_fp)
             .ok_or_else(|| format!("device {peer_fp} not found"))?;
-        device.best_addrs().ok_or_else(|| "device has no reachable address".to_string())?
+        device
+            .best_addrs()
+            .ok_or_else(|| "device has no reachable address".to_string())?
     };
 
     let path_bufs: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
@@ -91,7 +186,7 @@ pub async fn send_files_cmd(
             }
         }
     }
-    
+
     let conn = conn_opt.ok_or_else(|| "All connection attempts failed".to_string())?;
 
     // Hard-bind selected device fingerprint to the peer certificate.
@@ -99,17 +194,43 @@ pub async fn send_files_cmd(
         .map_err(|e| format!("failed to verify peer identity: {e:#}"))?;
     if !fp_match {
         conn.close(quinn::VarInt::from_u32(2), b"identity mismatch");
-        app.emit("identity_mismatch", serde_json::json!({
-            "expected_fp": peer_fp.clone(),
-            "actual_fp": actual_fp,
-            "phase": "connect",
-        })).ok();
-        return Err("identity mismatch: peer certificate does not match selected device".to_string());
+        app.emit(
+            "identity_mismatch",
+            serde_json::json!({
+                "expected_fp": peer_fp.clone(),
+                "actual_fp": actual_fp,
+                "phase": "connect",
+            }),
+        )
+        .ok();
+        if let Ok(db) = state.db.lock() {
+            let _ = crate::db::log_security_event(
+                &db,
+                "identity_mismatch",
+                "connect",
+                Some(&peer_fp),
+                "peer certificate fingerprint mismatch",
+            );
+        }
+        return Err(
+            "identity mismatch: peer certificate does not match selected device".to_string(),
+        );
     }
 
     // Spawn sender task
+    let transfer_id = uuid::Uuid::new_v4().to_string();
+    let transfer_id_clone = transfer_id.clone();
+
     tokio::spawn(async move {
-        let outcome = send_files(peer_fp, path_bufs, conn, app.clone(), state).await;
+        let outcome = send_files(
+            transfer_id_clone.clone(),
+            peer_fp,
+            path_bufs,
+            conn,
+            app.clone(),
+            state.clone(),
+        )
+        .await;
         match outcome {
             Ok(crate::transport::protocol::TransferOutcome::Success) => {
                 tracing::info!("Transfer complete");
@@ -119,11 +240,60 @@ pub async fn send_files_cmd(
             }
             Err(e) => {
                 tracing::error!("Send failed: {e:#}");
-                app.emit("transfer_error", serde_json::json!({
-                    "transfer_id": serde_json::Value::Null,
-                    "reason": e.to_string(),
-                    "phase": "send",
-                })).ok();
+                {
+                    let mut guard = state.transfers.write().await;
+                    if let Some(t) = guard.get_mut(&transfer_id_clone) {
+                        let is_terminal = matches!(
+                            t.status,
+                            crate::state::TransferStatus::Completed
+                                | crate::state::TransferStatus::PartialCompleted
+                                | crate::state::TransferStatus::Rejected
+                                | crate::state::TransferStatus::CancelledBySender
+                                | crate::state::TransferStatus::CancelledByReceiver
+                                | crate::state::TransferStatus::Failed
+                        );
+                        if !is_terminal {
+                            t.status = crate::state::TransferStatus::Failed;
+                            t.revision += 1;
+                            t.error = Some(e.to_string());
+                            t.ended_at = Some(std::time::Instant::now());
+                            t.ended_at_unix = Some(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0),
+                            );
+                            if let Ok(db) = state.db.lock() {
+                                let _ = crate::db::save_transfer(&db, t);
+                            }
+                        }
+                    }
+                }
+
+                let revision = {
+                    let transfers = state.transfers.read().await;
+                    transfers
+                        .get(&transfer_id_clone)
+                        .map(|t| t.revision)
+                        .unwrap_or(0)
+                };
+                crate::transport::events::emit_transfer_terminal(
+                    &app,
+                    &transfer_id_clone,
+                    &crate::state::TransferStatus::Failed,
+                    &e.to_string(),
+                    "SystemError",
+                    revision,
+                    Some("send"),
+                );
+                crate::transport::events::emit_transfer_error(
+                    &app,
+                    Some(&transfer_id_clone),
+                    &e.to_string(),
+                    "SystemError",
+                    "send",
+                    revision,
+                );
             }
         }
     });
@@ -132,17 +302,107 @@ pub async fn send_files_cmd(
 }
 
 #[tauri::command]
-pub async fn accept_transfer(
-    transfer_id: String,
+pub async fn connect_by_address(
+    address: String,
+    app: AppHandle,
     state: AppStateRef<'_>,
-) -> Result<(), String> {
-    let tx = state.pending_accepts.write().await.remove(&transfer_id);
-    if let Some(sender) = tx {
-        let _ = sender.send(true);
-        Ok(())
-    } else {
-        Err(format!("transfer {transfer_id} not found or already handled"))
+) -> Result<ConnectByAddressResult, String> {
+    let resolved: Vec<_> = address
+        .to_socket_addrs()
+        .map_err(|e| format!("invalid address {address}: {e}"))?
+        .collect();
+    if resolved.is_empty() {
+        return Err(format!("address {address} resolved to no endpoints"));
     }
+
+    let mut connected = None;
+    for addr in resolved {
+        match connect_to_peer(&state, addr).await {
+            Ok(conn) => {
+                connected = Some((addr, conn));
+                break;
+            }
+            Err(e) => tracing::warn!("connect_by_address failed to {addr}: {e:#}"),
+        }
+    }
+
+    let (selected_addr, conn) =
+        connected.ok_or_else(|| "all connection attempts failed".to_string())?;
+    let fingerprint = crate::transport::handshake::extract_peer_fp(&conn)
+        .map_err(|e| format!("failed to read peer fingerprint: {e:#}"))?;
+    if let Err(e) = crate::transport::handshake::do_hello_as_initiator(&conn).await {
+        if let Ok(db) = state.db.lock() {
+            let _ = crate::db::log_security_event(
+                &db,
+                "handshake_failed",
+                "connect_by_address",
+                Some(&fingerprint),
+                &e.to_string(),
+            );
+        }
+        return Err(format!("peer handshake failed: {e:#}"));
+    }
+    conn.close(quinn::VarInt::from_u32(0), b"probe done");
+
+    let trusted = state.is_trusted(&fingerprint).await;
+    let (name, payload, is_new) = {
+        let mut devices = state.devices.write().await;
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let session_id = format!("manual:{selected_addr}");
+        let fallback_name = format!("Manual {selected_addr}");
+        let is_new = !devices.contains_key(&fingerprint);
+        let device = devices
+            .entry(fingerprint.clone())
+            .or_insert_with(|| DeviceInfo {
+                fingerprint: fingerprint.clone(),
+                name: fallback_name.clone(),
+                platform: Platform::Unknown,
+                trusted,
+                sessions: HashMap::new(),
+                last_seen: now_unix,
+                reachability: ReachabilityStatus::Reachable,
+                probe_fail_count: 0,
+                last_probe_at: Some(now_unix),
+            });
+        device.sessions.insert(
+            session_id.clone(),
+            SessionInfo {
+                session_id,
+                addrs: vec![selected_addr],
+                last_seen_unix: now_unix,
+                last_seen_instant: Instant::now(),
+            },
+        );
+        device.last_seen = now_unix;
+        device.reachability = ReachabilityStatus::Reachable;
+        device.last_probe_at = Some(now_unix);
+        device.probe_fail_count = 0;
+        device.trusted = trusted;
+        let name = device.name.clone();
+        let payload = DeviceView::from(&*device);
+        (name, payload, is_new)
+    };
+
+    if is_new {
+        app.emit("device_discovered", &payload).ok();
+    } else {
+        app.emit("device_updated", &payload).ok();
+    }
+
+    Ok(ConnectByAddressResult {
+        fingerprint,
+        name,
+        trusted,
+        address: selected_addr.to_string(),
+    })
+}
+
+#[tauri::command]
+pub async fn accept_transfer(transfer_id: String, state: AppStateRef<'_>) -> Result<(), String> {
+    accept_pending_transfer(&state.pending_accepts, &transfer_id).await
 }
 
 #[tauri::command]
@@ -159,32 +419,55 @@ pub async fn accept_and_pair_transfer(
 }
 
 #[tauri::command]
-pub async fn reject_transfer(
-    transfer_id: String,
-    state: AppStateRef<'_>,
-) -> Result<(), String> {
-    let tx = state.pending_accepts.write().await.remove(&transfer_id);
-    if let Some(sender) = tx {
-        let _ = sender.send(false);
-    }
+pub async fn reject_transfer(transfer_id: String, state: AppStateRef<'_>) -> Result<(), String> {
+    reject_pending_transfer(&state.pending_accepts, &transfer_id).await;
     Ok(())
 }
 
-#[tauri::command]
-pub async fn cancel_transfer(
-    transfer_id: String,
-    state: AppStateRef<'_>,
-) -> Result<(), String> {
-    // Signal rejection (cancel while in-progress is handled by dropping connection)
-    let tx = state.pending_accepts.write().await.remove(&transfer_id);
+async fn cancel_transfer_inner(transfer_id: &str, app: &AppHandle, state: &Arc<AppState>) -> bool {
+    let tx = state.pending_accepts.write().await.remove(transfer_id);
     if let Some(sender) = tx {
         let _ = sender.send(false);
     }
-    // Update status and close connection if active
+    let mut cancelled = false;
+    let mut metrics_snapshot: Option<(
+        crate::state::TransferDirection,
+        crate::state::TransferStatus,
+        u64,
+    )> = None;
     let mut transfers = state.transfers.write().await;
-    if let Some(t) = transfers.get_mut(&transfer_id) {
-        t.status = crate::state::TransferStatus::Cancelled;
+    if let Some(t) = transfers.get_mut(transfer_id) {
+        let next_status = match t.direction {
+            crate::state::TransferDirection::Send => {
+                crate::state::TransferStatus::CancelledBySender
+            }
+            crate::state::TransferDirection::Receive => {
+                crate::state::TransferStatus::CancelledByReceiver
+            }
+        };
+        if t.status != next_status {
+            t.status = next_status;
+            t.revision += 1;
+        }
         t.ended_at = Some(std::time::Instant::now());
+        t.ended_at_unix = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        );
+        if let Ok(guard) = state.db.lock() {
+            let _ = crate::db::save_transfer(&guard, t);
+        }
+        crate::transport::events::emit_transfer_terminal(
+            app,
+            transfer_id,
+            &t.status,
+            "E_CANCELLED_BY_USER",
+            "UserCancelled",
+            t.revision,
+            Some("cancel"),
+        );
         if let Some(conn) = &t.conn {
             if let Ok(mut cancel_stream) = conn.open_uni().await {
                 let _ = crate::transport::protocol::write_message(
@@ -200,8 +483,135 @@ pub async fn cancel_transfer(
             }
             conn.close(quinn::VarInt::from_u32(1), b"Cancelled by user");
         }
+        metrics_snapshot = Some((t.direction.clone(), t.status.clone(), t.bytes_transferred));
+        cancelled = true;
+    }
+    drop(transfers);
+    if let Some((direction, status, bytes)) = metrics_snapshot {
+        state
+            .record_transfer_terminal(&direction, &status, bytes)
+            .await;
+    }
+    cancelled
+}
+
+#[tauri::command]
+pub async fn cancel_transfer(
+    transfer_id: String,
+    app: AppHandle,
+    state: AppStateRef<'_>,
+) -> Result<(), String> {
+    if !cancel_transfer_inner(&transfer_id, &app, &state).await {
+        return Err(format!("transfer {transfer_id} not found"));
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn cancel_all_transfers(app: AppHandle, state: AppStateRef<'_>) -> Result<u32, String> {
+    let active_ids: Vec<String> = {
+        let transfers = state.transfers.read().await;
+        transfers
+            .values()
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    crate::state::TransferStatus::PendingAccept
+                        | crate::state::TransferStatus::Transferring
+                )
+            })
+            .map(|t| t.id.clone())
+            .collect()
+    };
+    let mut count = 0u32;
+    for transfer_id in active_ids {
+        if cancel_transfer_inner(&transfer_id, &app, &state).await {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+#[tauri::command]
+pub async fn retry_transfer(
+    transfer_id: String,
+    app: AppHandle,
+    state: AppStateRef<'_>,
+) -> Result<(), String> {
+    let (peer_fp, source_paths) = {
+        let transfers = state.transfers.read().await;
+        let Some(task) = transfers.get(&transfer_id) else {
+            return Err(format!("transfer {transfer_id} not found in active cache"));
+        };
+        if task.direction != crate::state::TransferDirection::Send {
+            return Err("retry is only supported for outgoing transfers".into());
+        }
+        let Some(paths) = task.source_paths.clone() else {
+            return Err("retry source paths unavailable for this transfer".into());
+        };
+        (task.peer_fingerprint.clone(), paths)
+    };
+    send_files_cmd(peer_fp, source_paths, app, State::clone(&state)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use crate::state::{TransferDirection, TransferStatus};
+    use tokio::sync::oneshot;
+    use tokio::sync::RwLock;
+
+    use super::{accept_pending_transfer, reject_pending_transfer};
+
+    #[tokio::test]
+    async fn accept_pending_transfer_sends_true() {
+        let pending_accepts: Arc<RwLock<HashMap<String, oneshot::Sender<bool>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let transfer_id = "transfer-accept".to_string();
+        let (tx, rx) = oneshot::channel::<bool>();
+        pending_accepts
+            .write()
+            .await
+            .insert(transfer_id.clone(), tx);
+
+        accept_pending_transfer(&pending_accepts, &transfer_id)
+            .await
+            .expect("accept should succeed");
+        let accepted = rx.await.expect("receiver should get value");
+        assert!(accepted);
+    }
+
+    #[tokio::test]
+    async fn reject_pending_transfer_sends_false() {
+        let pending_accepts: Arc<RwLock<HashMap<String, oneshot::Sender<bool>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let transfer_id = "transfer-reject".to_string();
+        let (tx, rx) = oneshot::channel::<bool>();
+        pending_accepts
+            .write()
+            .await
+            .insert(transfer_id.clone(), tx);
+
+        reject_pending_transfer(&pending_accepts, &transfer_id).await;
+        let accepted = rx.await.expect("receiver should get value");
+        assert!(!accepted);
+    }
+
+    #[test]
+    fn cancel_direction_maps_to_expected_terminal_status() {
+        let sender_terminal = match TransferDirection::Send {
+            TransferDirection::Send => TransferStatus::CancelledBySender,
+            TransferDirection::Receive => TransferStatus::CancelledByReceiver,
+        };
+        let receiver_terminal = match TransferDirection::Receive {
+            TransferDirection::Send => TransferStatus::CancelledBySender,
+            TransferDirection::Receive => TransferStatus::CancelledByReceiver,
+        };
+        assert_eq!(sender_terminal, TransferStatus::CancelledBySender);
+        assert_eq!(receiver_terminal, TransferStatus::CancelledByReceiver);
+    }
 }
 
 #[tauri::command]
@@ -213,17 +623,20 @@ pub async fn open_transfer_folder(
     use tauri::Manager;
     let custom_dir = state.config.read().await.download_dir.clone();
     let base_dir = custom_dir.map(std::path::PathBuf::from).unwrap_or_else(|| {
-        app.path().download_dir()
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-                std::path::PathBuf::from(home).join("Downloads")
-            })
+        app.path().download_dir().unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            std::path::PathBuf::from(home).join("Downloads")
+        })
     });
     let save_root = base_dir.join("DashDrop").join(transfer_id);
 
     use tauri_plugin_opener::OpenerExt;
-    app.opener().reveal_item_in_dir(&save_root)
-        .or_else(|_| app.opener().open_path(save_root.to_string_lossy().to_string(), None::<&str>))
+    app.opener()
+        .reveal_item_in_dir(&save_root)
+        .or_else(|_| {
+            app.opener()
+                .open_path(save_root.to_string_lossy().to_string(), None::<&str>)
+        })
         .map_err(|e| e.to_string())
 }
 
@@ -238,6 +651,10 @@ pub async fn set_app_config(
     app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<(), String> {
+    if config.max_parallel_streams == 0 || config.max_parallel_streams > 32 {
+        return Err("max_parallel_streams must be between 1 and 32".to_string());
+    }
+    let attempted_device_name = config.device_name.clone();
     let old_name = state.config.read().await.device_name.clone();
     if let Some(download_dir) = &config.download_dir {
         let dir = std::path::PathBuf::from(download_dir);
@@ -258,7 +675,16 @@ pub async fn set_app_config(
     if old_name != state.config.read().await.device_name {
         if let Err(e) = crate::discovery::service::reregister_service(Arc::clone(&state)).await {
             *state.config.write().await = previous_config;
-            return Err(format!("device name updated locally but mDNS refresh failed: {e:#}"));
+            app.emit("system_error", serde_json::json!({
+                "code": "MDNS_REREGISTER_FAILED",
+                "subsystem": "mdns",
+                "message": format!("Device name update rolled back because mDNS refresh failed: {e:#}"),
+                "attempted_device_name": attempted_device_name,
+                "rollback_device_name": state.config.read().await.device_name.clone(),
+            })).ok();
+            return Err(format!(
+                "device name update rolled back because mDNS refresh failed: {e:#}"
+            ));
         }
     }
     {
@@ -273,16 +699,69 @@ pub async fn set_app_config(
 // ─── App info commands ───────────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn get_local_identity(state: AppStateRef<'_>) -> Result<serde_json::Value, String> {
+pub async fn get_local_identity(
+    state: AppStateRef<'_>,
+) -> Result<crate::state::LocalIdentityView, String> {
+    Ok(crate::dto::local_identity_view(
+        state.identity.fingerprint.clone(),
+        state.config.read().await.device_name.clone(),
+        *state.local_port.read().await,
+    ))
+}
+
+#[tauri::command]
+pub async fn get_transfers(state: AppStateRef<'_>) -> Result<Vec<TransferView>, String> {
+    let transfers = state.transfers.read().await;
+    Ok(transfers.values().map(TransferView::from).collect())
+}
+
+#[tauri::command]
+pub async fn get_transfer(
+    transfer_id: String,
+    state: AppStateRef<'_>,
+) -> Result<Option<TransferView>, String> {
+    let transfers = state.transfers.read().await;
+    Ok(transfers.get(&transfer_id).map(TransferView::from))
+}
+
+#[tauri::command]
+pub async fn get_transfer_history(
+    limit: u32,
+    offset: u32,
+    state: AppStateRef<'_>,
+) -> Result<Vec<TransferView>, String> {
+    let guard = state.db.lock().map_err(|_| "DB lock poisoned")?;
+    let history = crate::db::get_history(&guard, limit, offset).map_err(|e| e.to_string())?;
+    Ok(history.iter().map(TransferView::from).collect())
+}
+
+#[tauri::command]
+pub async fn get_security_events(
+    limit: u32,
+    offset: u32,
+    state: AppStateRef<'_>,
+) -> Result<Vec<crate::state::SecurityEvent>, String> {
+    let guard = state.db.lock().map_err(|_| "DB lock poisoned")?;
+    crate::db::get_security_events(&guard, limit, offset).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_security_posture() -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({
-        "fingerprint": state.identity.fingerprint,
-        "device_name": state.config.read().await.device_name,
-        "port": *state.local_port.read().await,
+        "secure_store_available": crate::crypto::secret_store::secure_store_available(),
     }))
 }
 
 #[tauri::command]
-pub async fn get_transfers(state: AppStateRef<'_>) -> Result<Vec<crate::state::TransferTask>, String> {
-    let transfers = state.transfers.read().await;
-    Ok(transfers.values().cloned().collect())
+pub async fn get_runtime_status(
+    state: AppStateRef<'_>,
+) -> Result<crate::state::RuntimeStatus, String> {
+    Ok(state.runtime_status().await)
+}
+
+#[tauri::command]
+pub async fn get_transfer_metrics(
+    state: AppStateRef<'_>,
+) -> Result<crate::state::TransferMetrics, String> {
+    Ok(state.transfer_metrics().await)
 }

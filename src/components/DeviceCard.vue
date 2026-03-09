@@ -1,15 +1,16 @@
 <script setup lang="ts">
 import { ref } from 'vue';
-import type { DeviceInfo } from '../types';
+import type { DeviceView } from '../types';
 
 const props = defineProps<{
-  device: DeviceInfo;
+  device: DeviceView;
   isSending?: boolean;
 }>();
 
 const emit = defineEmits<{
-  (e: 'drop'): void;
   (e: 'click'): void;
+  (e: 'drag-target-enter'): void;
+  (e: 'drag-target-leave'): void;
 }>();
 
 const isDragOver = ref(false);
@@ -21,25 +22,24 @@ function onDragOver(e: DragEvent) {
   }
 }
 
+function onDragEnter(e: DragEvent) {
+  e.preventDefault();
+  if (e.dataTransfer && e.dataTransfer.types.includes('Files')) {
+    isDragOver.value = true;
+    emit('drag-target-enter');
+  }
+}
+
 function onDragLeave(e: DragEvent) {
   e.preventDefault();
   isDragOver.value = false;
+  emit('drag-target-leave');
 }
 
 function onDrop(e: DragEvent) {
   e.preventDefault();
   isDragOver.value = false;
-  
-  if (!e.dataTransfer) return;
-  
-  // Note: In Tauri v2 with tauri-plugin-fs, we can't easily get the absolute path 
-  // from a standard web DragEvent because browsers protect it.
-  // We need to use Tauri's drop event listener on the window instead, OR
-  // use the older API if available. For MVP, we'll emit the drop and let 
-  // NearbyView handle it via Tauri window events, or standard click-to-select.
-  // To keep it simple, we just emit 'drop' so the parent knows *this* card was dropped on.
-  // The actual paths will be handled by the parent using @tauri-apps/api/event `tauri://drop`.
-  emit('drop'); 
+  emit('drag-target-enter');
 }
 
 // Compute an avatar initial
@@ -76,6 +76,7 @@ watchEffect(() => {
   <div 
     class="device-card glass-panel animate-fade-in"
     :class="{ 'drag-over': isDragOver, 'trusted': device.trusted, 'offline': isOffline }"
+    @dragenter="onDragEnter"
     @dragover="onDragOver"
     @dragleave="onDragLeave"
     @drop="onDrop"

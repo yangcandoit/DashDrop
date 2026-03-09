@@ -36,9 +36,10 @@ impl Identity {
         let (key_der, cert_der) = if cert_path.exists() {
             let cd = fs::read(&cert_path).context("read identity cert")?;
             let key_der = if secure_store {
-                if let Some(kd) =
-                    crate::crypto::secret_store::load_private_key(KEYCHAIN_SERVICE, &secure_account)?
-                {
+                if let Some(kd) = crate::crypto::secret_store::load_private_key(
+                    KEYCHAIN_SERVICE,
+                    &secure_account,
+                )? {
                     kd
                 } else if key_path.exists() {
                     // One-time migration from legacy plaintext key file.
@@ -52,7 +53,9 @@ impl Identity {
                     let _ = fs::remove_file(&key_path);
                     kd
                 } else {
-                    tracing::warn!("Certificate exists but private key missing; regenerating identity");
+                    tracing::warn!(
+                        "Certificate exists but private key missing; regenerating identity"
+                    );
                     let (new_kd, new_cd) = Self::generate()?;
                     crate::crypto::secret_store::save_private_key(
                         KEYCHAIN_SERVICE,
@@ -71,8 +74,12 @@ impl Identity {
             tracing::info!("Generating new device identity...");
             let (kd, cd) = Self::generate()?;
             if secure_store {
-                crate::crypto::secret_store::save_private_key(KEYCHAIN_SERVICE, &secure_account, &kd)
-                    .context("write identity key to secure store")?;
+                crate::crypto::secret_store::save_private_key(
+                    KEYCHAIN_SERVICE,
+                    &secure_account,
+                    &kd,
+                )
+                .context("write identity key to secure store")?;
             } else {
                 fs::write(&key_path, &kd).context("write identity key")?;
                 #[cfg(unix)]
@@ -163,14 +170,17 @@ impl Identity {
         let key = rustls_pki_types::PrivateKeyDer::try_from(self.key_der.clone())
             .map_err(|e| anyhow::anyhow!("invalid private key: {e}"))?;
 
-        let cfg = ServerConfig::builder_with_provider(
-            rustls::crypto::ring::default_provider().into(),
-        )
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .context("TLS version")?
-        .with_no_client_auth()
-        .with_single_cert(vec![cert], key)
-        .context("server cert")?;
+        let mut cfg =
+            ServerConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .context("TLS version")?
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .context("server cert")?;
+        cfg.alpn_protocols = vec![
+            b"dashdrop-transfer/1".to_vec(),
+            b"dashdrop-probe/1".to_vec(),
+        ];
 
         Ok(std::sync::Arc::new(cfg))
     }
@@ -180,14 +190,13 @@ impl Identity {
         use crate::crypto::cert_verifier::SkipServerVerification;
         use rustls::ClientConfig;
 
-        let cfg = ClientConfig::builder_with_provider(
-            rustls::crypto::ring::default_provider().into(),
-        )
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .context("TLS version")?
-        .dangerous()
-        .with_custom_certificate_verifier(SkipServerVerification::new())
-        .with_no_client_auth();
+        let cfg =
+            ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .context("TLS version")?
+                .dangerous()
+                .with_custom_certificate_verifier(SkipServerVerification::new())
+                .with_no_client_auth();
 
         Ok(std::sync::Arc::new(cfg))
     }

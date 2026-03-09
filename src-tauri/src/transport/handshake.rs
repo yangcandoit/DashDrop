@@ -1,45 +1,117 @@
 use anyhow::{bail, Context, Result};
 use quinn::Connection;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tauri::AppHandle;
 
-use crate::state::{AppState};
+use crate::state::AppState;
 use crate::transport::protocol::{
-    read_message, write_message, DashMessage, HelloPayload, RejectPayload,
-    ErrorCode, WIRE_VERSION, SUPPORTED_VERSIONS,
+    read_message, write_message, DashMessage, ErrorCode, HelloPayload, RejectPayload,
+    SUPPORTED_VERSIONS, WIRE_VERSION,
 };
 
 /// Called for each accepted incoming QUIC connection.
 /// Performs: cert fp binding → Hello exchange → route to receiver.
-pub async fn handle_incoming(
-    conn: Connection,
-    app: AppHandle,
-    state: Arc<AppState>,
-) -> Result<()> {
+pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppState>) -> Result<()> {
     // 1. Extract peer TLS certificate fingerprint
     let peer_cert_fp = extract_peer_fp(&conn)?;
 
     // 2. Auxiliary identity signal: compare against mDNS-by-IP and emit warning if mismatched.
     // Security decision is enforced by initiator-side fingerprint binding.
-    {
+    let mismatch = {
         let devices = state.devices.read().await;
+        let mut found: Option<(String, String)> = None;
         for device in devices.values() {
             for session in device.sessions.values() {
-                if session.addrs.iter().any(|a| a.ip() == conn.remote_address().ip()) {
+                if session
+                    .addrs
+                    .iter()
+                    .any(|a| a.ip() == conn.remote_address().ip())
+                {
                     // Found a matching mDNS device by IP
                     if device.fingerprint != peer_cert_fp {
-                        tracing::warn!(
-                            "Identity mismatch: mDNS fp={} but cert fp={}",
-                            device.fingerprint, peer_cert_fp
-                        );
-                        let _ = tauri::Emitter::emit(&app, "identity_mismatch", serde_json::json!({
-                            "remote_addr": conn.remote_address().to_string(),
-                            "mdns_fp": device.fingerprint,
-                            "cert_fp": peer_cert_fp,
-                            "phase": "incoming",
-                        }));
+                        found = Some((device.fingerprint.clone(), session.session_id.clone()));
                     }
                     break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        found
+    };
+
+    if let Some((mdns_fp, session_id)) = mismatch {
+        let remote_addr = conn.remote_address().to_string();
+        tracing::warn!(
+            transfer_id = "",
+            peer_fp = %mdns_fp,
+            phase = "incoming",
+            cert_fp = %peer_cert_fp,
+            "identity mismatch: mDNS fp != cert fp"
+        );
+        let _ = tauri::Emitter::emit(
+            &app,
+            "identity_mismatch",
+            serde_json::json!({
+                "remote_addr": remote_addr,
+                "mdns_fp": mdns_fp.clone(),
+                "cert_fp": peer_cert_fp.clone(),
+                "phase": "incoming",
+            }),
+        );
+        if let Ok(db) = state.db.lock() {
+            let _ = crate::db::log_security_event(
+                &db,
+                "identity_mismatch",
+                "incoming",
+                Some(&mdns_fp),
+                "mDNS identity does not match peer certificate fingerprint",
+            );
+        }
+
+        let previous_trusted = state.is_trusted(&mdns_fp).await;
+        let current_trusted = state.is_trusted(&peer_cert_fp).await;
+        if previous_trusted && !current_trusted {
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let dedupe_key = format!("{session_id}|{mdns_fp}|{peer_cert_fp}");
+            let should_emit = {
+                let mut alerts = state.fingerprint_change_alerts.lock().await;
+                let last = alerts.get(&dedupe_key).copied().unwrap_or(0);
+                if now_unix.saturating_sub(last) >= 60 {
+                    alerts.insert(dedupe_key, now_unix);
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_emit {
+                let _ = tauri::Emitter::emit(
+                    &app,
+                    "fingerprint_changed",
+                    serde_json::json!({
+                        "session_id": session_id.clone(),
+                        "previous_fp": mdns_fp.clone(),
+                        "current_fp": peer_cert_fp.clone(),
+                        "remote_addr": remote_addr,
+                        "phase": "incoming",
+                    }),
+                );
+                if let Ok(db) = state.db.lock() {
+                    let _ = crate::db::log_security_event(
+                        &db,
+                        "fingerprint_changed",
+                        "incoming",
+                        Some(&mdns_fp),
+                        &format!(
+                            "trusted fingerprint changed on session {}: previous={} current={}",
+                            session_id, mdns_fp, peer_cert_fp
+                        ),
+                    );
                 }
             }
         }
@@ -73,7 +145,9 @@ pub async fn handle_incoming(
         Some(v) => v,
         None => {
             // No version intersection — reject
-            let reject = DashMessage::Reject(RejectPayload { reason: ErrorCode::VersionMismatch });
+            let reject = DashMessage::Reject(RejectPayload {
+                reason: ErrorCode::VersionMismatch,
+            });
             write_message(&mut send, &reject).await?;
             bail!("no common protocol version");
         }
@@ -86,17 +160,56 @@ pub async fn handle_incoming(
         other => bail!("expected Offer, got {:?}", other),
     };
 
+    if let Some(reason) = check_offer_rate_limit(&state, &peer_cert_fp).await {
+        let reject = DashMessage::Reject(RejectPayload { reason });
+        write_message(&mut send, &reject).await?;
+        return Ok(());
+    }
+
     tracing::info!(
-        "Incoming offer from '{}' (fp={}): {} items, {} bytes total",
-        offer.sender_name, peer_cert_fp, offer.items.len(), offer.total_size
+        transfer_id = %offer.transfer_id,
+        peer_fp = %peer_cert_fp,
+        phase = "incoming_offer",
+        sender_name = %offer.sender_name,
+        item_count = offer.items.len(),
+        total_size = offer.total_size,
+        "incoming offer received"
     );
 
     // 5. Hand off to receiver state machine
     super::receiver::handle_offer(
-        offer, conn, send, recv,
-        peer_cert_fp, chosen_version,
-        app, state,
-    ).await
+        offer,
+        conn,
+        send,
+        recv,
+        peer_cert_fp,
+        chosen_version,
+        app,
+        state,
+    )
+    .await
+}
+
+async fn check_offer_rate_limit(state: &Arc<AppState>, peer_fp: &str) -> Option<ErrorCode> {
+    let limit = if state.is_trusted(peer_fp).await {
+        10
+    } else {
+        3
+    };
+    let mut limiter = state.offer_rate_limits.lock().await;
+    let (count, window_start) = limiter
+        .entry(peer_fp.to_string())
+        .or_insert((0, Instant::now()));
+    if window_start.elapsed() > Duration::from_secs(60) {
+        *count = 0;
+        *window_start = Instant::now();
+    }
+    *count += 1;
+    if *count > limit {
+        Some(ErrorCode::RateLimited)
+    } else {
+        None
+    }
 }
 
 /// Called by the sender side: perform Hello handshake as the initiator.
@@ -150,11 +263,32 @@ pub fn extract_peer_fp(conn: &Connection) -> Result<String> {
         .first()
         .ok_or_else(|| anyhow::anyhow!("empty certificate chain"))?;
 
-    Ok(crate::crypto::Identity::peer_fingerprint(end_entity.as_ref()))
+    Ok(crate::crypto::Identity::peer_fingerprint(
+        end_entity.as_ref(),
+    ))
 }
 
 /// Compare expected fingerprint with the certificate fingerprint on the active QUIC connection.
 pub fn peer_fp_matches(conn: &Connection, expected_peer_fp: &str) -> Result<(bool, String)> {
     let actual = extract_peer_fp(conn)?;
-    Ok((actual == expected_peer_fp, actual))
+    Ok((!is_identity_mismatch(expected_peer_fp, &actual), actual))
+}
+
+pub fn is_identity_mismatch(expected_peer_fp: &str, actual_peer_fp: &str) -> bool {
+    expected_peer_fp != actual_peer_fp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_identity_mismatch;
+
+    #[test]
+    fn detects_identity_mismatch() {
+        assert!(is_identity_mismatch("expected-fp", "actual-fp"));
+    }
+
+    #[test]
+    fn accepts_matching_identity() {
+        assert!(!is_identity_mismatch("same-fp", "same-fp"));
+    }
 }

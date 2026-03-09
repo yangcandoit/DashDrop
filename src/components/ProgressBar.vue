@@ -23,18 +23,21 @@ const progressPct = computed(() => {
 
 const statusText = computed(() => {
   switch (props.status) {
-    case 'AwaitingAccept': return 'Waiting for accept...';
+    case 'Draft': return 'Preparing...';
+    case 'PendingAccept': return 'Waiting for accept...';
     case 'Transferring': return 'Transferring...';
-    case 'Complete': return 'Done';
-    case 'PartialSuccess': return 'Finished with errors';
+    case 'Completed': return 'Done';
+    case 'PartialCompleted': return 'Finished with errors';
     case 'Failed': return 'Failed';
-    case 'Cancelled': return 'Cancelled';
+    case 'Rejected': return 'Rejected';
+    case 'CancelledBySender': return 'Cancelled by sender';
+    case 'CancelledByReceiver': return 'Cancelled by receiver';
     default: return '';
   }
 });
 
-const isError = computed(() => props.status === 'Failed' || props.status === 'Cancelled');
-const isSuccess = computed(() => props.status === 'Complete');
+const isError = computed(() => props.status === 'Failed' || props.status.startsWith('Cancelled') || props.status === 'Rejected');
+const isSuccess = computed(() => props.status === 'Completed');
 
 const speedStr = ref('');
 const etaStr = ref('');

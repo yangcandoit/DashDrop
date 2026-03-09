@@ -3,25 +3,34 @@ use blake3::Hasher;
 use quinn::Connection;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use sysinfo::Disks;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{oneshot, Mutex};
 
-use crate::state::{AppState, TransferDirection, TransferStatus};
-use crate::transport::protocol::{
-    read_message, write_message, AcceptPayload,
-    DashMessage, ErrorCode, FailedFile, FileItem, FileType,
-    OfferPayload, RejectPayload, TransferOutcome,
+use crate::state::{AppState, FileConflictStrategy, TransferDirection, TransferStatus};
+use crate::transport::events::{
+    emit_transfer_accepted, emit_transfer_complete, emit_transfer_error, emit_transfer_incoming,
+    emit_transfer_partial, emit_transfer_progress, emit_transfer_terminal,
 };
 use crate::transport::path_validation::validate_rel_path;
+use crate::transport::protocol::{
+    read_message, write_message, AcceptPayload, DashMessage, ErrorCode, FailedFile, FileItem,
+    FileType, OfferPayload, RejectPayload, TransferOutcome,
+};
 
 struct RoutedIncomingFile {
     recv: quinn::RecvStream,
     first_msg: DashMessage,
 }
+
+type ReceiveTaskResult = anyhow::Result<(u32, bool, Option<crate::transport::protocol::ErrorCode>)>;
+type ReceiveTaskHandle = tokio::task::JoinHandle<ReceiveTaskResult>;
 
 fn routed_file_id(msg: &DashMessage) -> Option<u32> {
     match msg {
@@ -52,6 +61,62 @@ fn temp_path_for(final_path: &Path) -> PathBuf {
     final_path.with_file_name(format!("{file_name}.dashdrop.part"))
 }
 
+fn split_file_name(path: &Path) -> (String, String) {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let ext = path
+        .extension()
+        .map(|s| format!(".{}", s.to_string_lossy()))
+        .unwrap_or_default();
+    (stem, ext)
+}
+
+async fn resolve_conflict_path(
+    desired_path: PathBuf,
+    strategy: &FileConflictStrategy,
+) -> Result<Option<PathBuf>> {
+    let exists = fs::metadata(&desired_path).await.is_ok();
+    if !exists {
+        return Ok(Some(desired_path));
+    }
+    match strategy {
+        FileConflictStrategy::Overwrite => Ok(Some(desired_path)),
+        FileConflictStrategy::Skip => Ok(None),
+        FileConflictStrategy::Rename => {
+            let parent = desired_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let (stem, ext) = split_file_name(&desired_path);
+            for idx in 1..=9999u32 {
+                let candidate = parent.join(format!("{stem} ({idx}){ext}"));
+                if fs::metadata(&candidate).await.is_err() {
+                    return Ok(Some(candidate));
+                }
+            }
+            Err(anyhow::anyhow!(
+                "unable to allocate renamed conflict path for {}",
+                desired_path.display()
+            ))
+        }
+    }
+}
+
+fn reject_reason(is_timeout: bool) -> (&'static str, &'static str) {
+    if is_timeout {
+        ("E_TIMEOUT", "Timeout")
+    } else {
+        ("E_REJECTED_BY_USER", "RejectedByReceiver")
+    }
+}
+
+pub fn should_auto_accept(trusted: bool, auto_accept_trusted_only: bool) -> bool {
+    trusted && auto_accept_trusted_only
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_offer(
     offer: OfferPayload,
     conn: Connection,
@@ -65,28 +130,38 @@ pub async fn handle_offer(
     let transfer_id = offer.transfer_id;
 
     // Register in state
-    let items_meta: Vec<_> = offer.items.iter().map(|f| crate::state::FileItemMeta {
-        file_id: f.file_id,
-        name: f.name.clone(),
-        rel_path: f.rel_path.clone(),
-        size: f.size,
-    }).collect();
+    let items_meta: Vec<_> = offer
+        .items
+        .iter()
+        .map(|f| crate::state::FileItemMeta {
+            file_id: f.file_id,
+            name: f.name.clone(),
+            rel_path: f.rel_path.clone(),
+            size: f.size,
+        })
+        .collect();
 
     {
         let mut transfers = state.transfers.write().await;
-        transfers.insert(transfer_id.clone(), crate::state::TransferTask {
-            id: transfer_id.clone(),
-            direction: TransferDirection::Receive,
-            peer_fingerprint: peer_fp.clone(),
-            peer_name: offer.sender_name.clone(),
-            items: items_meta,
-            status: TransferStatus::AwaitingAccept,
-            bytes_transferred: 0,
-            total_bytes: offer.total_size,
-            error: None,
-            conn: Some(conn.clone()),
-            ended_at: None,
-        });
+        transfers.insert(
+            transfer_id.clone(),
+            crate::state::TransferTask {
+                id: transfer_id.clone(),
+                direction: TransferDirection::Receive,
+                peer_fingerprint: peer_fp.clone(),
+                peer_name: offer.sender_name.clone(),
+                items: items_meta,
+                status: TransferStatus::PendingAccept,
+                bytes_transferred: 0,
+                total_bytes: offer.total_size,
+                revision: 0,
+                ended_at_unix: None,
+                error: None,
+                source_paths: None,
+                conn: Some(conn.clone()),
+                ended_at: None,
+            },
+        );
     }
 
     // Determine potential save root
@@ -115,9 +190,13 @@ pub async fn handle_offer(
     }
 
     if !sufficient_space {
-        write_message(&mut control_send, &DashMessage::Reject(RejectPayload {
-            reason: ErrorCode::DiskFull,
-        })).await?;
+        write_message(
+            &mut control_send,
+            &DashMessage::Reject(RejectPayload {
+                reason: ErrorCode::DiskFull,
+            }),
+        )
+        .await?;
         update_transfer_status(&state, transfer_id.clone(), TransferStatus::Failed).await;
         {
             let mut transfers = state.transfers.write().await;
@@ -125,107 +204,238 @@ pub async fn handle_offer(
                 t.error = Some("Insufficient disk space".to_string());
             }
         }
-        app.emit("transfer_failed", serde_json::json!({
-            "transfer_id": transfer_id,
-            "reason": "Receiver disk full",
-            "phase": "preflight",
-        })).unwrap_or_else(|e| tracing::warn!("Emit failed: {e}"));
+        emit_transfer_terminal(
+            &app,
+            &transfer_id,
+            &TransferStatus::Failed,
+            "E_DISK_FULL",
+            "DiskFull",
+            transfer_revision(&state, &transfer_id).await,
+            Some("preflight"),
+        );
         return Ok(());
     }
 
     // Emit incoming transfer event to frontend
     let trusted = state.is_trusted(&peer_fp).await;
-    app.emit("transfer_incoming", serde_json::json!({
-        "transfer_id": transfer_id,
-        "sender_name": offer.sender_name,
-        "sender_fp": peer_fp,
-        "trusted": trusted,
-        "items": offer.items,
-        "total_size": offer.total_size,
-    })).unwrap_or_else(|e| tracing::warn!("Emit failed: {e}"));
+    emit_transfer_incoming(
+        &app,
+        &transfer_id,
+        &offer.sender_name,
+        &peer_fp,
+        trusted,
+        &offer.items,
+        offer.total_size,
+        transfer_revision(&state, &transfer_id).await,
+    );
 
-    // Wait for user accept/reject
-    let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-    {
-        state.pending_accepts.write().await.insert(transfer_id.clone(), tx);
-    }
+    let auto_accept_enabled = state.config.read().await.auto_accept_trusted_only;
+    let (user_accepted, is_timeout) = if should_auto_accept(trusted, auto_accept_enabled) {
+        (true, false)
+    } else {
+        // Wait for user accept/reject
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        {
+            state
+                .pending_accepts
+                .write()
+                .await
+                .insert(transfer_id.clone(), tx);
+        }
 
-    let (user_accepted, is_timeout) = match tokio::time::timeout(
-        std::time::Duration::from_secs(crate::transport::protocol::USER_RESPONSE_TIMEOUT_SECS),
-        rx,
-    )
-    .await {
-        Ok(Ok(v)) => (v, false),
-        Ok(Err(_)) => (false, false),
-        Err(_) => (false, true),
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(crate::transport::protocol::USER_RESPONSE_TIMEOUT_SECS),
+            rx,
+        )
+        .await
+        {
+            Ok(Ok(v)) => (v, false),
+            Ok(Err(_)) => (false, false),
+            Err(_) => (false, true),
+        }
     };
 
     if !user_accepted {
         // Reject
-        write_message(&mut control_send, &DashMessage::Reject(RejectPayload {
-            reason: ErrorCode::Rejected,
-        })).await?;
-        update_transfer_status(&state, transfer_id.clone(), TransferStatus::Cancelled).await;
-        
-        if is_timeout {
-            app.emit("transfer_failed", serde_json::json!({
-                "transfer_id": transfer_id,
-                "reason": "Transfer timed out waiting for user acceptance",
-                "phase": "await_accept",
-            })).unwrap_or_else(|e| tracing::warn!("Emit failed: {e}"));
-        }
-        
+        write_message(
+            &mut control_send,
+            &DashMessage::Reject(RejectPayload {
+                reason: ErrorCode::Rejected,
+            }),
+        )
+        .await?;
+        update_transfer_status(&state, transfer_id.clone(), TransferStatus::Rejected).await;
+        let (reason_code, terminal_cause) = reject_reason(is_timeout);
+        emit_transfer_terminal(
+            &app,
+            &transfer_id,
+            &TransferStatus::Rejected,
+            reason_code,
+            terminal_cause,
+            transfer_revision(&state, &transfer_id).await,
+            Some("offer"),
+        );
+
         return Ok(());
     }
 
     // Accept
-    update_transfer_status(&state, transfer_id.clone(), TransferStatus::Transferring).await;
-    write_message(&mut control_send, &DashMessage::Accept(AcceptPayload {
-        chosen_version,
-    })).await?;
+    let accepted_revision =
+        update_transfer_status(&state, transfer_id.clone(), TransferStatus::Transferring)
+            .await
+            .unwrap_or(0);
+    emit_transfer_accepted(&app, &transfer_id, accepted_revision);
+    state.mark_peer_used(&peer_fp).await;
+    write_message(
+        &mut control_send,
+        &DashMessage::Accept(AcceptPayload { chosen_version }),
+    )
+    .await?;
 
     // Create save root after accepted
-    fs::create_dir_all(&save_root).await.context("create save root")?;
+    if let Err(e) = fs::create_dir_all(&save_root).await {
+        let reason = io_error_code(&e);
+        let _ = send_cancel(&conn, reason.clone()).await;
+        update_transfer_status(&state, transfer_id.clone(), TransferStatus::Failed).await;
+        emit_transfer_terminal(
+            &app,
+            &transfer_id,
+            &TransferStatus::Failed,
+            &reason.to_string(),
+            "ReceiverStorageError",
+            transfer_revision(&state, &transfer_id).await,
+            Some("receive_setup"),
+        );
+        emit_transfer_error(
+            &app,
+            Some(&transfer_id),
+            &reason.to_string(),
+            "ReceiverStorageError",
+            "receive_setup",
+            transfer_revision(&state, &transfer_id).await,
+        );
+        return Ok(());
+    }
 
     // Receive files
-    let result = receive_files(&offer.items, &conn, &save_root, &app, &state, transfer_id.clone()).await;
+    let result = receive_files(
+        &offer.items,
+        &conn,
+        &save_root,
+        &app,
+        &state,
+        transfer_id.clone(),
+    )
+    .await;
 
     match result {
-        Ok(outcome) => {
-            match &outcome {
-                TransferOutcome::Success => {
-                    update_transfer_status(&state, transfer_id.clone(), TransferStatus::Complete).await;
-                    app.emit("transfer_complete", serde_json::json!({ "transfer_id": transfer_id })).unwrap_or_else(|e| tracing::warn!("Emit failed: {e}"));
-                }
-                TransferOutcome::PartialSuccess(failed) => {
-                    update_transfer_status(&state, transfer_id.clone(), TransferStatus::PartialSuccess).await;
-                    app.emit("transfer_partial", serde_json::json!({
-                        "transfer_id": transfer_id,
-                        "succeeded_count": offer.items.len() - failed.len(),
-                        "failed": failed,
-                    })).unwrap_or_else(|e| tracing::warn!("Emit failed: {e}"));
-                }
-                TransferOutcome::Failed(e) => {
-                    update_transfer_status(&state, transfer_id.clone(), TransferStatus::Failed).await;
-                    app.emit("transfer_failed", serde_json::json!({
-                        "transfer_id": transfer_id,
-                        "reason": e.to_string(),
-                        "phase": "receive",
-                    })).unwrap_or_else(|e| tracing::warn!("Emit failed: {e}"));
-                }
-                TransferOutcome::Cancelled => {
-                    update_transfer_status(&state, transfer_id.clone(), TransferStatus::Cancelled).await;
-                }
+        Ok(outcome) => match &outcome {
+            TransferOutcome::Success => {
+                update_transfer_status(&state, transfer_id.clone(), TransferStatus::Completed)
+                    .await;
+                emit_transfer_complete(
+                    &app,
+                    &transfer_id,
+                    transfer_revision(&state, &transfer_id).await,
+                );
             }
-        }
+            TransferOutcome::PartialSuccess(failed) => {
+                update_transfer_status(
+                    &state,
+                    transfer_id.clone(),
+                    TransferStatus::PartialCompleted,
+                )
+                .await;
+                emit_transfer_partial(
+                    &app,
+                    &transfer_id,
+                    offer.items.len() - failed.len(),
+                    failed,
+                    None,
+                    transfer_revision(&state, &transfer_id).await,
+                );
+            }
+            TransferOutcome::Failed(e) => {
+                update_transfer_status(&state, transfer_id.clone(), TransferStatus::Failed).await;
+                emit_transfer_terminal(
+                    &app,
+                    &transfer_id,
+                    &TransferStatus::Failed,
+                    &e.to_string(),
+                    "NetworkDropped",
+                    transfer_revision(&state, &transfer_id).await,
+                    Some("receive"),
+                );
+                emit_transfer_error(
+                    &app,
+                    Some(&transfer_id),
+                    &e.to_string(),
+                    "NetworkDropped",
+                    "receive",
+                    transfer_revision(&state, &transfer_id).await,
+                );
+            }
+            TransferOutcome::CancelledBySender => {
+                update_transfer_status(
+                    &state,
+                    transfer_id.clone(),
+                    TransferStatus::CancelledBySender,
+                )
+                .await;
+                emit_transfer_terminal(
+                    &app,
+                    &transfer_id,
+                    &TransferStatus::CancelledBySender,
+                    "E_CANCELLED_BY_SENDER",
+                    "CancelledBySender",
+                    transfer_revision(&state, &transfer_id).await,
+                    Some("receive"),
+                );
+            }
+            TransferOutcome::CancelledByReceiver => {
+                update_transfer_status(
+                    &state,
+                    transfer_id.clone(),
+                    TransferStatus::CancelledByReceiver,
+                )
+                .await;
+                emit_transfer_terminal(
+                    &app,
+                    &transfer_id,
+                    &TransferStatus::CancelledByReceiver,
+                    "E_CANCELLED_BY_RECEIVER",
+                    "CancelledByReceiver",
+                    transfer_revision(&state, &transfer_id).await,
+                    Some("receive"),
+                );
+            }
+        },
         Err(e) => {
-            tracing::error!("Receive error: {e:#}");
+            tracing::error!(
+                transfer_id = %transfer_id,
+                peer_fp = %peer_fp,
+                phase = "receive",
+                reason = %e,
+                "receive transfer error"
+            );
             update_transfer_status(&state, transfer_id.clone(), TransferStatus::Failed).await;
-            app.emit("transfer_failed", serde_json::json!({
-                "transfer_id": transfer_id,
-                "reason": e.to_string(),
-                "phase": "receive",
-            })).unwrap_or_else(|e| tracing::warn!("Emit failed: {e}"));
+            emit_transfer_terminal(
+                &app,
+                &transfer_id,
+                &TransferStatus::Failed,
+                &e.to_string(),
+                "NetworkDropped",
+                transfer_revision(&state, &transfer_id).await,
+                Some("receive"),
+            );
+            emit_transfer_error(
+                &app,
+                Some(&transfer_id),
+                &e.to_string(),
+                "NetworkDropped",
+                "receive",
+                transfer_revision(&state, &transfer_id).await,
+            );
         }
     }
 
@@ -242,11 +452,10 @@ async fn receive_files(
 ) -> Result<TransferOutcome> {
     // Track seen final paths to detect conflicts
     let mut seen_paths: HashMap<PathBuf, u32> = HashMap::new();
-    
+
     // Use a semaphore to limit concurrent receives to MAX_CONCURRENT_STREAMS
-    let sem = Arc::new(tokio::sync::Semaphore::new(
-        crate::transport::protocol::MAX_CONCURRENT_STREAMS as usize,
-    ));
+    let max_streams = state.config.read().await.max_parallel_streams.clamp(1, 32);
+    let sem = Arc::new(tokio::sync::Semaphore::new(max_streams as usize));
     let stream_routes: Arc<Mutex<HashMap<u32, oneshot::Sender<RoutedIncomingFile>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let cancelled_by_peer = Arc::new(AtomicBool::new(false));
@@ -291,41 +500,9 @@ async fn receive_files(
         }
     });
 
-    let mut handles: Vec<tokio::task::JoinHandle<anyhow::Result<(u32, bool, Option<crate::transport::protocol::ErrorCode>)>>> = Vec::new();
+    let mut handles: Vec<ReceiveTaskHandle> = Vec::new();
 
     for item in items {
-        // Create directories immediately, no stream needed
-        if item.file_type == FileType::Directory {
-            match validate_rel_path(&item.rel_path, save_root) {
-                Ok(dir_path) => {
-                    if let Err(e) = fs::create_dir_all(&dir_path).await {
-                        tracing::warn!("Failed to create directory: {e}");
-                        // We cannot safely push to failed here without acquiring it; wait, failed is a local mut Vec before spawn loops
-                        // Acutally failed is collected later. So doing it directly is problematic since this loop skips Handles.
-                        // Let's spawn a dummy handle that yields the failure.
-                        let file_id = item.file_id;
-                        let err_msg = e.to_string();
-                        handles.push(tokio::spawn(async move {
-                            Ok((file_id, false, Some(crate::transport::protocol::ErrorCode::Protocol(err_msg))))
-                        }));
-                    } else {
-                        // Success, also spawn a dummy handle that yields success
-                        let file_id = item.file_id;
-                        handles.push(tokio::spawn(async move {
-                            Ok((file_id, true, None))
-                        }));
-                    }
-                }
-                Err(_) => {
-                    let file_id = item.file_id;
-                    handles.push(tokio::spawn(async move {
-                        Ok((file_id, false, Some(crate::transport::protocol::ErrorCode::InvalidPath)))
-                    }));
-                }
-            }
-            continue;
-        }
-
         // Validate path
         let final_path = match validate_rel_path(&item.rel_path, save_root) {
             Ok(p) => p,
@@ -366,29 +543,68 @@ async fn receive_files(
 
         let handle = tokio::spawn(async move {
             let Ok(_permit) = sem2.acquire().await else {
-                let _ = send_ack(&conn2, item2.file_id, false, Some(ErrorCode::Protocol("Semaphore closed".into()))).await;
-                return Ok((item2.file_id, false, Some(ErrorCode::Protocol("Semaphore closed".into()))));
+                let _ = send_ack(
+                    &conn2,
+                    item2.file_id,
+                    false,
+                    Some(ErrorCode::Protocol("Semaphore closed".into())),
+                )
+                .await;
+                return Ok((
+                    item2.file_id,
+                    false,
+                    Some(ErrorCode::Protocol("Semaphore closed".into())),
+                ));
             };
 
-            let routed = match tokio::time::timeout(std::time::Duration::from_secs(60), stream_rx).await {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(_)) => {
-                    if cancelled_by_peer2.load(Ordering::Relaxed) {
-                        return Ok((item2.file_id, false, Some(ErrorCode::Cancelled)));
+            let routed =
+                match tokio::time::timeout(std::time::Duration::from_secs(60), stream_rx).await {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(_)) => {
+                        if cancelled_by_peer2.load(Ordering::Relaxed) {
+                            return Ok((item2.file_id, false, Some(ErrorCode::Cancelled)));
+                        }
+                        let _ = send_ack(
+                            &conn2,
+                            item2.file_id,
+                            false,
+                            Some(ErrorCode::Protocol("stream route closed".into())),
+                        )
+                        .await;
+                        return Ok((
+                            item2.file_id,
+                            false,
+                            Some(ErrorCode::Protocol("stream route closed".into())),
+                        ));
                     }
-                    let _ = send_ack(&conn2, item2.file_id, false, Some(ErrorCode::Protocol("stream route closed".into()))).await;
-                    return Ok((item2.file_id, false, Some(ErrorCode::Protocol("stream route closed".into()))));
-                }
-                Err(_) => {
-                    if cancelled_by_peer2.load(Ordering::Relaxed) {
-                        return Ok((item2.file_id, false, Some(ErrorCode::Cancelled)));
+                    Err(_) => {
+                        if cancelled_by_peer2.load(Ordering::Relaxed) {
+                            return Ok((item2.file_id, false, Some(ErrorCode::Cancelled)));
+                        }
+                        let _ = send_ack(
+                            &conn2,
+                            item2.file_id,
+                            false,
+                            Some(ErrorCode::Protocol("stream route timeout".into())),
+                        )
+                        .await;
+                        return Ok((
+                            item2.file_id,
+                            false,
+                            Some(ErrorCode::Protocol("stream route timeout".into())),
+                        ));
                     }
-                    let _ = send_ack(&conn2, item2.file_id, false, Some(ErrorCode::Protocol("stream route timeout".into()))).await;
-                    return Ok((item2.file_id, false, Some(ErrorCode::Protocol("stream route timeout".into()))));
-                }
-            };
-            
-            let res = receive_one_file(item2.clone(), routed, save_root2, app2, state2, transfer_id_clone).await;
+                };
+
+            let res = receive_one_file(
+                item2.clone(),
+                routed,
+                save_root2,
+                app2,
+                state2,
+                transfer_id_clone,
+            )
+            .await;
             match res {
                 Ok((file_id, ok, reason)) => {
                     let _ = send_ack(&conn2, file_id, ok, reason.clone()).await;
@@ -396,7 +612,13 @@ async fn receive_files(
                 }
                 Err(e) => {
                     let err_msg = e.to_string();
-                    let _ = send_ack(&conn2, item2.file_id, false, Some(ErrorCode::Protocol(err_msg.clone()))).await;
+                    let _ = send_ack(
+                        &conn2,
+                        item2.file_id,
+                        false,
+                        Some(ErrorCode::Protocol(err_msg.clone())),
+                    )
+                    .await;
                     Ok((item2.file_id, false, Some(ErrorCode::Protocol(err_msg))))
                 }
             }
@@ -413,7 +635,8 @@ async fn receive_files(
                 if ok {
                     success_count += 1;
                 } else {
-                    let name = items.iter()
+                    let name = items
+                        .iter()
                         .find(|i| i.file_id == file_id)
                         .map(|i| i.name.clone())
                         .unwrap_or_default();
@@ -425,17 +648,27 @@ async fn receive_files(
                 }
             }
             Ok(Err(e)) => {
-                tracing::error!("File receive task error: {e:#}");
+                tracing::error!(
+                    transfer_id = %transfer_id,
+                    phase = "receive_file_task",
+                    reason = %e,
+                    "file receive task error"
+                );
             }
             Err(e) => {
-                tracing::error!("Task join error: {e}");
+                tracing::error!(
+                    transfer_id = %transfer_id,
+                    phase = "receive_file_join",
+                    reason = %e,
+                    "file receive task join error"
+                );
             }
         }
     }
 
     if cancelled_by_peer.load(Ordering::Relaxed) {
         stream_dispatch.abort();
-        Ok(TransferOutcome::Cancelled)
+        Ok(TransferOutcome::CancelledBySender)
     } else if failed.is_empty() {
         stream_dispatch.abort();
         Ok(TransferOutcome::Success)
@@ -444,7 +677,9 @@ async fn receive_files(
         Ok(TransferOutcome::PartialSuccess(failed))
     } else {
         stream_dispatch.abort();
-        Ok(TransferOutcome::Failed(ErrorCode::Protocol("all files failed".into())))
+        Ok(TransferOutcome::Failed(ErrorCode::Protocol(
+            "all files failed".into(),
+        )))
     }
 }
 
@@ -461,12 +696,58 @@ async fn receive_one_file(
     let first_msg = routed.first_msg;
 
     // Validate path first
-    let final_path = match validate_rel_path(&item.rel_path, &save_root) {
+    let validated_path = match validate_rel_path(&item.rel_path, &save_root) {
         Ok(p) => p,
         Err(_) => {
             return Ok((file_id, false, Some(ErrorCode::InvalidPath)));
         }
     };
+    let conflict_strategy = state.config.read().await.file_conflict_strategy.clone();
+    let mut final_path = validated_path.clone();
+
+    if item.file_type == FileType::Directory {
+        let expected_hash: [u8; 32] = blake3::hash(&[]).into();
+        match first_msg {
+            DashMessage::Complete(complete) => {
+                if complete.file_id != file_id {
+                    return Ok((
+                        file_id,
+                        false,
+                        Some(ErrorCode::Protocol("file_id mismatch in complete".into())),
+                    ));
+                }
+                if complete.file_hash != expected_hash {
+                    return Ok((file_id, false, Some(ErrorCode::HashMismatch)));
+                }
+                if let Err(e) = fs::create_dir_all(&validated_path).await {
+                    return Ok((file_id, false, Some(io_error_code(&e))));
+                }
+                return Ok((file_id, true, None));
+            }
+            DashMessage::Cancel(_) => return Ok((file_id, false, Some(ErrorCode::Cancelled))),
+            _ => {
+                return Ok((
+                    file_id,
+                    false,
+                    Some(ErrorCode::Protocol(
+                        "expected Complete for directory".into(),
+                    )),
+                ));
+            }
+        }
+    }
+
+    match resolve_conflict_path(final_path.clone(), &conflict_strategy).await {
+        Ok(Some(path)) => {
+            final_path = path;
+        }
+        Ok(None) => {
+            return Ok((file_id, false, Some(ErrorCode::PathConflict)));
+        }
+        Err(e) => {
+            return Ok((file_id, false, Some(ErrorCode::Protocol(e.to_string()))));
+        }
+    }
 
     if let Some(parent) = final_path.parent() {
         if let Err(e) = fs::create_dir_all(parent).await {
@@ -505,7 +786,11 @@ async fn receive_one_file(
         match msg {
             DashMessage::Chunk(chunk) => {
                 if chunk.file_id != file_id {
-                    return Ok((file_id, false, Some(ErrorCode::Protocol("file_id mismatch".into()))));
+                    return Ok((
+                        file_id,
+                        false,
+                        Some(ErrorCode::Protocol("file_id mismatch".into())),
+                    ));
                 }
                 hasher.update(&chunk.data);
                 if let Err(e) = file.write_all(&chunk.data).await {
@@ -513,24 +798,31 @@ async fn receive_one_file(
                     return Ok((file_id, false, Some(io_error_code(&e))));
                 }
 
-                let overall_transferred = {
+                let (overall_transferred, total_bytes, revision) = {
                     let mut transfers = state.transfers.write().await;
                     if let Some(t) = transfers.get_mut(&transfer_id) {
                         t.bytes_transferred += chunk.data.len() as u64;
-                        t.bytes_transferred
+                        (t.bytes_transferred, t.total_bytes, t.revision)
                     } else {
                         continue;
                     }
                 };
-                
-                app.emit("transfer_progress", serde_json::json!({
-                    "transfer_id": transfer_id,
-                    "bytes_transferred": overall_transferred,
-                })).unwrap_or_else(|e| tracing::warn!("Emit failed: {e}"));
+
+                emit_transfer_progress(
+                    &app,
+                    &transfer_id,
+                    overall_transferred,
+                    total_bytes,
+                    revision,
+                );
             }
             DashMessage::Complete(complete) => {
                 if complete.file_id != file_id {
-                    return Ok((file_id, false, Some(ErrorCode::Protocol("file_id mismatch in complete".into()))));
+                    return Ok((
+                        file_id,
+                        false,
+                        Some(ErrorCode::Protocol("file_id mismatch in complete".into())),
+                    ));
                 }
                 // Flush and verify
                 if let Err(e) = file.flush().await {
@@ -542,6 +834,14 @@ async fn receive_one_file(
                     tracing::error!("Hash mismatch for file {file_id}");
                     let _ = fs::remove_file(&temp_path).await;
                     return Ok((file_id, false, Some(ErrorCode::HashMismatch)));
+                }
+                if matches!(conflict_strategy, FileConflictStrategy::Overwrite)
+                    && fs::metadata(&final_path).await.is_ok()
+                {
+                    if let Err(e) = fs::remove_file(&final_path).await {
+                        let _ = fs::remove_file(&temp_path).await;
+                        return Ok((file_id, false, Some(io_error_code(&e))));
+                    }
                 }
                 if let Err(e) = fs::rename(&temp_path, &final_path).await {
                     let _ = fs::remove_file(&temp_path).await;
@@ -555,7 +855,11 @@ async fn receive_one_file(
             }
             _ => {
                 let _ = fs::remove_file(&temp_path).await;
-                return Ok((file_id, false, Some(ErrorCode::Protocol("unexpected message".into()))));
+                return Ok((
+                    file_id,
+                    false,
+                    Some(ErrorCode::Protocol("unexpected message".into())),
+                ));
             }
         }
     }
@@ -564,40 +868,119 @@ async fn receive_one_file(
 async fn get_save_root(app: &AppHandle, state: &Arc<AppState>, transfer_id: String) -> PathBuf {
     let custom_dir = state.config.read().await.download_dir.clone();
     let base_dir = custom_dir.map(PathBuf::from).unwrap_or_else(|| {
-        app.path().download_dir()
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-                PathBuf::from(home).join("Downloads")
-            })
+        app.path().download_dir().unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            PathBuf::from(home).join("Downloads")
+        })
     });
-    base_dir
-        .join("DashDrop")
-        .join(transfer_id.to_string())
+    base_dir.join("DashDrop").join(&transfer_id)
 }
 
-async fn update_transfer_status(state: &Arc<AppState>, id: String, status: TransferStatus) {
+async fn update_transfer_status(
+    state: &Arc<AppState>,
+    id: String,
+    status: TransferStatus,
+) -> Option<u64> {
+    let mut metrics_snapshot: Option<(TransferDirection, TransferStatus, u64)> = None;
     let mut transfers = state.transfers.write().await;
     if let Some(t) = transfers.get_mut(&id) {
-        t.status = status.clone();
-        match status {
-            TransferStatus::Complete | TransferStatus::PartialSuccess | TransferStatus::Failed | TransferStatus::Cancelled => {
+        let previous_status = t.status.clone();
+        if previous_status != status {
+            t.status = status.clone();
+            t.revision += 1;
+        }
+        match t.status {
+            TransferStatus::Completed
+            | TransferStatus::PartialCompleted
+            | TransferStatus::Failed
+            | TransferStatus::CancelledBySender
+            | TransferStatus::CancelledByReceiver
+            | TransferStatus::Rejected => {
                 t.ended_at = Some(std::time::Instant::now());
+                t.ended_at_unix = Some(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                );
+                if let Ok(guard) = state.db.lock() {
+                    let _ = crate::db::save_transfer(&guard, t);
+                }
+                let was_terminal = matches!(
+                    previous_status,
+                    TransferStatus::Completed
+                        | TransferStatus::PartialCompleted
+                        | TransferStatus::Failed
+                        | TransferStatus::CancelledBySender
+                        | TransferStatus::CancelledByReceiver
+                        | TransferStatus::Rejected
+                );
+                if !was_terminal {
+                    metrics_snapshot =
+                        Some((t.direction.clone(), t.status.clone(), t.bytes_transferred));
+                }
             }
             _ => {}
         }
+        let revision = t.revision;
+        drop(transfers);
+        if let Some((direction, terminal_status, bytes)) = metrics_snapshot {
+            state
+                .record_transfer_terminal(&direction, &terminal_status, bytes)
+                .await;
+        }
+        return Some(revision);
     }
+    None
 }
 
-async fn send_ack(conn: &quinn::Connection, file_id: u32, ok: bool, reason: Option<crate::transport::protocol::ErrorCode>) {
+async fn transfer_revision(state: &Arc<AppState>, id: &str) -> u64 {
+    state
+        .transfers
+        .read()
+        .await
+        .get(id)
+        .map(|t| t.revision)
+        .unwrap_or(0)
+}
+
+async fn send_ack(
+    conn: &quinn::Connection,
+    file_id: u32,
+    ok: bool,
+    reason: Option<crate::transport::protocol::ErrorCode>,
+) {
     if let Ok(mut send) = conn.open_uni().await {
-        let _ = crate::transport::protocol::write_message(&mut send, &crate::transport::protocol::DashMessage::Ack(crate::transport::protocol::AckPayload { file_id, ok, reason })).await;
+        let _ = crate::transport::protocol::write_message(
+            &mut send,
+            &crate::transport::protocol::DashMessage::Ack(crate::transport::protocol::AckPayload {
+                file_id,
+                ok,
+                reason,
+            }),
+        )
+        .await;
         let _ = send.finish();
     }
 }
 
+async fn send_cancel(conn: &quinn::Connection, reason: ErrorCode) -> Result<()> {
+    let mut send = conn.open_uni().await.context("open cancel stream")?;
+    write_message(
+        &mut send,
+        &DashMessage::Cancel(crate::transport::protocol::CancelPayload {
+            reason: crate::transport::protocol::CancelReason::Error(reason),
+        }),
+    )
+    .await
+    .context("write cancel message")?;
+    send.finish().context("finish cancel stream")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::io_error_code;
+    use super::{io_error_code, reject_reason, should_auto_accept};
     use crate::transport::protocol::ErrorCode;
 
     #[test]
@@ -611,5 +994,25 @@ mod tests {
     fn maps_enospc_errno_to_disk_full() {
         let err = std::io::Error::from_raw_os_error(28);
         assert!(matches!(io_error_code(&err), ErrorCode::DiskFull));
+    }
+
+    #[test]
+    fn reject_reason_matches_timeout_branch() {
+        assert_eq!(reject_reason(true), ("E_TIMEOUT", "Timeout"));
+    }
+
+    #[test]
+    fn reject_reason_matches_user_reject_branch() {
+        assert_eq!(
+            reject_reason(false),
+            ("E_REJECTED_BY_USER", "RejectedByReceiver")
+        );
+    }
+
+    #[test]
+    fn trusted_only_auto_accept_branch() {
+        assert!(should_auto_accept(true, true));
+        assert!(!should_auto_accept(false, true));
+        assert!(!should_auto_accept(true, false));
     }
 }

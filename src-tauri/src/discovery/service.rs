@@ -54,7 +54,7 @@ async fn register_on_daemon(mdns: &ServiceDaemon, state: &Arc<AppState>) -> Resu
         SERVICE_TYPE,
         &instance_name,
         &fqdn,
-        "",  // empty addr = use all interfaces
+        "", // empty addr = use all interfaces
         port,
         Some(properties),
     )
@@ -66,15 +66,24 @@ async fn register_on_daemon(mdns: &ServiceDaemon, state: &Arc<AppState>) -> Resu
     mdns.register(service_info).context("mDNS register")?;
     *state.mdns_service_fullname.write().await = Some(fullname);
 
-    tracing::info!(
-        "mDNS registered: instance={instance_name}, port={port}, fp={fp}"
-    );
+    tracing::info!("mDNS registered: instance={instance_name}, port={port}, fp={fp}");
     Ok(())
 }
 
 fn sanitize_mdns_name(name: &str) -> String {
-    let s: String = name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' { c } else { '-' })
+    let s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
-    if s.is_empty() { "DashDrop".into() } else { s }
+    if s.is_empty() {
+        "DashDrop".into()
+    } else {
+        s
+    }
 }

@@ -5,6 +5,17 @@
 > **文档版本**：v0.4（2026-03）
 > **主要修订**：五区 IA 与非阻塞接收模型、TransferStatus 与终态事件映射统一、接收方 Cancel 语义对齐、TransferHistoryEntry 与持久化约束、TrustedPeer/AppConfig 结构补全、Reachable Probe 归属与线协议约束
 
+> **实现状态快照（2026-03-09）**：
+> - 已实现：DTO 边界（`DeviceView/SessionView/TransferView`）、`transfer_accepted`、终态事件统一映射、`revision` 仅状态跃迁递增。
+> - 已实现：CI 门禁（`cargo check`、`cargo test`、`npm run build`、`npm run test:e2e`）。
+> - 已实现：`connect_by_address`、trusted-only auto-accept、Probe(ALPN `dashdrop-probe/1`) 与 `Offline` 状态收敛、security_events 审计落地。
+> - 已实现：真实浏览器自动化 Playwright E2E（mock IPC 驱动的 UI 流程）。
+> - 已实现：sender accept 超时、60s 用户响应时限、目录 complete/ack 生命周期、fingerprint 级 offer 限流、Probe `0xD0` close code。
+> - 已实现：配置驱动的文件冲突策略（overwrite/rename/skip）与并发流上限（`max_parallel_streams`）。
+> - 已实现：前端任务管理增强（批量取消、发送任务重试）、配对别名与最近使用时间展示。
+> - 未完成：真实双端 QUIC 多机编排压测（当前仍以合同测试+UI mock E2E 为主）。
+> - 说明：本文中若出现与代码细节不一致的结构定义，以 `src-tauri/src/*.rs` 与 `src/*.ts` 的当前实现为准。
+
 ---
 
 ## 一、分层架构总览

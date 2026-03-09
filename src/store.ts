@@ -1,0 +1,357 @@
+import { computed, ref } from "vue";
+import type { TransferView, DeviceView, TransferIncomingPayload, LocalIdentity } from "./types";
+import {
+  onDeviceDiscovered,
+  onDeviceUpdated,
+  onDeviceLost,
+  onTransferStarted,
+  onTransferIncoming,
+  onTransferAccepted,
+  onTransferProgress,
+  onTransferComplete,
+  onTransferPartial,
+  onTransferRejected,
+  onTransferCancelledBySender,
+  onTransferCancelledByReceiver,
+  onTransferFailed,
+  onTransferError,
+  onSystemError,
+  onIdentityMismatch,
+  onFingerprintChanged,
+  getLocalIdentity,
+  getDevices,
+  getTransfers,
+  getTransfer,
+} from "./ipc";
+import { sendNotification, isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
+
+export const myIdentity = ref<LocalIdentity | null>(null);
+export const devices = ref<DeviceView[]>([]);
+export const activeTransfers = ref<Record<string, TransferView>>({});
+export const incomingQueue = ref<TransferIncomingPayload[]>([]);
+export const systemError = ref<string | null>(null);
+export const sendingPeerFingerprints = computed(() => {
+  const sending = new Set<string>();
+  for (const task of Object.values(activeTransfers.value)) {
+    if (
+      task.direction === "Send" &&
+      (task.status === "PendingAccept" || task.status === "Transferring")
+    ) {
+      sending.add(task.peer_fingerprint);
+    }
+  }
+  return sending;
+});
+
+let unlistens: Array<() => void> = [];
+let clearSystemErrorTimer: ReturnType<typeof setTimeout> | null = null;
+
+function setSystemError(message: string, timeoutMs = 10_000) {
+  systemError.value = message;
+  if (clearSystemErrorTimer) {
+    clearTimeout(clearSystemErrorTimer);
+    clearSystemErrorTimer = null;
+  }
+  if (timeoutMs > 0) {
+    clearSystemErrorTimer = setTimeout(() => {
+      systemError.value = null;
+      clearSystemErrorTimer = null;
+    }, timeoutMs);
+  }
+}
+
+async function notifyUser(title: string, body: string) {
+  let permissionGranted = await isPermissionGranted();
+  if (!permissionGranted) {
+    const permission = await requestPermission();
+    permissionGranted = permission === "granted";
+  }
+  if (permissionGranted) {
+    sendNotification({ title, body });
+  }
+}
+
+function removeIncoming(transferId: string) {
+  incomingQueue.value = incomingQueue.value.filter((entry) => entry.transfer_id !== transferId);
+}
+
+function upsertIncoming(payload: TransferIncomingPayload) {
+  removeIncoming(payload.transfer_id);
+  incomingQueue.value.push(payload);
+}
+
+function applyRevision(task: TransferView, revision: number): boolean {
+  const currentRevision = task.revision ?? 0;
+  if (revision < currentRevision) {
+    return false;
+  }
+  task.revision = revision;
+  return true;
+}
+
+async function hydrateTransfer(transferId: string): Promise<TransferView | null> {
+  try {
+    const transfer = await getTransfer(transferId);
+    if (transfer) {
+      activeTransfers.value[transferId] = transfer;
+    }
+    return transfer;
+  } catch (e) {
+    console.error(`Failed to fetch transfer ${transferId}:`, e);
+    return null;
+  }
+}
+
+async function applyStateEvent(
+  transferId: string,
+  revision: number,
+  updater: (task: TransferView) => void,
+) {
+  let task: TransferView | null | undefined = activeTransfers.value[transferId];
+  if (!task) {
+    task = await hydrateTransfer(transferId);
+    if (!task) {
+      await fetchSnapshot();
+      task = activeTransfers.value[transferId];
+      if (!task) {
+        return;
+      }
+    }
+  }
+
+  const currentRevision = task.revision ?? 0;
+  if (revision > currentRevision + 1) {
+    await fetchSnapshot();
+    task = activeTransfers.value[transferId];
+    if (!task) {
+      return;
+    }
+  }
+
+  if (!applyRevision(task, revision)) {
+    return;
+  }
+
+  updater(task);
+}
+
+function applyProgressEvent(
+  transferId: string,
+  revision: number,
+  updater: (task: TransferView) => void,
+) {
+  const task = activeTransfers.value[transferId];
+  if (!task) {
+    return;
+  }
+
+  const currentRevision = task.revision ?? 0;
+  if (revision < currentRevision) {
+    return;
+  }
+  task.revision = revision;
+  updater(task);
+}
+
+function addOrUpdateTerminalError(
+  transferId: string,
+  status: TransferView["status"],
+  reason: string,
+  revision: number,
+) {
+  removeIncoming(transferId);
+  void applyStateEvent(transferId, revision, (t) => {
+    t.status = status;
+    t.error = reason;
+    t.bytes_transferred = Math.min(t.total_bytes, t.bytes_transferred);
+  });
+}
+
+export async function fetchSnapshot() {
+  try {
+    const transfers = await getTransfers();
+    const next: Record<string, TransferView> = {};
+    for (const t of transfers) {
+      next[t.id] = t;
+    }
+    activeTransfers.value = next;
+  } catch (e) {
+    console.error("Failed to fetch snapshot:", e);
+  }
+}
+
+export async function initAppStore() {
+  myIdentity.value = await getLocalIdentity();
+  devices.value = await getDevices();
+  await fetchSnapshot();
+
+  unlistens.push(
+    await onDeviceDiscovered((d) => {
+      const idx = devices.value.findIndex((existing) => existing.fingerprint === d.fingerprint);
+      if (idx === -1) {
+        devices.value.push(d);
+      }
+    }),
+  );
+
+  unlistens.push(
+    await onDeviceUpdated((d) => {
+      const idx = devices.value.findIndex((existing) => existing.fingerprint === d.fingerprint);
+      if (idx !== -1) {
+        devices.value[idx] = { ...devices.value[idx], ...d };
+      } else {
+        devices.value.push(d);
+      }
+    }),
+  );
+
+  unlistens.push(
+    await onDeviceLost((fp) => {
+      devices.value = devices.value.filter((d) => d.fingerprint !== fp);
+    }),
+  );
+
+  unlistens.push(
+    await onTransferStarted((payload) => {
+      activeTransfers.value[payload.transfer_id] = {
+        id: payload.transfer_id,
+        direction: "Send",
+        peer_fingerprint: payload.peer_fp,
+        peer_name: payload.peer_name,
+        items: payload.items,
+        status: "PendingAccept",
+        bytes_transferred: 0,
+        total_bytes: payload.total_size,
+        revision: payload.revision,
+      };
+    }),
+  );
+
+  unlistens.push(
+    await onTransferIncoming((payload) => {
+      upsertIncoming(payload);
+    }),
+  );
+
+  unlistens.push(
+    await onTransferAccepted(async (payload) => {
+      removeIncoming(payload.transfer_id);
+      await applyStateEvent(payload.transfer_id, payload.revision, (t) => {
+        t.status = "Transferring";
+      });
+    }),
+  );
+
+  unlistens.push(
+    await onTransferProgress((payload) => {
+      applyProgressEvent(payload.transfer_id, payload.revision, (t) => {
+        t.bytes_transferred = payload.bytes_transferred;
+        t.total_bytes = payload.total_bytes;
+      });
+    }),
+  );
+
+  unlistens.push(
+    await onTransferComplete((payload) => {
+      removeIncoming(payload.transfer_id);
+      void applyStateEvent(payload.transfer_id, payload.revision, (t) => {
+        t.status = "Completed";
+        t.bytes_transferred = t.total_bytes;
+        void notifyUser(
+          t.direction === "Send" ? "Upload Complete" : "Download Complete",
+          `Successfully transferred files ${t.direction === "Send" ? "to" : "from"} ${t.peer_name}`,
+        );
+      });
+    }),
+  );
+
+  unlistens.push(
+    await onTransferPartial((payload) => {
+      removeIncoming(payload.transfer_id);
+      void applyStateEvent(payload.transfer_id, payload.revision, (t) => {
+        t.status = "PartialCompleted";
+        t.bytes_transferred = t.total_bytes;
+      });
+    }),
+  );
+
+  unlistens.push(
+    await onTransferRejected((payload) => {
+      addOrUpdateTerminalError(payload.transfer_id, "Rejected", payload.reason_code, payload.revision);
+    }),
+  );
+
+  unlistens.push(
+    await onTransferCancelledBySender((payload) => {
+      addOrUpdateTerminalError(payload.transfer_id, "CancelledBySender", payload.reason_code, payload.revision);
+    }),
+  );
+
+  unlistens.push(
+    await onTransferCancelledByReceiver((payload) => {
+      addOrUpdateTerminalError(payload.transfer_id, "CancelledByReceiver", payload.reason_code, payload.revision);
+    }),
+  );
+
+  unlistens.push(
+    await onTransferFailed((payload) => {
+      addOrUpdateTerminalError(payload.transfer_id, "Failed", payload.reason_code, payload.revision);
+    }),
+  );
+
+  unlistens.push(
+    await onTransferError((err) => {
+      if (err.transfer_id) {
+        addOrUpdateTerminalError(err.transfer_id, "Failed", err.reason_code, err.revision);
+      }
+      setSystemError(`Transfer error (${err.phase}): ${err.reason_code}`);
+    }),
+  );
+
+  unlistens.push(
+    await onSystemError((payload) => {
+      if (payload.code === "MDNS_REREGISTER_FAILED") {
+        const rollbackName = payload.rollback_device_name || "previous value";
+        const attemptedName = payload.attempted_device_name || "new value";
+        setSystemError(
+          `Device name update failed and was rolled back (${attemptedName} -> ${rollbackName}). ${payload.message}`,
+          0,
+        );
+        return;
+      }
+      setSystemError(payload.message);
+    }),
+  );
+
+  unlistens.push(
+    await onIdentityMismatch((payload) => {
+      const expected = payload.expected_fp || payload.mdns_fp || "unknown";
+      const actual = payload.actual_fp || payload.cert_fp || "unknown";
+      const phase = payload.phase ? ` (${payload.phase})` : "";
+      setSystemError(
+        `Security warning${phase}: peer identity mismatch (expected ${expected}, got ${actual}).`,
+        20_000,
+      );
+    }),
+  );
+
+  unlistens.push(
+    await onFingerprintChanged((payload) => {
+      setSystemError(
+        `Security warning: paired peer fingerprint changed on session ${payload.session_id} (previous ${payload.previous_fp}, current ${payload.current_fp}).`,
+        30_000,
+      );
+    }),
+  );
+}
+
+export function destroyAppStore() {
+  for (const unlisten of unlistens) {
+    unlisten();
+  }
+  unlistens = [];
+  if (clearSystemErrorTimer) {
+    clearTimeout(clearSystemErrorTimer);
+    clearSystemErrorTimer = null;
+  }
+}

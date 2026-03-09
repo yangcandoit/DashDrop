@@ -2,176 +2,57 @@
 import { ref, onMounted, onUnmounted, computed } from 'vue';
 import { open, message } from '@tauri-apps/plugin-dialog';
 import DeviceCard from '../components/DeviceCard.vue';
-import TransferModal from '../components/TransferModal.vue';
-import ProgressBar from '../components/ProgressBar.vue';
-import { getDevices, sendFiles, getTransfers,
-  onDeviceDiscovered, onDeviceUpdated, onDeviceLost, onTransferStarted,
-  onTransferIncoming, onTransferProgress, onTransferComplete, 
-  onTransferPartial, onTransferFailed, onTransferError, getLocalIdentity,
-  cancelTransfer, openTransferFolder, onSystemError, onIdentityMismatch
-} from '../ipc';
+import { sendFiles } from '../ipc';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
-import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification';
-import type { DeviceInfo, TransferTask, LocalIdentity, TransferIncomingPayload } from '../types';
-
-async function notifyUser(title: string, body: string) {
-  let permissionGranted = await isPermissionGranted();
-  if (!permissionGranted) {
-    const permission = await requestPermission();
-    permissionGranted = permission === 'granted';
-  }
-  if (permissionGranted) {
-    sendNotification({ title, body });
-  }
-}
+import type { DeviceView } from '../types';
+import { myIdentity, devices, incomingQueue, sendingPeerFingerprints, systemError } from '../store';
 
 const emit = defineEmits(['openSettings']);
 
-const myIdentity = ref<LocalIdentity | null>(null);
-const devices = ref<DeviceInfo[]>([]);
-const activeTransfers = ref<Record<string, TransferTask>>({});
-const incomingQueue = ref<TransferIncomingPayload[]>([]);
-const incomingTransfer = computed(() => incomingQueue.value.length > 0 ? incomingQueue.value[0] : null);
-const systemError = ref<string | null>(null);
+const incomingCount = computed(() => incomingQueue.value.length);
+const activeDropTargetFp = ref<string | null>(null);
 
-const pendingTauriDrop = ref<string[] | null>(null);
-const pendingDomTarget = ref<DeviceInfo | null>(null);
-
-let unlistens: Array<() => void> = [];
+let dragDropUnlisten: (() => void) | null = null;
 
 onMounted(async () => {
-  // Load initial state
-  myIdentity.value = await getLocalIdentity();
-  devices.value = await getDevices();
-  
-  const transfers = await getTransfers();
-  for (const t of transfers) {
-    activeTransfers.value[t.id] = t;
-  }
-
-  // Listen for mDNS device events
-  unlistens.push(await onDeviceDiscovered((d) => {
-    // Check if already in list
-    const idx = devices.value.findIndex(existing => existing.fingerprint === d.fingerprint);
-    if (idx === -1) {
-      devices.value.push(d as DeviceInfo);
-    }
-  }));
-
-  unlistens.push(await onDeviceUpdated((d) => {
-    const idx = devices.value.findIndex(existing => existing.fingerprint === d.fingerprint);
-    if (idx !== -1) {
-      devices.value[idx] = { ...devices.value[idx], ...d };
-    }
-  }));
-
-  unlistens.push(await onDeviceLost((fp) => {
-    devices.value = devices.value.filter(d => d.fingerprint !== fp);
-  }));
-
-  // Listen for Tauri drag/drop globally
-  unlistens.push(await getCurrentWebview().onDragDropEvent((event) => {
-    if (event.payload.type === 'drop') {
-      const paths = event.payload.paths;
-      if (pendingDomTarget.value) {
-        sendGivenPathsToDevice(paths, pendingDomTarget.value);
-        pendingDomTarget.value = null;
-        pendingTauriDrop.value = null;
-      } else {
-        pendingTauriDrop.value = paths;
-        setTimeout(() => { pendingTauriDrop.value = null; }, 500);
-      }
-    }
-  }));
-
-  // Listen for transfer events
-  unlistens.push(await onTransferStarted((payload) => {
-    activeTransfers.value[payload.transfer_id] = {
-      id: payload.transfer_id,
-      direction: 'Send',
-      peer_fingerprint: payload.peer_fp,
-      peer_name: payload.peer_name,
-      items: [],
-      status: 'AwaitingAccept',
-      bytes_transferred: 0,
-      total_bytes: payload.total_size,
-    };
-  }));
-  unlistens.push(await onTransferIncoming((payload) => {
-    incomingQueue.value.push(payload);
-  }));
-
-  unlistens.push(await onTransferProgress((payload) => {
-    const t = activeTransfers.value[payload.transfer_id];
-    if (t) {
-      t.bytes_transferred = payload.bytes_transferred;
-      t.status = 'Transferring';
-    }
-  }));
-
-  const markComplete = (id: string, partial: boolean) => {
-    const t = activeTransfers.value[id];
-    if (t) {
-      t.status = partial ? 'PartialSuccess' : 'Complete';
-      t.bytes_transferred = t.total_bytes;
-      
-      notifyUser(
-        t.direction === 'Send' ? 'Upload Complete' : 'Download Complete',
-        `Successfully transferred files ${t.direction === 'Send' ? 'to' : 'from'} ${t.peer_name}`
-      );
-    }
-  };
-
-  unlistens.push(await onTransferComplete((payload) => {
-    markComplete(payload.transfer_id, false);
-  }));
-
-  unlistens.push(await onTransferPartial((payload) => {
-    markComplete(payload.transfer_id, true);
-  }));
-
-  unlistens.push(await onTransferFailed((payload) => {
-    const t = activeTransfers.value[payload.transfer_id];
-    if (t) {
-      t.status = 'Failed';
-      notifyUser(
-        t.direction === 'Send' ? 'Upload Failed' : 'Download Failed',
-        `Transfer failed with ${t.peer_name}: ${payload.reason}`
-      );
-    }
-  }));
-
-  unlistens.push(await onTransferError((err) => {
-    console.error("Transfer error:", err);
-    if (err.transfer_id && activeTransfers.value[err.transfer_id]) {
-      activeTransfers.value[err.transfer_id].status = 'Failed';
+  dragDropUnlisten = await getCurrentWebview().onDragDropEvent(async (event) => {
+    if (event.payload.type !== 'drop') {
       return;
     }
-    systemError.value = `Transfer error (${err.phase}): ${err.reason}`;
-    setTimeout(() => { systemError.value = null; }, 10_000);
-  }));
 
-  unlistens.push(await onSystemError((payload: { subsystem: string; message: string }) => {
-    systemError.value = payload.message;
-    setTimeout(() => { systemError.value = null; }, 10_000);
-  }));
+    const paths = event.payload.paths;
+    const targetFp = activeDropTargetFp.value;
+    activeDropTargetFp.value = null;
 
-  unlistens.push(await onIdentityMismatch((payload) => {
-    const expected = payload.expected_fp || payload.mdns_fp || 'unknown';
-    const actual = payload.actual_fp || payload.cert_fp || 'unknown';
-    systemError.value = `Security warning: peer identity mismatch (expected ${expected}, got ${actual}).`;
-  }));
+    if (!targetFp) {
+      await message('Drop files directly on a device card.', {
+        title: 'No target device',
+        kind: 'warning',
+      });
+      return;
+    }
+
+    const target = devices.value.find((d) => d.fingerprint === targetFp);
+    if (!target) {
+      await message('Selected device is no longer available.', {
+        title: 'Device unavailable',
+        kind: 'warning',
+      });
+      return;
+    }
+
+    await sendGivenPathsToDevice(paths, target);
+  });
 });
 
 onUnmounted(() => {
-  unlistens.forEach(fn => fn());
+  if (dragDropUnlisten) dragDropUnlisten();
 });
 
-const handleDeviceClick = async (device: DeviceInfo) => {
-  // Open Tauri file dialog to pick files
+const handleDeviceClick = async (device: DeviceView) => {
   const selected = await open({
     multiple: true,
-    title: `Send to ${device.name}`
+    title: `Send to ${device.name}`,
   });
 
   if (selected && selected.length > 0) {
@@ -180,127 +61,68 @@ const handleDeviceClick = async (device: DeviceInfo) => {
   }
 };
 
-const handleDomDrop = (device: DeviceInfo) => {
-  if (pendingTauriDrop.value) {
-    sendGivenPathsToDevice(pendingTauriDrop.value, device);
-    pendingTauriDrop.value = null;
-    pendingDomTarget.value = null;
-  } else {
-    pendingDomTarget.value = device;
-    setTimeout(() => { pendingDomTarget.value = null; }, 500);
+const handleDragTargetEnter = (device: DeviceView) => {
+  activeDropTargetFp.value = device.fingerprint;
+};
+
+const handleDragTargetLeave = (device: DeviceView) => {
+  if (activeDropTargetFp.value === device.fingerprint) {
+    activeDropTargetFp.value = null;
   }
 };
 
-const sendingTo = ref<string | null>(null);
+const sendGivenPathsToDevice = async (paths: string[], device: DeviceView) => {
+  if (sendingPeerFingerprints.value.has(device.fingerprint)) return;
 
-const sendGivenPathsToDevice = async (paths: string[], device: DeviceInfo) => {
-  if (sendingTo.value) return; // Prevent double-clicks
-  
   try {
-    sendingTo.value = device.fingerprint;
     await sendFiles(device.fingerprint, paths);
   } catch (e: unknown) {
-    console.error("Failed to send files:", e);
+    console.error('Failed to send files:', e);
     await message(`Failed to send files to ${device.name}:\n${String(e)}`, { title: 'Transfer Failed', kind: 'error' });
-  } finally {
-    sendingTo.value = null;
   }
 };
-
-const hasActiveTransfers = computed(() => Object.keys(activeTransfers.value).length > 0);
-
 </script>
 
 <template>
   <div class="nearby-view">
-    <!-- System Error Banner -->
     <div v-if="systemError" class="system-error-banner" @click="systemError = null">
       ⚠️ {{ systemError }} <span style="opacity:0.7;font-size:0.8em">(click to dismiss)</span>
     </div>
-    <header class="app-header">
-      <div class="logo">
-        <svg viewBox="0 0 24 24" fill="none" class="icon-logo" stroke="url(#gradient)" stroke-width="2.5">
-          <defs>
-            <linearGradient id="gradient" x1="0%" y1="0%" x2="100%" y2="100%">
-              <stop offset="0%" stop-color="#3b82f6" />
-              <stop offset="100%" stop-color="#8b5cf6" />
-            </linearGradient>
-          </defs>
-          <path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
-        </svg>
-        <h1>DashDrop</h1>
-      </div>
+    <header class="view-header">
+      <h2>Nearby</h2>
       <div class="my-identity" v-if="myIdentity">
         <div class="status-dot"></div>
         <span class="text-muted">{{ myIdentity.device_name }}</span>
-        <button @click="emit('openSettings')" class="btn-icon" style="margin-left:8px; cursor: pointer; background: transparent; border: none;" title="Settings">⚙️</button>
+        <button @click="emit('openSettings')" class="btn-icon" style="margin-left:8px; cursor: pointer; background: transparent; border: none; font-size: 1.2rem;" title="Settings">⚙️</button>
       </div>
     </header>
 
     <main class="content">
       <div class="devices-section">
-        <h2>Nearby Devices</h2>
         <p class="text-muted subtitle">Click a device to send files</p>
-        
+
         <div class="devices-grid" v-if="devices.length > 0">
-          <DeviceCard 
-            v-for="device in devices" 
+          <DeviceCard
+            v-for="device in devices"
             :key="device.fingerprint"
             :device="device"
-            :isSending="sendingTo === device.fingerprint"
+            :isSending="sendingPeerFingerprints.has(device.fingerprint)"
             @click="handleDeviceClick(device)"
-            @drop="handleDomDrop(device)"
+            @drag-target-enter="handleDragTargetEnter(device)"
+            @drag-target-leave="handleDragTargetLeave(device)"
           />
         </div>
-        
+
         <div class="empty-state" v-else>
           <div class="radar-ping"></div>
           <p class="text-muted">Looking for nearby devices...</p>
         </div>
       </div>
-
-      <div class="transfers-section glass-panel" v-if="hasActiveTransfers">
-        <h3>Transfers</h3>
-        <div class="transfers-list">
-          <div v-for="t in activeTransfers" :key="t.id" class="transfer-card">
-            <div class="transfer-meta" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-              <span class="peer-name">{{ t.direction === 'Send' ? 'To ' : 'From ' }}{{ t.peer_name }}</span>
-              <div class="transfer-actions" style="display: flex; gap: 8px;">
-                <button 
-                  v-if="t.status === 'Transferring' || t.status === 'AwaitingAccept'" 
-                  @click="cancelTransfer(t.id)" 
-                  style="font-size: 0.8rem; padding: 4px 8px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.2); background: transparent; color: inherit; cursor: pointer;">
-                  Cancel
-                </button>
-                <button 
-                  v-if="t.status === 'Complete' && t.direction === 'Receive'" 
-                  @click="openTransferFolder(t.id)" 
-                  style="font-size: 0.8rem; padding: 4px 8px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.2); background: transparent; color: inherit; cursor: pointer;">
-                  Open Folder
-                </button>
-              </div>
-            </div>
-            <ProgressBar 
-              :progress="t.total_bytes > 0 ? (t.bytes_transferred / t.total_bytes) : 0"
-              :status="t.status"
-              :bytesReceived="t.bytes_transferred"
-              :totalBytes="t.total_bytes"
-            />
-          </div>
-        </div>
-      </div>
     </main>
 
-    <TransferModal 
-      v-if="incomingTransfer"
-      :transferId="incomingTransfer.transfer_id"
-      :senderName="incomingTransfer.sender_name"
-      :senderFp="incomingTransfer.sender_fp"
-      :trusted="incomingTransfer.trusted"
-      :items="incomingTransfer.items"
-      :totalSize="incomingTransfer.total_size"
-      @close="incomingQueue.shift()"
-    />
+    <div v-if="incomingCount > 0" class="incoming-hint">
+      {{ incomingCount }} incoming request{{ incomingCount > 1 ? 's' : '' }} waiting in Transfers
+    </div>
   </div>
 </template>
 
@@ -312,23 +134,12 @@ const hasActiveTransfers = computed(() => Object.keys(activeTransfers.value).len
   flex-direction: column;
 }
 
-.app-header {
+.view-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
   padding: 24px 32px;
   background: linear-gradient(to bottom, rgba(15, 17, 21, 0.8), transparent);
-}
-
-.logo {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.icon-logo {
-  width: 32px;
-  height: 32px;
 }
 
 .my-identity {
@@ -394,38 +205,6 @@ const hasActiveTransfers = computed(() => Object.keys(activeTransfers.value).len
   animation: pulse-glow 2s infinite cubic-bezier(0.4, 0, 0.6, 1);
 }
 
-.transfers-section {
-  padding: 24px;
-  border-radius: var(--radius-xl);
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
-.transfers-list {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  max-height: 300px;
-  overflow-y: auto;
-}
-
-.transfer-card {
-  padding: 16px;
-  background: var(--bg-surface);
-  border-radius: var(--radius-md);
-  border: 1px solid var(--border-light);
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.transfer-meta {
-  display: flex;
-  justify-content: space-between;
-  font-weight: 500;
-}
-
 .system-error-banner {
   background: rgba(239, 68, 68, 0.15);
   border-bottom: 1px solid rgba(239, 68, 68, 0.3);
@@ -438,5 +217,17 @@ const hasActiveTransfers = computed(() => Object.keys(activeTransfers.value).len
 
 .system-error-banner:hover {
   background: rgba(239, 68, 68, 0.25);
+}
+
+.incoming-hint {
+  position: absolute;
+  bottom: 18px;
+  right: 24px;
+  padding: 8px 12px;
+  border-radius: var(--radius-md);
+  background: rgba(59, 130, 246, 0.15);
+  border: 1px solid rgba(59, 130, 246, 0.35);
+  color: #93c5fd;
+  font-size: 0.85rem;
 }
 </style>

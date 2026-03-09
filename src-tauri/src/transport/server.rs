@@ -13,7 +13,9 @@ pub async fn start_server(
     state: Arc<crate::state::AppState>,
 ) -> Result<u16> {
     // Build rustls config, then wrap for quinn
-    let rustls_cfg = identity.server_tls_config().context("build server TLS config")?;
+    let rustls_cfg = identity
+        .server_tls_config()
+        .context("build server TLS config")?;
     let quinn_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_cfg)
         .context("quinn server TLS")?;
 
@@ -22,7 +24,9 @@ pub async fn start_server(
     // QUIC transport parameters per ARCHITECTURE.md §3.6
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(
-        std::time::Duration::from_secs(30).try_into().map_err(|e| anyhow::anyhow!("invalid duration: {:?}", e))?,
+        std::time::Duration::from_secs(30)
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("invalid duration: {:?}", e))?,
     ));
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
     server_config.transport_config(Arc::new(transport));
@@ -33,9 +37,15 @@ pub async fn start_server(
 
     tracing::info!("QUIC server listening on port {port}");
     *state.local_port.write().await = port;
-    state.endpoint.set(endpoint.clone()).map_err(|_| anyhow::anyhow!("endpoint already set"))?;
+    state
+        .endpoint
+        .set(endpoint.clone())
+        .map_err(|_| anyhow::anyhow!("endpoint already set"))?;
 
-    let rate_limiter = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<std::net::IpAddr, (u32, std::time::Instant)>::new()));
+    let rate_limiter = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
+        std::net::IpAddr,
+        (u32, std::time::Instant),
+    >::new()));
 
     // Accept connections in background
     tokio::spawn(async move {
@@ -61,9 +71,41 @@ pub async fn start_server(
             tokio::spawn(async move {
                 match incoming.await {
                     Ok(conn) => {
+                        if let Some(protocol) = conn
+                            .handshake_data()
+                            .and_then(|data| {
+                                data.downcast::<quinn::crypto::rustls::HandshakeData>().ok()
+                            })
+                            .and_then(|hs| hs.protocol)
+                        {
+                            if protocol.as_slice() == crate::transport::probe::PROBE_ALPN {
+                                conn.close(quinn::VarInt::from_u32(0xD0), b"probe acknowledged");
+                                return;
+                            }
+                        }
                         tracing::debug!("Incoming connection from {:?}", conn.remote_address());
-                        if let Err(e) = super::handshake::handle_incoming(conn, app2, state2).await {
+                        if let Err(e) =
+                            super::handshake::handle_incoming(conn, app2.clone(), state2.clone())
+                                .await
+                        {
                             tracing::warn!("Incoming connection error: {e:#}");
+                            if let Ok(db) = state2.db.lock() {
+                                let _ = crate::db::log_security_event(
+                                    &db,
+                                    "handshake_failed",
+                                    "incoming",
+                                    None,
+                                    &e.to_string(),
+                                );
+                            }
+                            crate::transport::events::emit_transfer_error(
+                                &app2,
+                                None,
+                                &e.to_string(),
+                                "IncomingConnectionError",
+                                "incoming",
+                                0,
+                            );
                         }
                     }
                     Err(e) => tracing::warn!("QUIC accept error: {e}"),

@@ -1,11 +1,10 @@
-use std::path::{Component, Path, PathBuf};
 use anyhow::Result;
+use std::path::{Component, Path, PathBuf};
 
 /// Windows reserved device names (case-insensitive).
 const WINDOWS_RESERVED: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL",
-    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
 /// Validate a relative path from a FileItem.rel_path per PROTOCOL.md §5.1.
@@ -24,10 +23,14 @@ pub fn validate_rel_path(rel_path: &str, save_root: &Path) -> Result<PathBuf, Pa
     }
 
     // Rule 2: reject leading/trailing separators and double separators
-    if rel_path.starts_with('/') || rel_path.starts_with('\\')
-        || rel_path.ends_with('/') || rel_path.ends_with('\\')
-        || rel_path.contains("//") || rel_path.contains("\\\\")
-        || rel_path.contains("/\\") || rel_path.contains("\\/")
+    if rel_path.starts_with('/')
+        || rel_path.starts_with('\\')
+        || rel_path.ends_with('/')
+        || rel_path.ends_with('\\')
+        || rel_path.contains("//")
+        || rel_path.contains("\\\\")
+        || rel_path.contains("/\\")
+        || rel_path.contains("\\/")
     {
         return Err(PathError::EmptySegment);
     }
@@ -80,7 +83,9 @@ fn normalize_path(path: &Path) -> PathBuf {
             Component::Prefix(p) => result.push(p.as_os_str()),
             Component::RootDir => result.push("/"),
             Component::CurDir => {} // skip .
-            Component::ParentDir => { result.pop(); } // handle ..
+            Component::ParentDir => {
+                result.pop();
+            } // handle ..
             Component::Normal(c) => result.push(c),
         }
     }

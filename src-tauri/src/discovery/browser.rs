@@ -5,8 +5,12 @@ use std::sync::Arc;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter};
 
-use crate::state::{AppState, DeviceInfo, Platform, SessionIndexEntry, SessionInfo};
 use super::service::SERVICE_TYPE;
+use crate::dto::DeviceView;
+use crate::state::{AppState, DeviceInfo, Platform, SessionIndexEntry, SessionInfo};
+
+const OFFLINE_GRACE_SECS: u64 = 15;
+const DEVICE_LOST_RETENTION_SECS: u64 = 45;
 
 fn remove_session_from_state(
     remove_key: &str,
@@ -19,16 +23,27 @@ fn remove_session_from_state(
     if let Some(device) = devices.get_mut(&fp) {
         device.sessions.remove(&entry.session_id);
         let now_empty = device.sessions.is_empty();
-        let snapshot = if now_empty { None } else { Some(device.clone()) };
         if now_empty {
-            let removed = devices.remove(&fp);
-            Some((fp, true, removed))
+            device.reachability = crate::state::ReachabilityStatus::OfflineCandidate;
+            Some((fp, false, Some(device.clone())))
         } else {
-            Some((fp, false, snapshot))
+            Some((fp, false, Some(device.clone())))
         }
     } else {
         Some((fp, false, None))
     }
+}
+
+pub fn should_mark_offline(device: &DeviceInfo, now_unix: u64) -> bool {
+    device.sessions.is_empty()
+        && device.reachability == crate::state::ReachabilityStatus::OfflineCandidate
+        && now_unix.saturating_sub(device.last_seen) >= OFFLINE_GRACE_SECS
+}
+
+pub fn should_emit_device_lost(device: &DeviceInfo, now_unix: u64) -> bool {
+    device.sessions.is_empty()
+        && device.reachability == crate::state::ReachabilityStatus::Offline
+        && now_unix.saturating_sub(device.last_seen) >= DEVICE_LOST_RETENTION_SECS
 }
 
 /// Start mDNS browsing for DashDrop peers.
@@ -40,20 +55,23 @@ pub async fn start_browser(
     let receiver = mdns.browse(SERVICE_TYPE).context("mDNS browse")?;
     let own_fp = state.identity.fingerprint.clone();
 
+    let app_events = app.clone();
+    let state_events = state.clone();
     tokio::spawn(async move {
         loop {
             // mdns-sd channel receiver is Sync, use spawn_blocking to not block tokio
             let event = tokio::task::spawn_blocking({
                 let recv = receiver.clone();
                 move || recv.recv_timeout(std::time::Duration::from_secs(5))
-            }).await;
+            })
+            .await;
 
             match event {
                 Ok(Ok(ServiceEvent::ServiceResolved(info))) => {
-                    handle_resolved(&info, &own_fp, &app, &state).await;
+                    handle_resolved(&info, &own_fp, &app_events, &state_events).await;
                 }
                 Ok(Ok(ServiceEvent::ServiceRemoved(_service_type, fullname))) => {
-                    handle_removed(&fullname, &app, &state).await;
+                    handle_removed(&fullname, &app_events, &state_events).await;
                 }
                 Ok(Ok(_)) => {} // SearchStarted, other events
                 Ok(Err(_)) => {
@@ -66,6 +84,46 @@ pub async fn start_browser(
             }
         }
         tracing::info!("mDNS browser stopped");
+    });
+
+    let app_for_offline = app.clone();
+    let state_for_offline = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let mut updates = Vec::new();
+            let lost = {
+                let mut devices = state_for_offline.devices.write().await;
+                for device in devices.values_mut() {
+                    if should_mark_offline(device, now) {
+                        device.reachability = crate::state::ReachabilityStatus::Offline;
+                        updates.push(DeviceView::from(&*device));
+                    }
+                }
+                let evicted: Vec<String> = devices
+                    .iter()
+                    .filter(|(_, device)| should_emit_device_lost(device, now))
+                    .map(|(fp, _)| fp.clone())
+                    .collect();
+                for fp in &evicted {
+                    devices.remove(fp);
+                }
+                evicted
+            };
+            for payload in updates {
+                app_for_offline.emit("device_updated", payload).ok();
+            }
+            for fp in lost {
+                app_for_offline
+                    .emit("device_lost", serde_json::json!({ "fingerprint": fp }))
+                    .ok();
+            }
+        }
     });
 
     Ok(())
@@ -91,29 +149,34 @@ async fn handle_resolved(
         return;
     }
 
-    let session_id = props.get("id")
+    let session_id = props
+        .get("id")
         .map(|v| v.val_str())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| info.get_fullname())
         .to_string();
     let service_fullname = info.get_fullname().to_string();
 
-    let name = props.get("name")
+    let name = props
+        .get("name")
         .map(|v| v.val_str())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| info.get_hostname())
         .to_string();
 
-    let platform: Platform = props.get("platform")
+    let platform: Platform = props
+        .get("platform")
         .map(|v| v.val_str())
         .map(Platform::from)
         .unwrap_or(Platform::Unknown);
 
     let port = info.get_port();
 
-    let addrs: Vec<SocketAddr> = info.get_addresses().iter().map(|ip| {
-        SocketAddr::new(*ip, port)
-    }).collect();
+    let addrs: Vec<SocketAddr> = info
+        .get_addresses()
+        .iter()
+        .map(|ip| SocketAddr::new(*ip, port))
+        .collect();
 
     if addrs.is_empty() {
         tracing::debug!("No addresses resolved for {name}");
@@ -133,15 +196,37 @@ async fn handle_resolved(
             trusted,
             sessions: Default::default(),
             last_seen: 0,
+            reachability: crate::state::ReachabilityStatus::Discovered,
+            probe_fail_count: 0,
+            last_probe_at: None,
         });
 
-        device.sessions.insert(session_id.clone(), SessionInfo {
-            session_id: session_id.clone(),
-            addrs: addrs.clone(),
-            last_seen: Instant::now(),
-        });
-        device.trusted = state.is_trusted(&fp).await;
-        device.last_seen = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        device.sessions.insert(
+            session_id.clone(),
+            SessionInfo {
+                session_id: session_id.clone(),
+                addrs: addrs.clone(),
+                last_seen_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                last_seen_instant: Instant::now(),
+            },
+        );
+        device.trusted = trusted;
+        device.last_seen = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        if !device.sessions.is_empty()
+            && matches!(
+                device.reachability,
+                crate::state::ReachabilityStatus::Offline
+                    | crate::state::ReachabilityStatus::OfflineCandidate
+            )
+        {
+            device.reachability = crate::state::ReachabilityStatus::Discovered;
+        }
         (is_new, device.clone())
     };
 
@@ -156,7 +241,7 @@ async fn handle_resolved(
         idx.insert(service_fullname, entry);
     }
 
-    let payload = serde_json::to_value(&device_model).unwrap_or_default();
+    let payload = DeviceView::from(&device_model);
 
     if is_new {
         tracing::info!("Device discovered: {name} ({fp})");
@@ -165,13 +250,15 @@ async fn handle_resolved(
         tracing::debug!("Device updated: {name}");
         app.emit("device_updated", &payload).ok();
     }
+
+    let probe_app = app.clone();
+    let probe_state = state.clone();
+    tokio::spawn(async move {
+        run_probe_update(&probe_state, &probe_app, &fp, addrs).await;
+    });
 }
 
-async fn handle_removed(
-    remove_key: &str,
-    app: &AppHandle,
-    state: &Arc<AppState>,
-) {
+async fn handle_removed(remove_key: &str, app: &AppHandle, state: &Arc<AppState>) {
     let (fp, device_gone, updated_device) = {
         let mut idx = state.session_index.write().await;
         let mut devices = state.devices.write().await;
@@ -183,11 +270,51 @@ async fn handle_removed(
 
     if device_gone {
         tracing::info!("Device offline: fp={fp}");
-        app.emit("device_lost", serde_json::json!({ "fingerprint": fp })).ok();
+        app.emit("device_lost", serde_json::json!({ "fingerprint": fp }))
+            .ok();
     } else if let Some(dev) = updated_device {
-        let payload = serde_json::to_value(&dev).unwrap_or_default();
+        let payload = DeviceView::from(&dev);
         app.emit("device_updated", &payload).ok();
     }
+}
+
+async fn run_probe_update(
+    state: &Arc<AppState>,
+    app: &AppHandle,
+    fp: &str,
+    addrs: Vec<SocketAddr>,
+) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut ok = false;
+    for addr in addrs {
+        if crate::transport::probe::probe_addr(state, addr)
+            .await
+            .is_ok()
+        {
+            ok = true;
+            break;
+        }
+    }
+
+    let payload = {
+        let mut devices = state.devices.write().await;
+        let Some(device) = devices.get_mut(fp) else {
+            return;
+        };
+        device.last_probe_at = Some(now);
+        if ok {
+            device.reachability = crate::state::ReachabilityStatus::Reachable;
+            device.probe_fail_count = 0;
+        } else {
+            device.probe_fail_count = device.probe_fail_count.saturating_add(1);
+            device.reachability = crate::state::ReachabilityStatus::OfflineCandidate;
+        }
+        DeviceView::from(&*device)
+    };
+    app.emit("device_updated", payload).ok();
 }
 
 #[cfg(test)]
@@ -212,7 +339,8 @@ mod tests {
             SessionInfo {
                 session_id: session_id.clone(),
                 addrs: vec![SocketAddr::from_str("127.0.0.1:9001").unwrap()],
-                last_seen: Instant::now(),
+                last_seen_unix: 0,
+                last_seen_instant: Instant::now(),
             },
         );
         devices.insert(
@@ -224,6 +352,9 @@ mod tests {
                 trusted: false,
                 sessions,
                 last_seen: 0,
+                reachability: crate::state::ReachabilityStatus::Discovered,
+                probe_fail_count: 0,
+                last_probe_at: None,
             },
         );
         let entry = SessionIndexEntry {
@@ -236,8 +367,46 @@ mod tests {
         let removed = super::remove_session_from_state(&fullname, &mut idx, &mut devices);
         assert!(removed.is_some());
 
-        assert!(!devices.contains_key(&fp));
+        assert!(devices.contains_key(&fp));
+        assert_eq!(
+            devices.get(&fp).expect("device kept").reachability,
+            crate::state::ReachabilityStatus::OfflineCandidate
+        );
         assert!(!idx.contains_key(&fullname));
         assert!(!idx.contains_key(&session_id));
+    }
+
+    #[test]
+    fn offline_candidate_promotes_after_grace_period() {
+        let device = DeviceInfo {
+            fingerprint: "peer-fp".into(),
+            name: "peer".into(),
+            platform: Platform::Mac,
+            trusted: false,
+            sessions: HashMap::new(),
+            last_seen: 100,
+            reachability: crate::state::ReachabilityStatus::OfflineCandidate,
+            probe_fail_count: 0,
+            last_probe_at: None,
+        };
+        assert!(!super::should_mark_offline(&device, 114));
+        assert!(super::should_mark_offline(&device, 115));
+    }
+
+    #[test]
+    fn offline_device_evicted_after_retention() {
+        let device = DeviceInfo {
+            fingerprint: "peer-fp".into(),
+            name: "peer".into(),
+            platform: Platform::Mac,
+            trusted: false,
+            sessions: HashMap::new(),
+            last_seen: 100,
+            reachability: crate::state::ReachabilityStatus::Offline,
+            probe_fail_count: 0,
+            last_probe_at: None,
+        };
+        assert!(!super::should_emit_device_lost(&device, 144));
+        assert!(super::should_emit_device_lost(&device, 145));
     }
 }

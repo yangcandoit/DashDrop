@@ -5,7 +5,7 @@ use rustls::{DigitallySignedStruct, Error, SignatureScheme};
 use std::sync::Arc;
 
 /// A TLS certificate verifier that accepts **any** self-signed certificate.
-/// 
+///
 /// This implements Trust-On-First-Use (TOFU): we skip CA chain validation and
 /// instead extract the peer's certificate fingerprint for our own fp-binding check.
 #[derive(Debug)]
@@ -16,7 +16,9 @@ pub struct SkipServerVerification {
 impl SkipServerVerification {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            algorithms: Arc::new(rustls::crypto::ring::default_provider().signature_verification_algorithms),
+            algorithms: Arc::new(
+                rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            ),
         })
     }
 }

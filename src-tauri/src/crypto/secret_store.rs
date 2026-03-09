@@ -65,7 +65,27 @@ pub fn save_private_key(_service: &str, _account: &str, _key_der: &[u8]) -> Resu
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 pub fn secure_store_available() -> bool {
-    true
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    {
+        let entry = match keyring::Entry::new("com.dashdrop.availability", "probe") {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!("secure store probe could not open keyring entry: {e}");
+                return false;
+            }
+        };
+        match entry.get_password() {
+            Ok(_) | Err(keyring::Error::NoEntry) => true,
+            Err(e) => {
+                tracing::warn!("secure store probe failed: {e}");
+                false
+            }
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
