@@ -212,7 +212,7 @@ pub async fn send_files_cmd(
             }
             Err(e) => {
                 tracing::warn!("Failed to connect to {}: {e:#}", addr);
-                connect_errors.push(format!("{addr}: {e}"));
+                connect_errors.push(format!("{addr}: {e:#}"));
             }
         }
     }
@@ -364,7 +364,7 @@ pub async fn connect_by_address(
             }
             Err(e) => {
                 tracing::warn!("connect_by_address failed to {addr}: {e:#}");
-                connect_errors.push(format!("{addr}: {e}"));
+                connect_errors.push(format!("{addr}: {e:#}"));
             }
         }
     }

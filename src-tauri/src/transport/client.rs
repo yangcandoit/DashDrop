@@ -5,12 +5,17 @@ use std::sync::Arc;
 
 use crate::state::AppState;
 
+const TRANSFER_ALPN: &[u8] = b"dashdrop-transfer/1";
+
 /// Connect to a remote DashDrop peer via QUIC.
 pub async fn connect_to_peer(state: &AppState, remote_addr: SocketAddr) -> Result<Connection> {
-    let rustls_cfg = state
+    let mut rustls_cfg = state
         .identity
         .client_tls_config()
         .context("build client TLS config")?;
+    Arc::get_mut(&mut rustls_cfg)
+        .ok_or_else(|| anyhow::anyhow!("client TLS config unexpectedly shared"))?
+        .alpn_protocols = vec![TRANSFER_ALPN.to_vec()];
     let quinn_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)
         .context("quinn client TLS")?;
 
