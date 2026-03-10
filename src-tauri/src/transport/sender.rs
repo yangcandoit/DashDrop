@@ -128,6 +128,7 @@ pub async fn send_files(
         sender_fingerprint: state.identity.fingerprint.clone(),
     };
     write_message(&mut control_send, &DashMessage::Offer(offer_payload)).await?;
+    let _ = control_send.finish();
 
     emit_transfer_started(
         &app,
@@ -643,6 +644,7 @@ async fn send_one_file(
             data,
         });
         if let Err(e) = write_message(&mut send, &chunk).await {
+            let _ = send.finish();
             ack_waiters.lock().await.remove(&file_id);
             return Err(e);
         }
@@ -677,6 +679,7 @@ async fn send_one_file(
     )
     .await
     {
+        let _ = send.finish();
         ack_waiters.lock().await.remove(&file_id);
         return Err(e);
     }
@@ -729,6 +732,7 @@ async fn send_one_directory(
     )
     .await
     {
+        let _ = send.finish();
         ack_waiters.lock().await.remove(&file_id);
         return Err(e).context("send directory complete");
     }

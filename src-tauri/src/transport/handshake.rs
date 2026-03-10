@@ -23,6 +23,7 @@ async fn reject_control_stream(
     if let Err(e) = write_message(send, &DashMessage::Reject(RejectPayload { reason })).await {
         tracing::warn!("failed to send reject ({context}): {e:#}");
     }
+    let _ = send.finish();
     Ok(())
 }
 
@@ -201,6 +202,7 @@ pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppSta
                 reason: ErrorCode::VersionMismatch,
             });
             write_message(&mut send, &reject).await?;
+            let _ = send.finish();
             bail!("no common protocol version");
         }
     };

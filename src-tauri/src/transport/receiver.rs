@@ -205,6 +205,7 @@ pub async fn handle_offer(
             }),
         )
         .await?;
+        let _ = control_send.finish();
         update_transfer_status(
             &state,
             transfer_id.clone(),
@@ -278,6 +279,7 @@ pub async fn handle_offer(
             }),
         )
         .await?;
+        let _ = control_send.finish();
         let (reason_code, terminal_cause) = reject_reason(is_timeout);
         update_transfer_status(
             &state,
@@ -315,6 +317,7 @@ pub async fn handle_offer(
         &DashMessage::Accept(AcceptPayload { chosen_version }),
     )
     .await?;
+    let _ = control_send.finish();
 
     // Create save root after accepted
     if let Err(e) = fs::create_dir_all(&save_root).await {
