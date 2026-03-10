@@ -100,7 +100,7 @@ struct InterfaceStats {
     has_ipv6_non_link_local: bool,
 }
 
-fn is_virtual_or_filtered_interface(name: &str) -> bool {
+pub(crate) fn is_virtual_or_filtered_interface(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n.starts_with("utun")
         || n.starts_with("awdl")

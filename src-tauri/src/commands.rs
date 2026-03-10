@@ -981,6 +981,14 @@ pub async fn get_discovery_diagnostics(
         .get("service_resolved")
         .copied()
         .unwrap_or_default();
+    let beacon_sent = discovery_event_counts
+        .get("beacon_sent")
+        .copied()
+        .unwrap_or_default();
+    let beacon_received = discovery_event_counts
+        .get("beacon_received")
+        .copied()
+        .unwrap_or_default();
     let search_started_events = discovery_event_counts
         .get("search_started")
         .copied()
@@ -1082,6 +1090,17 @@ pub async fn get_discovery_diagnostics(
                 .to_string(),
         );
     }
+    if beacon_sent > 0 && beacon_received == 0 && resolved_events == 0 {
+        quick_hints.push(
+            "No inbound discovery packets seen from mDNS or UDP beacon; check AP isolation, VLAN segmentation, or host firewall multicast/broadcast rules."
+                .to_string(),
+        );
+    } else if beacon_received > 0 && resolved_events == 0 {
+        quick_hints.push(
+            "UDP beacon fallback is receiving peers while mDNS is silent; mDNS multicast is likely blocked on this network."
+                .to_string(),
+        );
+    }
     let self_filtered = discovery_event_counts
         .get("resolved_self_filtered")
         .copied()
@@ -1107,6 +1126,7 @@ pub async fn get_discovery_diagnostics(
     Ok(serde_json::json!({
         "runtime": runtime,
         "service_type": crate::discovery::service::SERVICE_TYPE,
+        "beacon_port": crate::discovery::beacon::DISCOVERY_BEACON_PORT,
         "own_fingerprint": state.identity.fingerprint.clone(),
         "own_platform": Platform::current(),
         "mdns_daemon_initialized": mdns_daemon_initialized,

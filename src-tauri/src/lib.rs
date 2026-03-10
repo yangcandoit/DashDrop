@@ -196,6 +196,7 @@ pub fn run() {
 
                 // Store mDNS in state to keep it alive
                 let _ = state2.mdns.set(Arc::clone(&mdns));
+                let state_for_beacon = Arc::clone(&state2);
 
                 // 3. Start mDNS browser
                 if let Err(e) = discovery::start_browser(mdns, handle2.clone(), state2).await {
@@ -205,6 +206,22 @@ pub fn run() {
                         "subsystem": "mdns_browser",
                         "message": format!("Scanning for nearby devices failed: {e:#}")
                     })).ok();
+                }
+
+                // 4. Start UDP beacon fallback discovery
+                if let Err(e) = discovery::start_beacon(handle2.clone(), state_for_beacon).await
+                {
+                    tracing::error!("Failed to start beacon discovery: {e:#}");
+                    handle2
+                        .emit(
+                            "system_error",
+                            serde_json::json!({
+                                "code": "BEACON_DISCOVERY_FAILED",
+                                "subsystem": "beacon_discovery",
+                                "message": format!("Fallback local discovery failed: {e:#}")
+                            }),
+                        )
+                        .ok();
                 }
             });
 

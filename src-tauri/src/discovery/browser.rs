@@ -710,7 +710,7 @@ async fn handle_removed(remove_key: &str, app: &AppHandle, state: &Arc<AppState>
     });
 }
 
-async fn run_probe_update(
+pub(crate) async fn run_probe_update(
     state: &Arc<AppState>,
     app: &AppHandle,
     fp: &str,

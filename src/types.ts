@@ -212,6 +212,7 @@ export interface RuntimeStatus {
 export interface DiscoveryDiagnostics {
   runtime: RuntimeStatus;
   service_type?: string;
+  beacon_port?: number;
   own_fingerprint?: string;
   own_platform?: Platform;
   mdns_daemon_initialized: boolean;
