@@ -5,7 +5,7 @@
 > **v0.3 修订摘要**（在 v0.2 基础上）：
 > - **传输成功语义闭环**：接收端落盘+校验成功后发 `Ack`，发送端以此为唯一成功判据
 > - **版本协商前移**：QUIC 连接后先交换 `Hello` 消息，再发 `Offer`，避免跨版本 Offer 结构无法安全解析
-> - **发现层与连接层身份关联**：发送端对目标 fp 做证书强绑定；接收端对 mDNS/TLS 不一致进行告警与审计
+> - **发现层与连接层身份关联**：发送端对目标 fp 做证书强绑定；接收端对 mDNS/TLS 不一致先告警审计（当前实现）
 > - **速率限制改为基于 fingerprint**，IP 在多网卡/IPv6 场景下不可靠
 
 > **实现状态快照（2026-03-10）**：
@@ -116,7 +116,7 @@ Probe 行为：
 
 ### 4.1 单文件 / 多文件
 
-多文件时每个文件占一个独立 QUIC stream，并发上限 4 个。
+多文件时每个文件占一个独立 QUIC stream，并发上限由配置 `max_parallel_streams` 控制（默认 4，范围 1..32）。
 
 ```
 Sender                              Receiver
@@ -290,6 +290,8 @@ cert_fp = SHA256(peer_tls_cert.public_key_der)
     cert_fp not in trusted_peers -> 新设备，走首次连接流程
 ```
 
+目标态说明（v0.2+）：在可确定预期身份的上下文中，接收侧 mismatch 将升级为硬拒绝；当前版本维持兼容告警路径。
+
 **`fingerprint_changed` 触发规则**：
 
 `fingerprint_changed` **不按设备名判断**。设备名可变、可伪造、可重复，用设备名推断身份连续性会产生误报（同名两台机器）和漏报（改名后不告警），反而削弱真正的安全提示。
@@ -328,7 +330,7 @@ cert_fp = SHA256(peer_tls_cert.public_key_der)
 - 首次连接（手动 IP）：显示完整 fingerprint，提示"请与对方设备屏幕上的指纹核对"
 - 已配对：显示"已配对"，不使用"已验证"
 - `fingerprint_changed`：显示"此设备证书已更换，可能存在安全风险"
-- `identity_mismatch`：显示"该连接身份与广播信息不符，已拒绝"
+- `identity_mismatch`：显示"该连接身份与广播信息不符，请核验后重试"
 
 ---
 

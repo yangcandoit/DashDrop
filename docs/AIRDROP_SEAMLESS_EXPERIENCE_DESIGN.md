@@ -1,59 +1,57 @@
 # DashDrop 无缝体验设计（AirDrop-like）
 
 更新时间：2026-03-10  
-状态：Proposed（面向下一阶段实施）
+状态：Proposed（目标态设计，非当前实现快照）
 
 ---
 
 ## 1. 目标定义
 
-本设计的目标不是“像 LocalSend 一样能传文件”，而是尽可能实现接近 AirDrop 的无缝体验：
+本设计目标是跨平台（macOS/Windows/Linux）实现接近 AirDrop 的体验：
 
-1. 发送动作发生在系统上下文，不要求先打开主应用。
-2. 接收动作通过系统通知即可完成，不要求切换到主界面。
-3. 设备发现与可用性由后台常驻服务维护，不依赖前台窗口生命周期。
-4. 对可信设备做到低摩擦直达，对未知设备保持安全确认。
-5. 网络抖动与短时中断可自动恢复，用户无需重复操作。
-6. 同时支持一对一与一对多（批量下发）两类传输模式，且体验一致。
-7. 传输链路不局限于同一 LAN，支持近场直连 Wi‑Fi（P2P/热点）作为扩展路径。
+1. 发送动作可从系统分享入口发起，不依赖主窗口预先打开。
+2. 接收动作可通过系统通知完成（Accept/Decline）。
+3. 发现、可达性、队列恢复由后台服务维护，不随窗口生命周期波动。
+4. 同时支持 1:1 与 1:N，且失败可解释、可重试。
+5. 在硬件能力受限（无蓝牙/无 Wi-Fi）时，LAN-only 仍可稳定可用。
+
+设计边界：
+1. 本文档是目标架构，不等价于当前 `main` 分支已交付能力。
+2. 协议终态事件名保持稳定，不引入破坏式重命名。
 
 ---
 
-## 2. “无缝”体验标准（体验契约）
+## 2. SLO 与可验收定义
 
 ### 2.1 用户侧 SLO
 
-1. 附近设备可见延迟（LAN 或近场直连可用）：P50 <= 2s，P95 <= 5s。
-2. 从“系统分享”到“对端收到可操作通知”延迟：P50 <= 2s，P95 <= 6s。
-3. 已配对设备发送步骤：不超过 2 步（选择设备 -> 发送）。
-4. 未配对设备发送步骤：不超过 3 步（选择设备 -> 指纹确认 -> 发送）。
-5. 网络恢复后设备在线状态恢复：<= 8s（无需重启应用）。
-6. 一对多（<= 5 个目标）批量发起时间：P95 <= 3s（完成目标选择到任务进入进行中）。
+1. Nearby 可见延迟（P50 <= 2s，P95 <= 5s）。
+2. 从发送入口点击“发送”到接收端出现可操作通知（P50 <= 2s，P95 <= 6s）。
+3. 已配对设备发送操作步数 <= 2。
+4. 未配对设备发送操作步数 <= 3（含指纹确认）。
 
 ### 2.2 工程侧 SLO
 
-1. 后台常驻发现可用性：>= 99.9%（进程级健康自恢复）。
-2. 传输成功率（同网段、目标在线、权限正常）：>= 99%。
-3. 接收确认超时与失败均可解释（可操作文案 + 诊断字段）。
-4. 无“静默失败”：任意失败路径必须沉淀可追踪 reason_code 与 phase。
-5. 一对多任务中单目标失败不拖垮整体任务，支持按目标重试。
-6. 链路切换成功率（LAN -> P2P/Hotspot fallback）：>= 95%（支持设备范围内）。
+1. 发现服务可用性 >= 99.9%。
+2. 同网段、权限正常条件下端到端发送成功率 >= 99%。
+3. 所有失败具备结构化 `reason_code + phase + detail`。
+
+### 2.3 计量起点（强制）
+
+为避免 SLO 无法验收，统一起点定义：
+
+1. Nearby 可见延迟起点：`remote_peer_online_at`（远端 daemon 完成监听并注册发现通道）到 `local_device_visible_at`（本端 UI/daemon 首次产生该设备可见状态）。
+2. 发送到通知延迟起点：`sender_dispatch_at`（发送请求进入调度器）到 `receiver_prompted_at`（接收端通知中心成功入队）。
+3. 若通知权限被禁用，`receiver_prompted_at` 改为 `receiver_fallback_prompted_at`（托盘角标或前台队列可见）。
 
 ---
 
-## 3. 关键差距（当前实现 -> AirDrop-like）
+## 3. 现实约束与设计前提
 
-当前已具备：QUIC 加密传输、mDNS + beacon 发现、基本配对与探活、诊断导出。  
-关键差距在“系统级产品形态”而非单点协议能力：
-
-1. 缺少常驻后台服务（UI 进程退出后发现和接收能力下降）。
-2. 缺少系统分享入口（Finder/Explorer/Share Target）。
-3. 缺少通知级接收动作（Accept/Reject 在通知中心直接处理）。
-4. 缺少带外配对（TOFU 仍需升级为可验证配对）。
-5. 缺少断点续传与后台队列恢复。
-6. 缺少一对多批量发送模型（当前以单目标发送为主）。
-7. 缺少 BLE 能力探测与跨硬件差异处理策略。
-8. 缺少 Wi‑Fi 直连链路（P2P/SoftAP）与多链路调度策略。
+1. 跨平台无法依赖 AWDL 私有协议，不追求底层完全复刻 AirDrop。
+2. 单无线网卡设备上，SoftAP 常导致当前网络中断；不得静默切换。
+3. mDNS/UDP 广播默认仅同网段有效；跨 VLAN/子网并非默认支持路径。
+4. 企业设备可能被 MDM/GPO 禁用蓝牙、热点或组播，必须保留 LAN-only 路径。
 
 ---
 
@@ -61,559 +59,237 @@
 
 ```mermaid
 flowchart LR
-  UI["UI Shell (Tauri Window)"] <-->|"Local IPC"| DAEMON["DashDrop Service (always-on)"]
-  SHARE["System Share Entry\n(Finder/Explorer/Share Target)"] -->|"Local IPC"| DAEMON
-  NOTIFY["System Notification Center"] <-->|"accept/reject actions"| DAEMON
-  DAEMON --> DISC["Discovery Engine\nmDNS + UDP Beacon + BLE assist"]
-  DAEMON --> LINK["Link Manager\nLAN infra / Wi‑Fi P2P / SoftAP"]
-  DAEMON --> TRANS["Transfer Engine\nQUIC/TLS + Resume + Queue"]
-  DAEMON --> SCHED["Dispatch Scheduler\n1:1 + 1:N batch orchestration"]
-  DAEMON --> TRUST["Trust Engine\nPairing + Fingerprint Policy"]
+  UI["UI Shell"] <-->|"Local IPC"| DAEMON["DashDrop Service (always-on)"]
+  SHARE["System Share Entry"] -->|"Local IPC"| DAEMON
+  NOTIFY["System Notification Center"] <-->|"Action callback"| DAEMON
+  DAEMON --> DISC["Discovery: mDNS + Beacon + BLE assist"]
+  DAEMON --> LINK["Link Manager: LAN / P2P / SoftAP"]
+  DAEMON --> TRANS["Transfer Engine: QUIC/TLS + Resume"]
   DAEMON --> STORE["SQLite + Secure Store"]
 ```
 
-### 4.1 架构原则
+### 4.1 本地 IPC 规范（Phase A 必需）
 
-1. 传输与发现必须以后台 service 为真源（source of truth）。
-2. UI 仅做控制面和可视化，不承载关键网络状态机。
-3. 所有入口（主界面、系统分享、右键菜单）都走同一服务 API。
-4. 协议与状态事件向后兼容，终态事件命名保持稳定。
-5. 调度层必须同时支持 1:1 与 1:N，且复用同一状态机与诊断体系。
-6. 链路管理层必须支持“能力探测 + 动态选路 + 失败自动降级”。
+传输通道：
+1. macOS/Linux：Unix Domain Socket。
+2. Windows：Named Pipe（`\\.\pipe\dashdrop-service-v1`）。
 
----
+编码与帧：
+1. 长度前缀 + CBOR（与传输协议一致的编码风格）。
+2. Envelope：`proto_version`、`request_id`、`command`、`payload`、`auth_context`。
 
-## 4.2 设备能力模型（Capability-first）
+权限与认证：
+1. 仅允许同用户会话连接（socket 权限 `0600` / pipe ACL 仅当前用户 SID）。
+2. UI 与系统分享入口连接 daemon 时必须携带短时会话令牌（daemon 启动后生成，TTL 5 分钟，可刷新）。
+3. 禁止匿名跨用户调用，禁止远程网络入口复用本地 IPC。
 
-为避免“某方案在部分设备上不可用”导致失败，所有链路选择都基于能力模型：
+最小命令集：
+1. `discover/list`, `discover/diagnostics`
+2. `transfer/send`, `transfer/cancel`, `transfer/retry`
+3. `trust/pair`, `trust/unpair`, `trust/set_alias`
+4. `config/get`, `config/set`
 
-1. 网络硬件能力：
-   1. `has_wifi_adapter`
-   2. `has_bluetooth_adapter`
-   3. `supports_p2p`
-   4. `supports_softap`
-2. 系统权限能力：
-   1. `local_network_permission`
-   2. `bluetooth_permission`
-   3. `notification_permission`
-3. 运行态约束：
-   1. 当前是否连接企业受控网络
-   2. 是否启用省电/飞行模式
-   3. 是否存在驱动错误或接口占用
-4. 链路策略必须满足：
-   1. 能力满足才尝试
-   2. 失败可回退
-   3. 回退路径可解释（diagnostics + user hint）
+文件授权：
+1. macOS 必须通过 Security-Scoped Bookmarks 或等效授权句柄传递文件访问权限。
+2. IPC 不接受“裸路径即默认可读”的假设。
 
 ---
 
-## 5. 平台集成设计
+## 5. 发现与建连策略
 
-### 5.1 macOS
+### 5.1 发现通道
 
-1. 菜单栏常驻（Menu Bar）+ 登录启动（LaunchAgent）。
-2. Finder 分享入口（Share Extension / Quick Action）。
-3. 接收通知支持 action button：`Accept` / `Decline`。
-4. 权限模型：
-   1. Local Network（Bonjour/mDNS）
-   2. Notifications
-   3. 文件访问（用户选择路径范围）
-5. 链路扩展：
-   1. 优先基础设施 Wi‑Fi（LAN）
-   2. 次选临时热点直连（SoftAP）
-   3. 不依赖 AWDL 私有能力
+1. 主通道：mDNS。
+2. 兜底通道：UDP beacon（同网段广播）。
+3. 辅助通道：BLE（仅用于近距唤醒与快速发现，不作为身份信任依据）。
 
-### 5.2 Windows
+### 5.2 跨子网边界
 
-1. 托盘常驻 + 开机启动。
-2. Explorer 右键发送入口（Shell Extension/Context Menu）。
-3. Windows Notification with actions（Toast action callbacks）。
-4. 防火墙规则引导：
-   1. mDNS: UDP 5353
-   2. Beacon: UDP 53318
-   3. QUIC listener: 随机 UDP 端口（应用进程）
-5. 链路扩展：
-   1. Wi‑Fi Direct（可用机型启用）
-   2. 不可用时自动降级到 SoftAP 或 LAN
+1. 默认不支持跨 VLAN/跨子网自动发现。
+2. 诊断与 UI 必须明确提示：`当前网络可能存在 VLAN/子网隔离，请使用 Connect by Address`。
 
-### 5.3 Linux（阶段性）
+### 5.3 连接策略（默认）
 
-1. 托盘常驻 + autostart `.desktop`。
-2. 文件管理器入口优先支持常见桌面环境（Nautilus/Dolphin）。
-3. 通知动作依赖 Desktop Notifications 能力矩阵，先提供统一降级路径。
-4. 链路扩展：
-   1. 优先 LAN
-   2. 次选 NetworkManager 支持下的热点直连
-   3. Wi‑Fi P2P 仅在驱动与发行版能力明确时启用
+1. 使用单发起方策略：Sender 发起连接，Receiver 仅监听。
+2. 候选地址使用 Happy Eyeballs 思路并行尝试（受限并发），优先成功路径。
+3. 默认优先级：LAN > P2P > SoftAP > Manual address。
+
+### 5.4 Dual-active 策略结论
+
+1. `Dual-active` 不作为主路径，不进入默认交付计划。
+2. 如需研究，仅允许作为实验 feature flag，默认关闭，且不得影响主路径稳定性。
 
 ---
 
-## 6. 发现链路设计（Seamless Discovery）
+## 6. BLE / P2P / SoftAP 约束与规则
 
-### 6.0 链路定义与差异（LAN vs P2P vs SoftAP）
+### 6.1 BLE 载荷规则（修订）
 
-1. LAN（基础设施网络）：
-   1. 双方都在同一现有网络内（路由/AP 提供连通）
-   2. 最稳定、成本最低
-   3. 风险：受 VLAN/AP 隔离、组播策略、防火墙影响
-2. Wi‑Fi P2P（点对点直连）：
-   1. 双方建立临时直连组网，不依赖现有路由
-   2. 更接近 AirDrop 的“设备直连”体验
-   3. 风险：平台 API/驱动支持差异大，兼容成本高
-3. SoftAP（软件热点直连）：
-   1. 一端临时开热点，另一端加入该热点后传输
-   2. 作为 P2P 不可用时的跨平台保底方案
-   3. 风险：单网卡设备可能发生网络切换抖动，企业策略可能禁用热点
+BLE 允许发送“短时加密会话胶囊（ephemeral capsule）”，但不得发送长期身份明文：
 
-### 6.1 双通道策略
+1. 可包含：`session_token`、短时链路参数、一次性公钥材料。
+2. 不可包含：长期指纹明文、长期私密标识。
+3. 最终身份判定仍以 QUIC/TLS 指纹校验为准。
 
-1. 主通道：mDNS（设备身份 + 会话信息 + 端口）。
-2. 兜底通道：UDP beacon（组播受限时保持可见性）。
-3. 统一会话模型：`sessions[session_id]` 聚合，同一 fingerprint 合并显示。
+### 6.2 SoftAP 凭据分发
 
-### 6.1a 多链路连接策略（LAN + Wi‑Fi 直连）
+1. SoftAP 凭据必须一次一密（随机 SSID + 强密码 + 短 TTL）。
+2. 凭据通过加密胶囊分发：
+   1. 优先 BLE（若可用）。
+   2. BLE 不可用时使用二维码/短码交互确认。
 
-连接链路优先级：
-1. 基础设施 LAN（当前主路径，最稳）
-2. Wi‑Fi P2P（平台支持时）
-3. 临时热点 SoftAP（跨平台保底）
+### 6.3 SoftAP 用户确认（强制）
 
-策略规则：
-1. 先探测链路能力，再决定是否尝试非 LAN 直连。
-2. 对端可达但 LAN 不通时，自动发起链路切换。
-3. 链路切换不改变上层传输状态契约（事件名、终态语义保持一致）。
+1. 禁止后台静默切换到 SoftAP。
+2. 触发 SoftAP 前必须弹出明确确认：提示“可能短时断网”。
+3. 用户拒绝后回退 LAN/manual，不可强制切换。
 
-默认选路顺序（可配置）：
-1. `LAN`
-2. `P2P`
-3. `SoftAP`
-4. `Manual address`（最后人工兜底）
+### 6.4 1:N 下 SoftAP 约束（强制）
 
-### 6.2 地址与可达性策略
-
-1. 地址候选来自所有 session，按最新 session 优先，IPv4 优先，IPv6 作为后备。
-2. Probe 采用轻量 QUIC preflight，不触发业务传输状态机。
-3. 降级规则：
-   1. 单次 probe 失败不立刻判离线。
-   2. 连续失败阈值后进入 `offline_candidate`。
-   3. session 全失活 + 宽限期后进入 `offline`。
-
-### 6.3 浏览器自恢复
-
-1. `Timeout` 视为正常 idle，不中断。
-2. `Disconnected` 触发 browse 重建，指数退避（上限 5s）。
-3. 重建状态写入 diagnostics：`active/restart_count/last_disconnect_at`。
-
-### 6.4 BLE 辅助发现（跨硬件兼容）
-
-BLE 的角色定义：仅做“近距快速发现/唤醒”，不作为唯一发现通道，不承载身份信任结论。
-
-1. 启动时执行 BLE 能力探测：
-   1. `ble_adapter_present`
-   2. `ble_scan_supported`
-   3. `ble_advertise_supported`
-   4. `ble_permission_granted`
-2. 运行策略：
-   1. 能力完整：启用 BLE 扫描+广播辅助发现。
-   2. 仅扫描可用：只启用扫描，广播关闭。
-   3. BLE 不可用/被禁：自动降级到 mDNS + beacon。
-3. 安全约束：
-   1. BLE payload 只放临时会话标识，不放长期身份明文。
-   2. 最终身份仍以 QUIC 证书指纹校验为准。
-4. 诊断字段（新增）：
-   1. `ble_capabilities`
-   2. `ble_runtime_state`
-   3. `ble_failure_counts`
-
-### 6.5 Wi‑Fi 直连能力探测与降级
-
-1. 启动时探测：
-   1. `wifi_p2p_supported`
-   2. `softap_supported`
-   3. `wifi_adapter_mode`（single/dual radio）
-2. 运行时策略：
-   1. 支持 P2P：优先尝试 P2P 建链。
-   2. P2P 失败或不支持：尝试 SoftAP。
-   3. SoftAP 失败：回退 LAN 并给出可操作提示。
-3. 诊断字段（新增）：
-   1. `link_capabilities`
-   2. `link_current_mode`（lan/p2p/softap）
-   3. `link_fallback_count`
-
-### 6.6 自动选路与降级决策（实现约束）
-
-链路决策伪逻辑：
-
-1. 若 `LAN` 可达：优先走 LAN。
-2. 若 LAN 不可达且 `supports_p2p=true`：尝试 P2P。
-3. 若 P2P 失败且 `supports_softap=true`：尝试 SoftAP。
-4. 若全部失败：回退手动地址并给出明确错误建议。
-
-约束：
-1. 每次链路尝试必须设置上限超时，避免长时间阻塞。
-2. 不允许无限重试；必须有退避与停止条件。
-3. 失败路径必须记录标准化 reason_code（如 `E_LINK_UNAVAILABLE`、`E_LINK_PERMISSION`）。
-
-### 6.7 跨平台能力矩阵（目标）
-
-1. macOS：
-   1. LAN：强支持
-   2. P2P：不作为默认承诺能力
-   3. SoftAP：可做，但受系统接口与权限约束
-2. Windows：
-   1. LAN：强支持
-   2. P2P（Wi‑Fi Direct）：部分机型/驱动可用
-   3. SoftAP：较可行，建议作为 P2P 失败后的主回退
-3. Linux：
-   1. LAN：强支持
-   2. P2P：依赖发行版+驱动组合，差异明显
-   3. SoftAP：依赖 NetworkManager/驱动，需做发行版分层支持
-4. 无 Wi‑Fi 模块设备：
-   1. P2P/SoftAP 不可用
-   2. 仅走 LAN（有线或现有网络）
-
-### 6.8 双端同时建连（Dual-active Connectivity）
-
-目标：两端在同一时间既可 `dial` 也可 `accept`，以降低等待和单向网络问题带来的失败率。
-
-实现原则：
-1. 双端都保持监听（server 常驻）。
-2. 发起传输时，发送端进入并行拨号；接收端继续正常接受入站连接。
-3. 若双方都发起了连接，允许短时间内出现重复连接，但必须做“选主去重”。
-
-选主去重规则（建议）：
-1. 同一 `intent_id` 下最多保留 1 条主连接。
-2. 若出现两条连接，按以下顺序比较，保留优先级更高者：
-   1. 链路优先级（lan > p2p > softap）
-   2. 握手完成时间更早
-   3. 冲突平局用 `min(local_fp, peer_fp)` 的字典序稳定打破
-3. 被淘汰连接发送 `CONNECTION_CLOSE(code=0xD2, reason=\"superseded\")`。
-
-必要字段（连接协调）：
-1. `intent_id`：一次发送意图的唯一 ID（UUID）。
-2. `intent_nonce`：本端随机数，用于冲突判定与去重。
-3. `candidate_rank`：本次连接候选链路排序位次。
-
-兼容要求：
-1. 老版本不识别 `intent_id` 时，退化为当前单连接逻辑。
-2. 不改终态事件名；新增字段仅作可选扩展。
+1. 一台发送端同一时刻仅允许 1 个 SoftAP 目标会话。
+2. 1:N 若多个目标都仅支持 SoftAP：必须串行调度。
+3. 文案需提示用户“热点链路串行执行，预计耗时增加”。
 
 ---
 
-## 7. 信任与安全设计（Seamless but Safe）
+## 7. 安全与信任策略
 
-### 7.1 身份校验基线
+### 7.1 身份校验
 
-1. 发送侧强绑定：`selected_peer_fp == cert_fp`，不匹配直接中止。
-2. 接收侧差异告警：`mdns_fp != cert_fp` 记录安全事件并提示用户。
-3. 已配对关系中 fingerprint 演进触发 `fingerprint_changed` 风险提示。
+1. 发送侧：强绑定 `selected_fp == cert_fp`。
+2. 接收侧目标策略（v0.2+）：在可确定预期身份时，`mdns_fp != cert_fp` 走硬拒绝；无法确定预期身份时至少强告警 + 审计。
+3. 当前实现（v0.1.x）允许“告警不拒绝”的兼容路径，属于过渡态，不应作为长期目标。
 
-### 7.2 配对升级（摆脱纯 TOFU）
+### 7.2 自动接收策略（修订）
 
-1. 引入带外配对（二选一）：
-   1. 二维码扫描配对
-   2. 6 位短码双端确认
-2. 配对完成后授予“低摩擦发送/接收”能力。
-3. 配对关系支持：
-   1. alias
-   2. paired_at / last_used_at
-   3. 一键撤销 + 风险冻结
+不允许“完全静默自动接收”。Trusted 场景也必须满足：
 
-### 7.3 策略矩阵
+1. 必须产生通知或可见前台队列提示。
+2. 默认存在单次体积上限（例如 500MB，可配置）。
+3. 可执行/脚本类高风险文件默认仍需人工确认。
 
-1. Trusted:
-   1. 可配置自动接收
-   2. 发送默认免二次确认
-2. Untrusted:
-   1. 发送前指纹确认
-   2. 接收必须显式确认
-3. Suspicious（identity mismatch / fingerprint changed）:
-   1. 强制人工确认
-   2. 持久化安全事件
+### 7.3 配对策略
 
-### 7.4 直连链路安全要求（P2P/SoftAP）
-
-1. SoftAP 凭据必须一次一密：
-   1. 随机 SSID
-   2. 随机强密码
-   3. 传输完成后立即销毁
-2. 链路凭据分发：
-   1. 优先 BLE 近距通道
-   2. BLE 不可用时通过二维码/短码确认
-3. 无论链路类型，最终身份判定仍以 TLS 证书指纹为准。
+1. 保持 TOFU 兼容，但默认引导带外验证（二维码/短码）。
+2. 配对关系支持冻结、撤销、风险告警闭环。
 
 ---
 
-## 8. 传输体验设计（Seamless Transfer）
+## 8. 传输模型（1:1 与 1:N）
 
-### 8.0 传输模式
+### 8.1 任务模型
 
-1. 一对一（1:1）：单发送方 -> 单接收方。
-2. 一对多（1:N）：单发送方 -> 多接收方（每个接收方独立连接与结果）。
-3. 每个目标支持独立链路模式：LAN / P2P / SoftAP。
+1. `batch_id`：一对多任务分组标识。
+2. `transfer_id`：每目标独立传输任务。
+3. 每目标独立状态、独立失败原因、独立重试。
 
-### 8.1 统一入口
+### 8.2 1:N I/O 策略（避免过载）
 
-所有发送入口（主界面拖拽、系统分享、右键菜单）统一进入同一发送管线：
+1. 同一源文件在发送侧应支持“单读多发”扇出（fan-out）策略，避免 N 份重复磁盘读取。
+2. 全局并发上限 + 单目标并发上限同时生效。
+3. 若系统资源紧张，优先降并发，不允许拖垮前台交互。
 
-1. 目标选择
-2. 身份策略检查
-3. 连接建立与 Hello
-4. Offer/Accept
-5. 数据传输与结果聚合
+### 8.3 状态契约
 
-在 1:N 模式下：
-1. 目标选择支持多选设备。
-2. 每个目标独立建立连接并并发执行。
-3. 每目标独立可取消、失败、重试，不相互阻塞。
-4. 每目标可独立触发链路降级（如 LAN 失败转 P2P），不影响其它目标。
-
-### 8.1a 一对多任务模型（Batch）
-
-1. 新增批次概念：
-   1. `batch_id`：一组并行目标共享
-   2. `transfer_id`：每个目标独立任务
-2. 结果聚合：
-   1. 批次总览：成功数/失败数/进行中
-   2. 单目标明细：独立 reason_code 与 phase
-3. 重试策略：
-   1. 支持“只重试失败目标”
-   2. 支持“只重试失败文件（单目标内）”
-
-调度约束：
-1. 1:N 任务中每个目标独立维护链路状态（lan/p2p/softap）。
-2. 某目标触发链路降级时，不阻塞其它目标继续传输。
-3. 批次总览必须可见每目标链路模式与失败原因。
-
-### 8.2 断点续传与后台恢复
-
-1. 每文件分块持久化块清单（SQLite）。
-2. 连接中断后可按块恢复，不重传已确认块。
-3. 应用前台退出不影响后台进行中的任务（由 service 持有状态）。
-4. 1:N 模式下恢复按目标独立进行，不要求整批同进同退。
-
-### 8.3 性能与稳定
-
-1. 并发流按网络质量自适应（而非固定值）。
-2. 大批小文件走批次调度，减少控制流抖动。
-3. 失败重试优先文件级，而非整任务重发。
-4. 1:N 模式下设置全局并发上限 + 单目标并发上限，避免网络拥塞。
-5. 非 LAN 直连模式下增加链路建立超时与快速回退阈值。
-
-### 8.4 Dual-active 的具体实现步骤
-
-后端实现步骤：
-1. 新增 `connect_coordinator` 模块（状态中心）：
-   1. `intent_id -> intent_state`
-   2. `intent_state` 含 `winner_conn_id`, `candidates`, `started_at`, `timeout_at`
-2. 发起侧：
-   1. 构建候选地址（LAN/P2P/SoftAP）
-   2. 并行拨号（带轻微抖动，避免瞬时洪峰）
-   3. 每条连接握手后先进入协调器，等待是否当选主连接
-3. 接收侧：
-   1. 对入站连接在握手早期读取 `intent_id`（扩展字段）
-   2. 交给协调器参与选主
-4. 协调器：
-   1. 选出主连接并广播“winner”
-   2. 其余连接统一关闭并清理资源
-5. 超时策略：
-   1. `intent` 超时后结束协调，返回最优失败原因
-   2. 禁止无限并发拨号和无限重试
-
-前端/IPC 接口：
-1. 不新增终态事件名。
-2. 可新增可选字段：
-   1. `link_mode`
-   2. `fallback_step`
-   3. `connection_strategy: \"single\" | \"dual_active\"`
-
-诊断与日志：
-1. 记录 `intent_id`、候选数量、胜出链路、淘汰连接数量。
-2. 新增计数：
-   1. `dual_active_attempts`
-   2. `dual_active_conflicts`
-   3. `dual_active_win_lan/p2p/softap`
-   4. `dual_active_superseded`
+1. 终态事件命名保持不变。
+2. 新增字段仅作为可选扩展，不破坏已有前端消费契约。
 
 ---
 
-## 9. 通知与交互设计
+## 9. 通知与降级体验
 
-### 9.1 发送侧
+### 9.1 正常路径
 
-1. 发起后立即显示系统 toast：`Sending to <device>`。
-2. 失败时 toast 包含“下一步建议”（重试/检查防火墙/重新配对）。
-3. 完成后可一键“Open History”。
-4. 1:N 模式显示批次进度（如 `3/5 completed`）并支持失败目标一键重试。
+1. 接收通知包含发送方、文件规模、信任状态。
+2. 通知支持 `Accept/Decline` 直接动作。
 
-### 9.2 接收侧
+### 9.2 通知不可用降级（强制）
 
-1. 收到请求时系统通知卡片包含：
-   1. 发送方设备名
-   2. 文件数量/总大小
-   3. Trust 状态
-2. 通知直接操作：
-   1. `Accept`
-   2. `Decline`
-3. 过期策略：超时自动拒绝并反馈明确 reason_code。
+当通知权限被禁用或系统通知失败时：
 
-### 9.3 一对多接收拥塞保护
-
-1. 同一发送方短时间内批量请求时，按发送方和 fingerprint 限流。
-2. 接收端允许“批次全部接收/全部拒绝/逐项处理”三种策略。
-3. 默认防骚扰策略：未知设备的批量请求需要显式确认。
-
-### 9.4 链路切换可感知但不打扰
-
-1. 默认不向用户暴露技术细节（LAN/P2P/SoftAP）。
-2. 仅在失败或明显延迟时显示“已自动切换链路”提示。
-3. 高级诊断中必须完整展示链路切换历史。
+1. 托盘/菜单栏角标必须提示 pending 请求。
+2. 前台 `Incoming Queue` 必须高优先显示。
+3. 发送侧错误文案必须明确“对端通知不可达或未响应”。
 
 ---
 
-## 10. 可观测性与诊断
+## 10. 诊断与可观测性
 
-### 10.1 用户可导出诊断（已存在并继续扩展）
+诊断输出必须可区分“发现失败 / 可达性失败 / 协议失败 / 权限失败”：
 
-1. listener 模式与地址族
-2. browser 状态与重建计数
-3. discovery 事件计数与失败分类
-4. 每设备 resolve/probe 摘要
-5. quick_hints 自动归因
-6. 链路能力与当前模式（lan/p2p/softap）
-7. 链路切换次数与最近失败原因
-
-### 10.2 开发/运维指标
-
-1. 发现成功率（mDNS vs beacon）
-2. 连接成功率（首次成功率、重试成功率；区分 1:1 与 1:N）
-3. 平均首包时间、平均完成时间
-4. 失败原因分布（timeout/handshake/connect/protocol）
-5. 平台分布与版本分布
-6. BLE 可用率与降级率（按平台/硬件）
-7. 链路分布与切换率（lan/p2p/softap）
-8. 无 Wi‑Fi 设备占比与仅 LAN 成功率
-9. dual-active 成功率与冲突收敛耗时
+1. 发现层：mDNS/beacon 事件计数、失败计数、接口策略、浏览器重启状态。
+2. 链路层：listener 模式、链路能力、当前链路模式、fallback 次数。
+3. 设备层：每设备 resolve 原始地址数/可用地址数、probe 结果、最近失败分类。
+4. 交互层：通知权限状态、通知降级触发计数。
+5. 传输层：phase 级失败统计与可重试建议。
 
 ---
 
-## 11. 分阶段实施计划
+## 11. 分阶段实施计划（修订后）
 
-### Phase A（系统化底座）
+### Phase A：系统化底座
 
-1. 拆分后台 service 与 UI shell。
-2. 建立本地 IPC 协议与权限边界。
-3. 托盘/菜单栏常驻 + 开机自启。
+1. Daemon + UI 拆分。
+2. 本地 IPC 协议、认证、权限模型落地。
+3. 文件授权句柄（Security-Scoped Bookmarks 等）接线。
 
-验收：
-1. UI 关闭后发现与接收能力仍在线。
-2. 重开 UI 可秒级恢复完整状态。
-3. 输出 BLE 能力探测结果并可见于 diagnostics。
-4. 输出 Wi‑Fi 直连能力探测结果并可见于 diagnostics。
+### Phase B：系统入口与通知闭环
 
-### Phase B（系统入口与通知闭环）
+1. Finder/Explorer 分享入口。
+2. 通知动作回调。
+3. 通知不可用降级链路（托盘/前台队列）。
 
-1. macOS Finder/Share Extension。
-2. Windows Explorer 右键发送。
-3. 通知中心 Accept/Decline 动作回调。
+### Phase C：信任与安全收敛
 
-验收：
-1. 全流程无需先打开主窗口。
-2. 接收动作可在通知中心完成。
+1. 带外配对（二维码/短码）。
+2. Trusted 自动接收安全护栏。
+3. 接收侧 mismatch 策略升级（从告警过渡到严格模式）。
 
-### Phase C（可信无感）
-
-1. QR/短码带外配对。
-2. trusted 低摩擦策略（可配置自动接收）。
-3. 风险设备策略（冻结/强提醒）。
-
-验收：
-1. 已配对设备发送 <= 2 步。
-2. 风险场景无静默放行。
-
-### Phase D（可靠性与恢复）
+### Phase D：可靠性与恢复
 
 1. 断点续传。
-2. 后台队列持久化恢复。
-3. 自适应并发与重试策略。
+2. 队列持久化恢复。
+3. 失败原因分层与可重试策略完善。
 
-验收：
-1. 中断恢复后不从 0 重传。
-2. 长时运行无明显状态漂移。
+### Phase E：兼容性与灰度基础设施（提前）
 
-### Phase E（一对多正式能力）
+1. 硬件/驱动兼容矩阵。
+2. Feature flag 与灰度开关。
+3. 平台级失败码监控。
 
-1. 批量目标选择与 `batch_id` 任务模型。
-2. 批次总览 + 单目标独立状态/重试/取消。
-3. 1:N 速率限制与接收防骚扰策略。
+### Phase F：Wi-Fi 直连能力上线
 
-验收：
-1. 5 目标批量发送中单目标失败不影响其余目标完成。
-2. 用户可一键重试失败目标，不重复成功目标。
+1. P2P/SoftAP 能力探测与调度。
+2. SoftAP 用户确认与串行限制。
+3. 链路切换诊断与回退策略。
 
-### Phase F（Wi‑Fi 直连扩展）
+### Phase G：1:N 深化与性能优化
 
-1. Link Manager：LAN/P2P/SoftAP 三模式抽象。
-2. 平台能力探测与链路切换策略落地。
-3. 链路级诊断字段、错误码与用户提示补齐。
+1. 扇出读写优化（单读多发）。
+2. 1:N 调度、限流、失败重试 UX 完整化。
 
-验收：
-1. 在“同 LAN 不可达但直连可用”场景下，自动切换链路并完成传输。
-2. 链路切换失败时有明确 fallback 与提示，不出现静默卡死。
+### Phase H：实验项（默认关闭）
 
-### Phase G（兼容性与灰度）
-
-1. 建立硬件兼容清单（Wi‑Fi/蓝牙芯片、驱动、系统版本）。
-2. 分平台灰度开关（Feature flag）逐步启用 P2P/SoftAP。
-3. 关键失败码监控（权限、驱动、接口占用、建链超时）。
-
-验收：
-1. 关闭新链路开关后，系统可稳定回退到 LAN-only。
-2. 灰度期间不出现“新链路引入后主链路不可用”的回归。
-
-### Phase H（Dual-active 建连优化）
-
-1. `intent_id` 协调字段与连接协调器落地。
-2. 并行拨号 + 选主去重 + superseded 关闭码落地。
-3. dual-active 指标、诊断与灰度开关落地。
-
-验收：
-1. 在存在双向可达和瞬时抖动场景下，首连成功率明显提升。
-2. 不出现重复传输会话、重复通知、重复写盘。
-3. 关闭 dual-active 开关后行为与当前单连接一致。
+1. 研究型连接策略（如 dual-active 实验）。
+2. 必须在 feature flag 下灰度，不影响默认主路径。
 
 ---
 
 ## 12. 风险与边界
 
-1. AirDrop 使用 Apple 私有生态（如 AWDL）；跨平台无法 1:1 复刻底层链路。
-2. Windows/Linux 平台通知动作与系统分享入口能力碎片化，需要分平台实现。
-3. 后台常驻服务引入更高运维复杂度（升级、崩溃恢复、权限管理）。
-4. 带外配对需兼顾易用与安全，避免把流程做重。
-5. BLE 在不同硬件/驱动上的稳定性差异大，必须做能力探测与降级。
-6. 1:N 在弱网络下易造成拥塞，需要精细化调度与并发控制。
-7. Wi‑Fi P2P/SoftAP 在不同平台 API 与驱动差异大，适配成本高。
-8. 部分设备“单无线网卡”在热点与联网并存时体验可能下降。
-9. 企业设备策略（MDM/GPO）可能禁用蓝牙/热点，需保留 LAN-only 工作模式。
+1. 跨公网中继/NAT 穿透不在本设计范围。
+2. 跨 VLAN 自动发现默认不保证。
+3. P2P/SoftAP 在不同平台 API 与驱动差异大，需灰度发布。
+4. 单网卡设备热点链路体验存在天然上限，必须显式告知用户。
 
 ---
 
-## 13. 非目标（本设计不覆盖）
+## 13. Definition of Done（AirDrop-like 门槛）
 
-1. 跨公网中继/NAT 穿透（本设计仅覆盖近场本地链路：LAN/P2P/SoftAP）。
-2. 云账号体系与远程同步。
-3. 移动端完整生态（可后续扩展）。
+仅当以下条件全部满足，才可对外宣称“AirDrop-like”：
 
----
-
-## 14. Definition of Done（AirDrop-like 门槛）
-
-满足以下条件才可对外宣称“AirDrop-like”：
-
-1. 系统入口可直接发送（不先开主应用）。
-2. 系统通知可直接接收（不切主界面）。
-3. 已配对设备低摩擦直达，未知设备安全确认。
-4. 后台常驻 + 网络抖动自动恢复。
-5. 诊断可直接定位发现/连接/协议/权限问题，不靠猜测。
-6. 一对一与一对多均可稳定运行，且重试/取消策略可解释。
-7. 在设备能力受限（无蓝牙/无 Wi‑Fi）时仍能以 LAN-only 稳定可用。
+1. 系统分享入口直达发送。
+2. 通知动作直达接收，且通知禁用时有可用降级。
+3. 配对与安全策略可解释，不存在静默高风险路径。
+4. 1:1 与 1:N 都有稳定可重试与可诊断闭环。
+5. 在受限设备能力下，LAN-only 仍保持稳定可用。

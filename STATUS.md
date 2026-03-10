@@ -4,12 +4,13 @@ Last updated: 2026-03-10
 
 ## Overall
 
-Project is stable on the Tauri-embedded architecture, with Phase A/B/C core contract work now implemented and validated locally.
+Project is stable on the current single-process Tauri architecture, with discovery/transfer/security contracts implemented and validated locally.
 
 Estimated completion:
 - Core product hardening (state contract + reliability): 95%+
 - Release readiness (current gate scope): complete
 - Release readiness (strict protocol compliance + long-run behavior): mostly complete
+- AirDrop-like target architecture (daemon/system share/P2P-SoftAP): not started as a shipped feature line
 
 ## Completed
 
@@ -124,6 +125,12 @@ Estimated completion:
 ### Build quality
 - `cargo check` / `cargo test` / `npm run build` / `npm run test:e2e` pass.
 - `cargo clippy --all-targets --all-features` passes with no warnings.
+
+## AirDrop-like target status
+
+- The design in `docs/AIRDROP_SEAMLESS_EXPERIENCE_DESIGN.md` is a target-state plan.
+- Daemon split, local IPC auth model, system share entry, BLE assist, and Wi-Fi direct link manager are not part of the current shipped architecture.
+- Current production baseline remains: single-process app + mDNS/beacon + QUIC transfer + diagnostics.
 
 ## In progress / not fully complete
 

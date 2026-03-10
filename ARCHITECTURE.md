@@ -60,7 +60,8 @@ DashDrop 是一个**单进程 Tauri 应用**。后端逻辑运行在 Rust 异步
 - "传输核心崩溃不影响 UI" — 无进程边界，无此保证
 - 应用退出后后台暂停恢复 — MVP 不支持守护进程模式
 
-如需进程级隔离，未来可将 transport/discovery 拆为系统服务，通过 Unix socket / named pipe 与 UI 通信。**当前 MVP 不实现**。
+如需进程级隔离，未来可将 transport/discovery 拆为系统服务，通过 Unix socket / named pipe 与 UI 通信。  
+目标态 IPC 与权限模型见 [docs/AIRDROP_SEAMLESS_EXPERIENCE_DESIGN.md](./docs/AIRDROP_SEAMLESS_EXPERIENCE_DESIGN.md) §4.1。**当前 MVP 不实现 daemon 拆分**。
 
 ---
 
@@ -348,7 +349,7 @@ enum CancelReason {
 
 - 块大小：**1 MiB**
 - `(file_id, chunk_id)` 二元组唯一标识一个块，不同文件间 chunk_id 可重复
-- 多文件并发：每文件一个 QUIC stream，`max_concurrent_streams = 4`
+- 多文件并发：每文件一个 QUIC stream，`max_parallel_streams` 运行时可配置（默认 `4`，允许 `1..32`）
 - 整文件 BLAKE3 哈希在 `Complete` 中携带，接收端 `Ack` 前完成校验
 
 ### 3.4 传输成功语义（含多文件部分成功）
@@ -437,6 +438,8 @@ cert_fp = SHA256(peer_tls_cert.public_key_der)
     若 cert_fp not in trusted_peers -> 新设备（未配对），走首次连接流程
 ```
 
+> 说明：上面是当前实现。目标态安全收敛（v0.2+）会将“可确定预期身份”的接收侧 mismatch 升级为硬拒绝，详细策略见 AirDrop 目标设计文档 §7.1。
+
 **`fingerprint_changed` 的正确触发条件**：
 
 `fingerprint_changed` **不按设备名判断**（名字可变可伪造，同名不代表同一台机器）。触发条件唯一：
@@ -488,107 +491,57 @@ cert_fp = SHA256(peer_tls_cert.public_key_der)
 - 首次连接（手动 IP）：显示"首次连接，请核对设备指纹"
 - 已配对：显示"已配对"，不使用"已验证"
 - `fingerprint_changed`：显示"此设备证书已更换，可能存在安全风险"
-- `identity_mismatch`：显示"连接身份与广播信息不符，已拒绝"
+- `identity_mismatch`：显示"连接身份与广播信息不符，请核验后重试"
 
 ---
 
 ## 五、AppState 模块（`src-tauri/src/state.rs`）
 
+> 以下结构为“当前实现要点摘录”（非完整字段清单），以 `src-tauri/src/state.rs` 为准。
+
 ```rust
 pub struct AppState {
     pub identity: Identity,
-
-    // 键：fingerprint（稳定设备身份）
-    // 每个 DeviceInfo 内含多会话支持（见 §2.3）
-    pub devices: Arc<RwLock<HashMap<String, DeviceInfo>>>,
-
-    // 键：transfer_id
-    pub transfers: Arc<RwLock<HashMap<Uuid, TransferTask>>>,
-
-    // 传输历史（持久化后回填内存索引）
-    pub history: Arc<RwLock<Vec<TransferHistoryEntry>>>,
-
-    // 键：fingerprint
+    pub devices: Arc<RwLock<HashMap<String, DeviceInfo>>>, // key: fingerprint
+    pub session_index: Arc<RwLock<HashMap<String, SessionIndexEntry>>>,
+    pub transfers: Arc<RwLock<HashMap<String, TransferTask>>>, // key: transfer_id
     pub trusted_peers: Arc<RwLock<HashMap<String, TrustedPeer>>>,
-
     pub config: Arc<RwLock<AppConfig>>,
+    pub local_port: Arc<RwLock<u16>>,
+    pub mdns_service_fullname: Arc<RwLock<Option<String>>>,
 }
 
 pub struct TransferTask {
-    pub id: Uuid,
-    pub direction: Direction,
-    pub peer_fingerprint: String,   // 稳定身份，不用 session_id
-    pub peer_name_snapshot: String, // 创建任务时固化，避免离线后名称丢失
-    pub items: Vec<FileItem>,
-    pub status: TransferStatus,
-    pub bytes_transferred: u64,
-    pub total_bytes: u64,
-    pub started_at: SystemTime,
-    pub ended_at: Option<SystemTime>,
-}
-
-pub struct TransferHistoryEntry {
-    pub transfer_id: Uuid,
+    pub id: String,
+    pub direction: TransferDirection,
     pub peer_fingerprint: String,
-    pub peer_name_snapshot: String,
-    pub outcome: TransferOutcome, // 仅终态
-    pub terminal_cause: Option<ErrorCode>,
-    pub succeeded_count: u32,
-    pub failed_count: u32,
-    pub started_at: SystemTime,
-    pub ended_at: SystemTime,
+    pub peer_name: String,
+    pub status: TransferStatus,
+    pub revision: u64,
+    pub terminal_reason_code: Option<String>,
 }
 
 pub struct TrustedPeer {
     pub fingerprint: String,
+    pub name: String,
+    pub paired_at: u64,
     pub alias: Option<String>,
-    pub paired_at: SystemTime,
-    pub last_seen_at: Option<SystemTime>,
-    pub status: TrustStatus, // Trusted | TrustSuspended | Stale | Replaced
-    pub source: TrustSource, // mdns | manual
+    pub last_used_at: Option<u64>,
 }
 
 pub struct AppConfig {
     pub device_name: String,
-    pub download_dir: PathBuf,
-    pub auto_accept_trusted_only: bool,
-    pub notify_on_incoming: bool,
-}
-
-pub enum Direction {
-    Send,
-    Receive,
-}
-
-pub enum TrustSource {
-    Mdns,
-    Manual,
-}
-
-pub enum TrustStatus {
-    Trusted,
-    TrustSuspended,
-    Stale,
-    Replaced,
-}
-
-pub enum TransferStatus {
-    Draft,
-    PendingAccept,
-    Transferring,
-    Completed,
-    PartialCompleted,
-    Rejected,
-    CancelledBySender,
-    CancelledByReceiver,
-    Failed,
+    pub auto_accept_trusted_only: bool, // default: false
+    pub download_dir: Option<String>,
+    pub file_conflict_strategy: FileConflictStrategy,
+    pub max_parallel_streams: u32, // default: 4, clamp: 1..32
 }
 ```
 
 补充说明：
 - `Verifying` 不作为外部状态枚举，而是 `Transferring` 阶段的 `subphase`（如 `uploading | verifying`），用于 UI 细粒度展示。
 - `Failed` 仅用于“零成功”终态；有成功也有失败必须归为 `PartialCompleted`。
-- History 必须落盘持久化（M1），重启后可恢复；禁止仅依赖 `transfers` 内存态。
+- 持久化基线为 SQLite（`transfers_history` / `trusted_peers_store` / `app_config_store` / `security_events`）。
 
 ---
 
