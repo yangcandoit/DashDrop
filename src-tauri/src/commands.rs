@@ -45,6 +45,45 @@ fn classify_runtime_send_error(detail: &str) -> (&'static str, &'static str) {
     }
 }
 
+fn should_retry_send_once(detail: &str) -> bool {
+    let s = detail.to_ascii_lowercase();
+    s.contains("read accept/reject failed")
+        || s.contains("control stream")
+        || s.contains("read len")
+        || s.contains("read body")
+        || s.contains("open bi stream")
+        || s.contains("accept bi stream")
+}
+
+async fn reconnect_to_peer_by_best_addrs(
+    state: &Arc<AppState>,
+    peer_fp: &str,
+) -> Result<quinn::Connection, String> {
+    let addrs = {
+        let devices = state.devices.read().await;
+        let Some(device) = devices.get(peer_fp) else {
+            return Err(format!("device {peer_fp} not found for retry"));
+        };
+        device
+            .best_addrs()
+            .ok_or_else(|| "device has no reachable address for retry".to_string())?
+    };
+
+    let mut errors = Vec::new();
+    for addr in addrs {
+        match connect_to_peer(state, addr).await {
+            Ok(conn) => return Ok(conn),
+            Err(e) => errors.push(format!("{addr}: {e:#}")),
+        }
+    }
+
+    if errors.is_empty() {
+        Err("retry connect failed without candidates".to_string())
+    } else {
+        Err(format!("retry connect failed ({})", errors.join(" | ")))
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectByAddressResult {
     pub fingerprint: String,
@@ -289,86 +328,119 @@ pub async fn send_files_cmd(
     // Spawn sender task
     let transfer_id = uuid::Uuid::new_v4().to_string();
     let transfer_id_clone = transfer_id.clone();
+    let retry_paths = path_bufs.clone();
+    let retry_peer_fp = peer_fp.clone();
 
     tokio::spawn(async move {
-        let outcome = send_files(
-            transfer_id_clone.clone(),
-            peer_fp,
-            path_bufs,
-            conn,
-            app.clone(),
-            state.clone(),
-        )
-        .await;
-        match outcome {
-            Ok(crate::transport::protocol::TransferOutcome::Success) => {
-                tracing::info!("Transfer complete");
-            }
-            Ok(other) => {
-                tracing::warn!("Transfer ended: {:?}", other);
-            }
-            Err(e) => {
-                tracing::error!("Send failed: {e:#}");
-                let detail = format!("{e:#}");
-                let (reason_code, terminal_cause) = classify_runtime_send_error(&detail);
-                {
-                    let mut guard = state.transfers.write().await;
-                    if let Some(t) = guard.get_mut(&transfer_id_clone) {
-                        let is_terminal = matches!(
-                            t.status,
-                            crate::state::TransferStatus::Completed
-                                | crate::state::TransferStatus::PartialCompleted
-                                | crate::state::TransferStatus::Rejected
-                                | crate::state::TransferStatus::CancelledBySender
-                                | crate::state::TransferStatus::CancelledByReceiver
-                                | crate::state::TransferStatus::Failed
+        let mut first_conn = Some(conn);
+        let mut has_retried = false;
+        loop {
+            let Some(current_conn) = first_conn.take() else {
+                break;
+            };
+            let outcome = send_files(
+                transfer_id_clone.clone(),
+                retry_peer_fp.clone(),
+                retry_paths.clone(),
+                current_conn,
+                app.clone(),
+                state.clone(),
+            )
+            .await;
+
+            match outcome {
+                Ok(crate::transport::protocol::TransferOutcome::Success) => {
+                    tracing::info!("Transfer complete");
+                    break;
+                }
+                Ok(other) => {
+                    tracing::warn!("Transfer ended: {:?}", other);
+                    break;
+                }
+                Err(e) => {
+                    let detail = format!("{e:#}");
+                    if !has_retried && should_retry_send_once(&detail) {
+                        has_retried = true;
+                        tracing::warn!(
+                            transfer_id = %transfer_id_clone,
+                            "Send attempt hit transient control-stream failure; reconnecting once"
                         );
-                        if !is_terminal {
-                            t.status = crate::state::TransferStatus::Failed;
-                            t.revision += 1;
-                            t.terminal_reason_code = Some(reason_code.to_string());
-                            t.failed_file_ids =
-                                Some(t.items.iter().map(|item| item.file_id).collect());
-                            t.error = Some(detail.clone());
-                            t.ended_at = Some(std::time::Instant::now());
-                            t.ended_at_unix = Some(
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0),
-                            );
-                            if let Ok(db) = state.db.lock() {
-                                let _ = crate::db::save_transfer(&db, t);
+                        match reconnect_to_peer_by_best_addrs(&state, &retry_peer_fp).await {
+                            Ok(retry_conn) => {
+                                first_conn = Some(retry_conn);
+                                continue;
+                            }
+                            Err(reconnect_err) => {
+                                tracing::warn!(
+                                    transfer_id = %transfer_id_clone,
+                                    "Retry reconnect failed: {reconnect_err}"
+                                );
                             }
                         }
                     }
-                }
 
-                let revision = {
-                    let transfers = state.transfers.read().await;
-                    transfers
-                        .get(&transfer_id_clone)
-                        .map(|t| t.revision)
-                        .unwrap_or(0)
-                };
-                crate::transport::events::emit_transfer_terminal(
-                    &app,
-                    &transfer_id_clone,
-                    &crate::state::TransferStatus::Failed,
-                    reason_code,
-                    terminal_cause,
-                    revision,
-                    Some("send"),
-                );
-                crate::transport::events::emit_transfer_error_with_detail(
-                    &app,
-                    Some(&transfer_id_clone),
-                    reason_code,
-                    terminal_cause,
-                    "send",
-                    revision,
-                    Some(&detail),
-                );
+                    tracing::error!("Send failed: {e:#}");
+                    let (reason_code, terminal_cause) = classify_runtime_send_error(&detail);
+                    {
+                        let mut guard = state.transfers.write().await;
+                        if let Some(t) = guard.get_mut(&transfer_id_clone) {
+                            let is_terminal = matches!(
+                                t.status,
+                                crate::state::TransferStatus::Completed
+                                    | crate::state::TransferStatus::PartialCompleted
+                                    | crate::state::TransferStatus::Rejected
+                                    | crate::state::TransferStatus::CancelledBySender
+                                    | crate::state::TransferStatus::CancelledByReceiver
+                                    | crate::state::TransferStatus::Failed
+                            );
+                            if !is_terminal {
+                                t.status = crate::state::TransferStatus::Failed;
+                                t.revision += 1;
+                                t.terminal_reason_code = Some(reason_code.to_string());
+                                t.failed_file_ids =
+                                    Some(t.items.iter().map(|item| item.file_id).collect());
+                                t.error = Some(detail.clone());
+                                t.ended_at = Some(std::time::Instant::now());
+                                t.ended_at_unix = Some(
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs())
+                                        .unwrap_or(0),
+                                );
+                                if let Ok(db) = state.db.lock() {
+                                    let _ = crate::db::save_transfer(&db, t);
+                                }
+                            }
+                        }
+                    }
+
+                    let revision = {
+                        let transfers = state.transfers.read().await;
+                        transfers
+                            .get(&transfer_id_clone)
+                            .map(|t| t.revision)
+                            .unwrap_or(0)
+                    };
+                    crate::transport::events::emit_transfer_terminal(
+                        &app,
+                        &transfer_id_clone,
+                        &crate::state::TransferStatus::Failed,
+                        reason_code,
+                        terminal_cause,
+                        revision,
+                        Some("send"),
+                    );
+                    crate::transport::events::emit_transfer_error_with_detail(
+                        &app,
+                        Some(&transfer_id_clone),
+                        reason_code,
+                        terminal_cause,
+                        "send",
+                        revision,
+                        Some(&detail),
+                    );
+                    break;
+                }
             }
         }
     });
