@@ -152,6 +152,7 @@ pub async fn handle_offer(
             transfer_id.clone(),
             crate::state::TransferTask {
                 id: transfer_id.clone(),
+                batch_id: None,
                 direction: TransferDirection::Receive,
                 peer_fingerprint: peer_fp.clone(),
                 peer_name: offer.sender_name.clone(),

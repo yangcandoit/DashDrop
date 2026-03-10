@@ -173,9 +173,11 @@ pub enum TransferStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferTask {
     pub id: String,
+    #[serde(default)]
+    pub batch_id: Option<String>,
     pub direction: TransferDirection,
     pub peer_fingerprint: String,
     pub peer_name: String,
@@ -602,9 +604,10 @@ impl AppState {
 mod tests {
     use super::{
         default_firewall_rule_state, default_listener_port_mode, AppConfig, AppState, DeviceInfo,
-        Platform, ReachabilityStatus, SessionInfo,
+        Platform, ReachabilityStatus, SessionInfo, TransferDirection, TransferStatus, TransferTask,
     };
     use crate::crypto::Identity;
+    use serde_json::json;
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::str::FromStr;
@@ -694,5 +697,30 @@ mod tests {
     fn runtime_status_defaults_are_backward_safe() {
         assert_eq!(default_listener_port_mode(), "fallback_random");
         assert_eq!(default_firewall_rule_state(), "unknown");
+    }
+
+    #[test]
+    fn transfer_task_deserializes_legacy_payload_without_batch_id() {
+        let task: TransferTask = serde_json::from_value(json!({
+            "id": "transfer-1",
+            "direction": "Send",
+            "peer_fingerprint": "fp-1",
+            "peer_name": "Peer 1",
+            "items": [],
+            "status": "PendingAccept",
+            "bytes_transferred": 0,
+            "total_bytes": 10,
+            "revision": 0,
+            "started_at_unix": 1,
+            "ended_at_unix": null,
+            "terminal_reason_code": null,
+            "error": null
+        }))
+        .expect("legacy payload should deserialize");
+
+        assert_eq!(task.id, "transfer-1");
+        assert_eq!(task.batch_id, None);
+        assert_eq!(task.direction, TransferDirection::Send);
+        assert_eq!(task.status, TransferStatus::PendingAccept);
     }
 }

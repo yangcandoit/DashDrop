@@ -15,6 +15,9 @@ function applyAccepted(state, payload, snapshotTransfer) {
     state.activeTransfers[payload.transfer_id] = clone(snapshotTransfer);
   }
   if (state.activeTransfers[payload.transfer_id]) {
+    if (Object.hasOwn(payload, 'batch_id')) {
+      state.activeTransfers[payload.transfer_id].batch_id = payload.batch_id;
+    }
     state.activeTransfers[payload.transfer_id].status = 'Transferring';
     state.activeTransfers[payload.transfer_id].revision = payload.revision;
   }
@@ -23,11 +26,15 @@ function applyAccepted(state, payload, snapshotTransfer) {
 function applyTerminal(state, payload, status) {
   state.incomingQueue = state.incomingQueue.filter((i) => i.transfer_id !== payload.transfer_id);
   if (state.activeTransfers[payload.transfer_id]) {
+    if (Object.hasOwn(payload, 'batch_id')) {
+      state.activeTransfers[payload.transfer_id].batch_id = payload.batch_id;
+    }
     state.activeTransfers[payload.transfer_id].status = status;
     state.activeTransfers[payload.transfer_id].revision = payload.revision;
   }
   state.history.unshift({
     id: payload.transfer_id,
+    batch_id: payload.batch_id ?? null,
     status,
     reason_code: payload.reason_code ?? null,
     ended_at_unix: 1,
@@ -72,6 +79,78 @@ function testIncomingAcceptHistoryLoop() {
   applyTerminal(state, { transfer_id: 't-1', revision: 2 }, 'Completed');
   assert.equal(state.history[0].id, 't-1');
   assert.equal(state.history[0].status, 'Completed');
+}
+
+function testBatchIdCompatibilityAndIndependentTargets() {
+  const state = { incomingQueue: [], activeTransfers: {}, history: [] };
+
+  applyIncoming(state, {
+    transfer_id: 't-b1',
+    batch_id: 'batch-1',
+    sender_name: 'Peer Batch',
+    sender_fp: 'fp-batch',
+    trusted: true,
+    items: [],
+    total_size: 0,
+    revision: 0,
+  });
+  applyIncoming(state, {
+    transfer_id: 't-b2',
+    batch_id: 'batch-1',
+    sender_name: 'Peer Batch',
+    sender_fp: 'fp-batch',
+    trusted: true,
+    items: [],
+    total_size: 0,
+    revision: 0,
+  });
+
+  applyAccepted(
+    state,
+    { transfer_id: 't-b1', batch_id: 'batch-1', revision: 1 },
+    {
+      id: 't-b1',
+      batch_id: 'batch-1',
+      direction: 'Receive',
+      peer_fingerprint: 'fp-batch',
+      peer_name: 'Peer Batch',
+      items: [],
+      status: 'PendingAccept',
+      bytes_transferred: 0,
+      total_bytes: 0,
+      revision: 0,
+    },
+  );
+  applyAccepted(
+    state,
+    { transfer_id: 't-b2', batch_id: 'batch-1', revision: 1 },
+    {
+      id: 't-b2',
+      batch_id: 'batch-1',
+      direction: 'Receive',
+      peer_fingerprint: 'fp-batch',
+      peer_name: 'Peer Batch',
+      items: [],
+      status: 'PendingAccept',
+      bytes_transferred: 0,
+      total_bytes: 0,
+      revision: 0,
+    },
+  );
+
+  applyTerminal(state, { transfer_id: 't-b1', batch_id: 'batch-1', revision: 2 }, 'Completed');
+  applyTerminal(
+    state,
+    { transfer_id: 't-b2', batch_id: 'batch-1', reason_code: 'E_TIMEOUT', revision: 2 },
+    'Failed',
+  );
+
+  assert.equal(state.activeTransfers['t-b1'].batch_id, 'batch-1');
+  assert.equal(state.activeTransfers['t-b2'].batch_id, 'batch-1');
+  assert.equal(state.activeTransfers['t-b1'].status, 'Completed');
+  assert.equal(state.activeTransfers['t-b2'].status, 'Failed');
+  assert.equal(state.history[0].batch_id, 'batch-1');
+  assert.equal(state.history[1].batch_id, 'batch-1');
 }
 
 function testIncomingRejectHistoryLoop() {
@@ -153,4 +232,5 @@ function testPartialAndCancelHistoryLoop() {
 testIncomingAcceptHistoryLoop();
 testIncomingRejectHistoryLoop();
 testPartialAndCancelHistoryLoop();
+testBatchIdCompatibilityAndIndependentTargets();
 console.log('frontend e2e transfer-flow: ok');

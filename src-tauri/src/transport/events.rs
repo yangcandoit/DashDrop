@@ -1,11 +1,31 @@
-use tauri::{AppHandle, Emitter};
+use std::sync::Arc;
 
-use crate::state::TransferStatus;
+use tauri::{AppHandle, Emitter, Manager};
+
+use crate::state::{AppState, TransferStatus};
 use crate::transport::protocol::FileItem;
 
 fn emit_json(app: &AppHandle, event: &str, payload: serde_json::Value) {
     app.emit(event, payload)
         .unwrap_or_else(|e| tracing::warn!("Emit {event} failed: {e}"));
+}
+
+fn transfer_batch_id(app: &AppHandle, transfer_id: &str) -> Option<String> {
+    let state = app.try_state::<Arc<AppState>>()?;
+    let transfers = state.transfers.try_read().ok()?;
+    transfers
+        .get(transfer_id)
+        .and_then(|task| task.batch_id.clone())
+}
+
+fn with_optional_batch_id(
+    mut payload: serde_json::Value,
+    batch_id: Option<&str>,
+) -> serde_json::Value {
+    if let Some(batch_id) = batch_id {
+        payload["batch_id"] = serde_json::json!(batch_id);
+    }
+    payload
 }
 
 pub fn emit_transfer_started(
@@ -17,17 +37,21 @@ pub fn emit_transfer_started(
     total_size: u64,
     revision: u64,
 ) {
+    let batch_id = transfer_batch_id(app, transfer_id);
     emit_json(
         app,
         "transfer_started",
-        serde_json::json!({
-            "transfer_id": transfer_id,
-            "peer_fp": peer_fp,
-            "peer_name": peer_name,
-            "items": items,
-            "total_size": total_size,
-            "revision": revision,
-        }),
+        with_optional_batch_id(
+            serde_json::json!({
+                "transfer_id": transfer_id,
+                "peer_fp": peer_fp,
+                "peer_name": peer_name,
+                "items": items,
+                "total_size": total_size,
+                "revision": revision,
+            }),
+            batch_id.as_deref(),
+        ),
     );
 }
 
@@ -42,29 +66,37 @@ pub fn emit_transfer_incoming(
     total_size: u64,
     revision: u64,
 ) {
+    let batch_id = transfer_batch_id(app, transfer_id);
     emit_json(
         app,
         "transfer_incoming",
-        serde_json::json!({
-            "transfer_id": transfer_id,
-            "sender_name": sender_name,
-            "sender_fp": sender_fp,
-            "trusted": trusted,
-            "items": items,
-            "total_size": total_size,
-            "revision": revision,
-        }),
+        with_optional_batch_id(
+            serde_json::json!({
+                "transfer_id": transfer_id,
+                "sender_name": sender_name,
+                "sender_fp": sender_fp,
+                "trusted": trusted,
+                "items": items,
+                "total_size": total_size,
+                "revision": revision,
+            }),
+            batch_id.as_deref(),
+        ),
     );
 }
 
 pub fn emit_transfer_accepted(app: &AppHandle, transfer_id: &str, revision: u64) {
+    let batch_id = transfer_batch_id(app, transfer_id);
     emit_json(
         app,
         "transfer_accepted",
-        serde_json::json!({
-            "transfer_id": transfer_id,
-            "revision": revision,
-        }),
+        with_optional_batch_id(
+            serde_json::json!({
+                "transfer_id": transfer_id,
+                "revision": revision,
+            }),
+            batch_id.as_deref(),
+        ),
     );
 }
 
@@ -75,26 +107,34 @@ pub fn emit_transfer_progress(
     total_bytes: u64,
     revision: u64,
 ) {
+    let batch_id = transfer_batch_id(app, transfer_id);
     emit_json(
         app,
         "transfer_progress",
-        serde_json::json!({
-            "transfer_id": transfer_id,
-            "bytes_transferred": bytes_transferred,
-            "total_bytes": total_bytes,
-            "revision": revision,
-        }),
+        with_optional_batch_id(
+            serde_json::json!({
+                "transfer_id": transfer_id,
+                "bytes_transferred": bytes_transferred,
+                "total_bytes": total_bytes,
+                "revision": revision,
+            }),
+            batch_id.as_deref(),
+        ),
     );
 }
 
 pub fn emit_transfer_complete(app: &AppHandle, transfer_id: &str, revision: u64) {
+    let batch_id = transfer_batch_id(app, transfer_id);
     emit_json(
         app,
         "transfer_complete",
-        serde_json::json!({
-            "transfer_id": transfer_id,
-            "revision": revision,
-        }),
+        with_optional_batch_id(
+            serde_json::json!({
+                "transfer_id": transfer_id,
+                "revision": revision,
+            }),
+            batch_id.as_deref(),
+        ),
     );
 }
 
@@ -106,12 +146,16 @@ pub fn emit_transfer_partial(
     terminal_cause: Option<&str>,
     revision: u64,
 ) {
-    let mut payload = serde_json::json!({
-        "transfer_id": transfer_id,
-        "succeeded_count": succeeded_count,
-        "failed": failed,
-        "revision": revision,
-    });
+    let batch_id = transfer_batch_id(app, transfer_id);
+    let mut payload = with_optional_batch_id(
+        serde_json::json!({
+            "transfer_id": transfer_id,
+            "succeeded_count": succeeded_count,
+            "failed": failed,
+            "revision": revision,
+        }),
+        batch_id.as_deref(),
+    );
 
     if let Some(cause) = terminal_cause {
         payload["terminal_cause"] = serde_json::json!(cause);
@@ -133,12 +177,16 @@ pub fn emit_transfer_terminal(
         return;
     };
 
-    let mut payload = serde_json::json!({
-        "transfer_id": transfer_id,
-        "reason_code": reason_code,
-        "terminal_cause": terminal_cause,
-        "revision": revision,
-    });
+    let batch_id = transfer_batch_id(app, transfer_id);
+    let mut payload = with_optional_batch_id(
+        serde_json::json!({
+            "transfer_id": transfer_id,
+            "reason_code": reason_code,
+            "terminal_cause": terminal_cause,
+            "revision": revision,
+        }),
+        batch_id.as_deref(),
+    );
 
     if let Some(p) = phase {
         payload["phase"] = serde_json::json!(p);
@@ -185,13 +233,17 @@ pub fn emit_transfer_error_with_detail(
     revision: u64,
     detail: Option<&str>,
 ) {
-    let mut payload = serde_json::json!({
-        "transfer_id": transfer_id,
-        "reason_code": reason_code,
-        "terminal_cause": terminal_cause,
-        "phase": phase,
-        "revision": revision,
-    });
+    let batch_id = transfer_id.and_then(|id| transfer_batch_id(app, id));
+    let mut payload = with_optional_batch_id(
+        serde_json::json!({
+            "transfer_id": transfer_id,
+            "reason_code": reason_code,
+            "terminal_cause": terminal_cause,
+            "phase": phase,
+            "revision": revision,
+        }),
+        batch_id.as_deref(),
+    );
     if let Some(d) = detail {
         payload["detail"] = serde_json::json!(d);
     }
@@ -200,8 +252,9 @@ pub fn emit_transfer_error_with_detail(
 
 #[cfg(test)]
 mod tests {
-    use super::terminal_event_name;
+    use super::{terminal_event_name, with_optional_batch_id};
     use crate::state::TransferStatus;
+    use serde_json::json;
 
     #[test]
     fn maps_terminal_statuses_to_fixed_event_names() {
@@ -229,5 +282,23 @@ mod tests {
         assert_eq!(terminal_event_name(&TransferStatus::Transferring), None);
         assert_eq!(terminal_event_name(&TransferStatus::Completed), None);
         assert_eq!(terminal_event_name(&TransferStatus::PartialCompleted), None);
+    }
+
+    #[test]
+    fn payload_extension_omits_batch_id_when_absent() {
+        let payload = with_optional_batch_id(json!({ "transfer_id": "t-1" }), None);
+        assert_eq!(payload.get("transfer_id"), Some(&json!("t-1")));
+        assert!(payload.get("batch_id").is_none());
+    }
+
+    #[test]
+    fn payload_extension_preserves_fixed_event_contract_and_adds_batch_id() {
+        let payload = with_optional_batch_id(json!({ "transfer_id": "t-1" }), Some("batch-1"));
+        assert_eq!(payload.get("transfer_id"), Some(&json!("t-1")));
+        assert_eq!(payload.get("batch_id"), Some(&json!("batch-1")));
+        assert_eq!(
+            terminal_event_name(&TransferStatus::CancelledBySender),
+            Some("transfer_cancelled_by_sender")
+        );
     }
 }

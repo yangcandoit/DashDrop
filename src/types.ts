@@ -73,6 +73,7 @@ export interface FileItemMeta {
 
 export interface TransferView {
   id: string;
+  batch_id?: string | null;
   direction: TransferDirection;
   peer_fingerprint: string;
   peer_name: string;
@@ -95,6 +96,7 @@ export interface LocalIdentity {
 
 export interface TransferStartedPayload {
   transfer_id: string;
+  batch_id?: string | null;
   peer_fp: string;
   peer_name: string;
   items: FileItemMeta[];
@@ -104,6 +106,7 @@ export interface TransferStartedPayload {
 
 export interface TransferIncomingPayload {
   transfer_id: string;
+  batch_id?: string | null;
   sender_name: string;
   sender_fp: string;
   trusted: boolean;
@@ -114,11 +117,13 @@ export interface TransferIncomingPayload {
 
 export interface TransferAcceptedPayload {
   transfer_id: string;
+  batch_id?: string | null;
   revision: number;
 }
 
 export interface TransferProgressPayload {
   transfer_id: string;
+  batch_id?: string | null;
   bytes_transferred: number;
   total_bytes: number;
   revision: number;
@@ -126,6 +131,7 @@ export interface TransferProgressPayload {
 
 export interface TransferCompletePayload {
   transfer_id: string;
+  batch_id?: string | null;
   revision: number;
 }
 
@@ -137,6 +143,7 @@ export interface FailedFile {
 
 export interface TransferPartialPayload {
   transfer_id: string;
+  batch_id?: string | null;
   succeeded_count: number;
   failed: FailedFile[];
   terminal_cause?: string;
@@ -145,6 +152,7 @@ export interface TransferPartialPayload {
 
 export interface TransferRejectedPayload {
   transfer_id: string;
+  batch_id?: string | null;
   reason_code: string;
   terminal_cause: string;
   revision: number;
@@ -152,6 +160,7 @@ export interface TransferRejectedPayload {
 
 export interface TransferCancelledPayload {
   transfer_id: string;
+  batch_id?: string | null;
   reason_code: string;
   terminal_cause: string;
   revision: number;
@@ -159,6 +168,7 @@ export interface TransferCancelledPayload {
 
 export interface TransferFailedPayload {
   transfer_id: string;
+  batch_id?: string | null;
   reason_code: string;
   terminal_cause: string;
   phase?: string;
@@ -167,6 +177,7 @@ export interface TransferFailedPayload {
 
 export interface TransferErrorPayload {
   transfer_id: string | null;
+  batch_id?: string | null;
   reason_code: string;
   terminal_cause: string;
   phase: string;

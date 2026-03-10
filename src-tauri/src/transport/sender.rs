@@ -104,6 +104,7 @@ pub async fn send_files(
             transfer_id.clone(),
             crate::state::TransferTask {
                 id: transfer_id.clone(),
+                batch_id: None,
                 direction: TransferDirection::Send,
                 peer_fingerprint: peer_fp.clone(),
                 peer_name: peer_name.clone(),

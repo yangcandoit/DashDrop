@@ -230,6 +230,7 @@ pub fn get_history(conn: &Connection, limit: u32, offset: u32) -> Result<Vec<Tra
 
         Ok(TransferTask {
             id: row.get(0)?,
+            batch_id: None,
             direction: parse_direction(row.get(1)?)?,
             peer_fingerprint: row.get(2)?,
             peer_name: row.get(3)?,

@@ -159,6 +159,12 @@ function upsertIncoming(payload: TransferIncomingPayload) {
   incomingQueue.value.push(payload);
 }
 
+function applyBatchId(task: TransferView, batchId?: string | null) {
+  if (batchId !== undefined) {
+    task.batch_id = batchId;
+  }
+}
+
 function applyRevision(task: TransferView, revision: number): boolean {
   const currentRevision = task.revision ?? 0;
   if (revision < currentRevision) {
@@ -183,6 +189,7 @@ async function hydrateTransfer(transferId: string): Promise<TransferView | null>
 
 async function applyStateEvent(
   transferId: string,
+  batchId: string | null | undefined,
   revision: number,
   updater: (task: TransferView) => void,
 ) {
@@ -211,11 +218,13 @@ async function applyStateEvent(
     return;
   }
 
+  applyBatchId(task, batchId);
   updater(task);
 }
 
 function applyProgressEvent(
   transferId: string,
+  batchId: string | null | undefined,
   revision: number,
   updater: (task: TransferView) => void,
 ) {
@@ -229,17 +238,19 @@ function applyProgressEvent(
     return;
   }
   task.revision = revision;
+  applyBatchId(task, batchId);
   updater(task);
 }
 
 function addOrUpdateTerminalError(
   transferId: string,
+  batchId: string | null | undefined,
   status: TransferView["status"],
   reason: string,
   revision: number,
 ) {
   removeIncoming(transferId);
-  void applyStateEvent(transferId, revision, (t) => {
+  void applyStateEvent(transferId, batchId, revision, (t) => {
     t.status = status;
     t.error = reason;
     t.bytes_transferred = Math.min(t.total_bytes, t.bytes_transferred);
@@ -298,6 +309,7 @@ export async function initAppStore() {
     await onTransferStarted((payload) => {
       activeTransfers.value[payload.transfer_id] = {
         id: payload.transfer_id,
+        batch_id: payload.batch_id ?? null,
         direction: "Send",
         peer_fingerprint: payload.peer_fp,
         peer_name: payload.peer_name,
@@ -319,7 +331,7 @@ export async function initAppStore() {
   unlistens.push(
     await onTransferAccepted(async (payload) => {
       removeIncoming(payload.transfer_id);
-      await applyStateEvent(payload.transfer_id, payload.revision, (t) => {
+      await applyStateEvent(payload.transfer_id, payload.batch_id, payload.revision, (t) => {
         t.status = "Transferring";
       });
     }),
@@ -327,7 +339,7 @@ export async function initAppStore() {
 
   unlistens.push(
     await onTransferProgress((payload) => {
-      applyProgressEvent(payload.transfer_id, payload.revision, (t) => {
+      applyProgressEvent(payload.transfer_id, payload.batch_id, payload.revision, (t) => {
         t.bytes_transferred = payload.bytes_transferred;
         t.total_bytes = payload.total_bytes;
       });
@@ -337,7 +349,7 @@ export async function initAppStore() {
   unlistens.push(
     await onTransferComplete((payload) => {
       removeIncoming(payload.transfer_id);
-      void applyStateEvent(payload.transfer_id, payload.revision, (t) => {
+      void applyStateEvent(payload.transfer_id, payload.batch_id, payload.revision, (t) => {
         t.status = "Completed";
         t.bytes_transferred = t.total_bytes;
         void notifyUser(
@@ -351,7 +363,7 @@ export async function initAppStore() {
   unlistens.push(
     await onTransferPartial((payload) => {
       removeIncoming(payload.transfer_id);
-      void applyStateEvent(payload.transfer_id, payload.revision, (t) => {
+      void applyStateEvent(payload.transfer_id, payload.batch_id, payload.revision, (t) => {
         t.status = "PartialCompleted";
         t.bytes_transferred = t.total_bytes;
       });
@@ -360,25 +372,49 @@ export async function initAppStore() {
 
   unlistens.push(
     await onTransferRejected((payload) => {
-      addOrUpdateTerminalError(payload.transfer_id, "Rejected", payload.reason_code, payload.revision);
+      addOrUpdateTerminalError(
+        payload.transfer_id,
+        payload.batch_id,
+        "Rejected",
+        payload.reason_code,
+        payload.revision,
+      );
     }),
   );
 
   unlistens.push(
     await onTransferCancelledBySender((payload) => {
-      addOrUpdateTerminalError(payload.transfer_id, "CancelledBySender", payload.reason_code, payload.revision);
+      addOrUpdateTerminalError(
+        payload.transfer_id,
+        payload.batch_id,
+        "CancelledBySender",
+        payload.reason_code,
+        payload.revision,
+      );
     }),
   );
 
   unlistens.push(
     await onTransferCancelledByReceiver((payload) => {
-      addOrUpdateTerminalError(payload.transfer_id, "CancelledByReceiver", payload.reason_code, payload.revision);
+      addOrUpdateTerminalError(
+        payload.transfer_id,
+        payload.batch_id,
+        "CancelledByReceiver",
+        payload.reason_code,
+        payload.revision,
+      );
     }),
   );
 
   unlistens.push(
     await onTransferFailed((payload) => {
-      addOrUpdateTerminalError(payload.transfer_id, "Failed", payload.reason_code, payload.revision);
+      addOrUpdateTerminalError(
+        payload.transfer_id,
+        payload.batch_id,
+        "Failed",
+        payload.reason_code,
+        payload.revision,
+      );
     }),
   );
 
@@ -407,7 +443,13 @@ export async function initAppStore() {
         return;
       }
       if (err.transfer_id) {
-        addOrUpdateTerminalError(err.transfer_id, "Failed", normalizedReasonCode, err.revision);
+        addOrUpdateTerminalError(
+          err.transfer_id,
+          err.batch_id,
+          "Failed",
+          normalizedReasonCode,
+          err.revision,
+        );
       }
       setSystemError(
         actionableMessage(

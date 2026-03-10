@@ -924,6 +924,7 @@ mod diagnostics_tests {
             transfer_id.clone(),
             TransferTask {
                 id: transfer_id.clone(),
+                batch_id: None,
                 direction: TransferDirection::Receive,
                 peer_fingerprint: "fp".into(),
                 peer_name: "peer".into(),
@@ -968,6 +969,7 @@ mod diagnostics_tests {
             transfer_id.clone(),
             TransferTask {
                 id: transfer_id.clone(),
+                batch_id: None,
                 direction: TransferDirection::Receive,
                 peer_fingerprint: "fp".into(),
                 peer_name: "peer".into(),
@@ -1006,6 +1008,7 @@ mod diagnostics_tests {
             transfer_id.clone(),
             TransferTask {
                 id: transfer_id.clone(),
+                batch_id: None,
                 direction: TransferDirection::Receive,
                 peer_fingerprint: "fp".into(),
                 peer_name: "peer".into(),
@@ -1064,6 +1067,7 @@ mod diagnostics_tests {
         mapping.insert(2, "/tmp/b.txt".to_string());
         let task = TransferTask {
             id: "t1".into(),
+            batch_id: None,
             direction: TransferDirection::Send,
             peer_fingerprint: "fp".into(),
             peer_name: "peer".into(),
@@ -1103,6 +1107,7 @@ mod diagnostics_tests {
     fn retry_paths_falls_back_to_all_paths_when_mapping_missing() {
         let task = TransferTask {
             id: "t2".into(),
+            batch_id: None,
             direction: TransferDirection::Send,
             peer_fingerprint: "fp".into(),
             peer_name: "peer".into(),

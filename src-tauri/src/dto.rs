@@ -60,6 +60,8 @@ impl From<&DeviceInfo> for DeviceView {
 #[derive(Debug, Clone, Serialize)]
 pub struct TransferView {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
     pub direction: TransferDirection,
     pub peer_fingerprint: String,
     pub peer_name: String,
@@ -78,6 +80,7 @@ impl From<&TransferTask> for TransferView {
     fn from(value: &TransferTask) -> Self {
         Self {
             id: value.id.clone(),
+            batch_id: value.batch_id.clone(),
             direction: value.direction.clone(),
             peer_fingerprint: value.peer_fingerprint.clone(),
             peer_name: value.peer_name.clone(),
