@@ -70,6 +70,7 @@ DashDrop 是一个**单进程 Tauri 应用**。后端逻辑运行在 Rust 异步
 2. 当前通知链路不承担系统通知过期撤回与 `E_REQUEST_EXPIRED` 完整闭环；目标态要求强制闭环。
 3. 当前 MVP 不实现断点续传；目标态要求恢复前执行 `source_snapshot(size/mtime/head_hash)` 一致性校验。
 4. 当前为单进程 Tauri；目标态为 daemon + 本地 IPC（Unix socket / Named Pipe）。
+5. 当前主路径仍以 1:1 传输为核心；目标态要求 batch 级 1:N 调度与单读多发扇出能力。
 
 ---
 
