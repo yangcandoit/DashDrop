@@ -2,6 +2,8 @@ export type Platform = "Mac" | "Windows" | "Linux" | "Android" | "Ios" | "Unknow
 
 export type ReachabilityStatus = "discovered" | "reachable" | "offline_candidate" | "offline";
 
+export type PowerProfile = "ac" | "battery" | "low_power";
+
 export interface DeviceView {
   fingerprint: string;
   name: string;
@@ -213,6 +215,8 @@ export interface DiscoveryDiagnostics {
   runtime: RuntimeStatus;
   service_type?: string;
   beacon_port?: number;
+  power_profile?: PowerProfile;
+  beacon_interval_secs?: number;
   own_fingerprint?: string;
   own_platform?: Platform;
   mdns_daemon_initialized: boolean;

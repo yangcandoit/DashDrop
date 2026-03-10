@@ -745,11 +745,17 @@ mod diagnostics_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use crate::crypto::Identity;
+    use crate::discovery::beacon::{BeaconCadence, PowerProfile};
+    use crate::state::AppConfig;
     use crate::state::{FileItemMeta, TransferDirection, TransferStatus, TransferTask};
     use tokio::sync::oneshot;
     use tokio::sync::RwLock;
 
-    use super::{accept_pending_transfer, reject_pending_transfer, select_retry_paths};
+    use super::{
+        accept_pending_transfer, build_discovery_diagnostics, reject_pending_transfer,
+        select_retry_paths,
+    };
 
     #[tokio::test]
     async fn accept_pending_transfer_sends_true() {
@@ -868,6 +874,41 @@ mod diagnostics_tests {
             selected,
             vec!["/tmp/a.txt".to_string(), "/tmp/b.txt".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn discovery_diagnostics_serializes_power_profile_and_interval() {
+        let state = Arc::new(crate::state::AppState::new(
+            Identity {
+                fingerprint: "self-fp".into(),
+                cert_der: Vec::new(),
+                key_der: Vec::new(),
+                device_name: "Test Device".into(),
+            },
+            AppConfig::default(),
+            rusqlite::Connection::open_in_memory().expect("in-memory db"),
+        ));
+        *state.local_port.write().await = 9443;
+
+        let diagnostics = build_discovery_diagnostics(
+            &state,
+            BeaconCadence {
+                power_profile: PowerProfile::LowPower,
+                interval_secs: 12,
+            },
+        )
+        .await;
+
+        assert_eq!(diagnostics["power_profile"], "low_power");
+        assert_eq!(diagnostics["beacon_interval_secs"], 12);
+        let quick_hints = diagnostics["quick_hints"]
+            .as_array()
+            .expect("quick hints array");
+        assert!(quick_hints.iter().any(|hint| {
+            hint.as_str()
+                .map(|value| value.contains("discovery latency is intentionally relaxed"))
+                .unwrap_or(false)
+        }));
     }
 }
 
@@ -1014,8 +1055,8 @@ pub async fn get_runtime_status(
 #[tauri::command]
 pub async fn copy_to_clipboard(text: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        let mut clipboard = arboard::Clipboard::new()
-            .map_err(|e| format!("native clipboard unavailable: {e}"))?;
+        let mut clipboard =
+            arboard::Clipboard::new().map_err(|e| format!("native clipboard unavailable: {e}"))?;
         clipboard
             .set_text(text)
             .map_err(|e| format!("native clipboard write failed: {e}"))?;
@@ -1029,6 +1070,15 @@ pub async fn copy_to_clipboard(text: String) -> Result<(), String> {
 pub async fn get_discovery_diagnostics(
     state: AppStateRef<'_>,
 ) -> Result<serde_json::Value, String> {
+    let state = Arc::clone(&state);
+    let cadence = crate::discovery::beacon::current_beacon_cadence();
+    Ok(build_discovery_diagnostics(&state, cadence).await)
+}
+
+async fn build_discovery_diagnostics(
+    state: &Arc<AppState>,
+    beacon_cadence: crate::discovery::beacon::BeaconCadence,
+) -> serde_json::Value {
     let runtime = state.runtime_status().await;
     let mdns_service_fullname = state.mdns_service_fullname.read().await.clone();
     let mdns_interface_policy = state.mdns_interface_policy.read().await.clone();
@@ -1044,10 +1094,7 @@ pub async fn get_discovery_diagnostics(
     let network_interfaces = collect_network_interfaces();
     let devices = state.devices.read().await;
 
-    let device_rows: Vec<serde_json::Value> = devices
-        .values()
-        .map(discovery_device_row)
-        .collect();
+    let device_rows: Vec<serde_json::Value> = devices.values().map(discovery_device_row).collect();
 
     let resolved_events = discovery_event_counts
         .get("service_resolved")
@@ -1194,11 +1241,19 @@ pub async fn get_discovery_diagnostics(
                 .to_string(),
         );
     }
+    if beacon_cadence.power_profile == crate::discovery::beacon::PowerProfile::LowPower {
+        quick_hints.push(
+            "Low-power mode is active, so discovery latency is intentionally relaxed to reduce energy use; beacon-based peer appearance may take longer than on AC."
+                .to_string(),
+        );
+    }
 
-    Ok(serde_json::json!({
+    serde_json::json!({
         "runtime": runtime,
         "service_type": crate::discovery::service::SERVICE_TYPE,
         "beacon_port": crate::discovery::beacon::DISCOVERY_BEACON_PORT,
+        "power_profile": beacon_cadence.power_profile,
+        "beacon_interval_secs": beacon_cadence.interval_secs,
         "own_fingerprint": state.identity.fingerprint.clone(),
         "own_platform": Platform::current(),
         "mdns_daemon_initialized": mdns_daemon_initialized,
@@ -1223,16 +1278,18 @@ pub async fn get_discovery_diagnostics(
         "quick_hints": quick_hints,
         "device_count": device_rows.len(),
         "devices": device_rows,
-    }))
+    })
 }
 
 fn collect_network_interfaces() -> Vec<serde_json::Value> {
     let mut grouped: BTreeMap<String, (bool, Vec<String>, Vec<String>)> = BTreeMap::new();
     if let Ok(ifaces) = if_addrs::get_if_addrs() {
         for iface in ifaces {
-            let entry = grouped
-                .entry(iface.name.clone())
-                .or_insert((iface.is_loopback(), Vec::new(), Vec::new()));
+            let entry = grouped.entry(iface.name.clone()).or_insert((
+                iface.is_loopback(),
+                Vec::new(),
+                Vec::new(),
+            ));
             entry.0 = entry.0 || iface.is_loopback();
             let ip = iface.ip().to_string();
             if iface.ip().is_ipv4() {
@@ -1360,16 +1417,16 @@ mod tests {
         };
 
         let row = discovery_device_row(&device);
-        assert_eq!(row["last_resolve_stats"]["raw_addr_count"].as_u64(), Some(2));
-        assert_eq!(row["last_resolve_stats"]["usable_addr_count"].as_u64(), Some(1));
         assert_eq!(
-            row["last_probe_result"]["result"].as_str(),
-            Some("failed")
+            row["last_resolve_stats"]["raw_addr_count"].as_u64(),
+            Some(2)
         );
         assert_eq!(
-            row["last_probe_result"]["error"].as_str(),
-            Some("timeout")
+            row["last_resolve_stats"]["usable_addr_count"].as_u64(),
+            Some(1)
         );
+        assert_eq!(row["last_probe_result"]["result"].as_str(), Some("failed"));
+        assert_eq!(row["last_probe_result"]["error"].as_str(), Some("timeout"));
         assert_eq!(
             row["last_probe_result"]["addr"].as_str(),
             Some("192.168.1.8:9443")
