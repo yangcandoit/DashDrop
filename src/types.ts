@@ -216,6 +216,8 @@ export interface DiscoveryDiagnostics {
   own_platform?: Platform;
   mdns_daemon_initialized: boolean;
   mdns_service_fullname?: string | null;
+  mdns_interface_policy?: string;
+  mdns_enabled_interfaces?: string[];
   mdns_last_search_started?: string | null;
   local_instance_name?: string | null;
   listener_mode?: string;

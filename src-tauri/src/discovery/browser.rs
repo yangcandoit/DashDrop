@@ -430,15 +430,22 @@ async fn handle_resolved(
 ) {
     let props = info.get_properties();
 
-    let fp = match props.get("fp") {
-        Some(v) => v.val_str().to_string(),
-        None => {
-            tracing::debug!("mDNS peer missing fp, skipping");
-            return;
-        }
+    let Some(fp_prop) = props.get("fp") else {
+        tracing::debug!("mDNS peer missing fp, skipping");
+        state
+            .bump_discovery_failure("resolved_missing_fp_txt")
+            .await;
+        return;
     };
-
-    if fp.is_empty() || fp == own_fp {
+    let fp = fp_prop.val_str().to_string();
+    if fp.is_empty() {
+        state
+            .bump_discovery_failure("resolved_empty_fp_txt")
+            .await;
+        return;
+    }
+    if fp == own_fp {
+        state.bump_discovery_event("resolved_self_filtered").await;
         return;
     }
 

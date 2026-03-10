@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use mdns_sd::{ServiceDaemon, ServiceInfo};
-use std::collections::HashMap;
+use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::state::{AppState, Platform};
@@ -34,6 +34,8 @@ pub async fn reregister_service(state: Arc<AppState>) -> Result<()> {
 }
 
 async fn register_on_daemon(mdns: &ServiceDaemon, state: &Arc<AppState>) -> Result<()> {
+    configure_mdns_interfaces(mdns, state).await?;
+
     let port = *state.local_port.read().await;
     let fp = state.identity.fingerprint.clone();
     let device_name = state.config.read().await.device_name.clone();
@@ -68,6 +70,102 @@ async fn register_on_daemon(mdns: &ServiceDaemon, state: &Arc<AppState>) -> Resu
 
     tracing::info!("mDNS registered: instance={instance_name}, port={port}, fp={fp}");
     Ok(())
+}
+
+async fn configure_mdns_interfaces(mdns: &ServiceDaemon, state: &Arc<AppState>) -> Result<()> {
+    let selected = select_preferred_mdns_interfaces();
+    if selected.is_empty() {
+        *state.mdns_interface_policy.write().await = "all".to_string();
+        state.mdns_enabled_interfaces.write().await.clear();
+        tracing::warn!("mDNS interface filter skipped (no preferred LAN interfaces found); using all interfaces");
+        return Ok(());
+    }
+
+    mdns.disable_interface(IfKind::All)
+        .context("disable all mDNS interfaces before selective enable")?;
+    for ifname in &selected {
+        mdns.enable_interface(ifname.as_str())
+            .with_context(|| format!("enable mDNS interface {ifname}"))?;
+    }
+    *state.mdns_interface_policy.write().await = "filtered".to_string();
+    *state.mdns_enabled_interfaces.write().await = selected.clone();
+    tracing::info!("mDNS interface filter enabled: {}", selected.join(", "));
+    Ok(())
+}
+
+#[derive(Default)]
+struct InterfaceStats {
+    is_loopback: bool,
+    has_ipv4_lan: bool,
+    has_ipv6_non_link_local: bool,
+}
+
+fn is_virtual_or_filtered_interface(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.starts_with("utun")
+        || n.starts_with("awdl")
+        || n.starts_with("llw")
+        || n.starts_with("lo")
+        || n.contains("loopback")
+        || n.starts_with("docker")
+        || n.starts_with("veth")
+        || n.starts_with("vmnet")
+        || n.contains("vmware")
+        || n.contains("virtualbox")
+        || n.contains("vethernet")
+        || n.contains("tailscale")
+        || n.contains("zerotier")
+        || n.contains("wireguard")
+        || n.contains("npcap")
+        || n.contains("bridge")
+        || n.contains("tap")
+        || n.contains("tun")
+}
+
+fn select_preferred_mdns_interfaces() -> Vec<String> {
+    let Ok(ifaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+
+    let mut by_name: BTreeMap<String, InterfaceStats> = BTreeMap::new();
+    for iface in ifaces {
+        let entry = by_name.entry(iface.name.clone()).or_default();
+        entry.is_loopback = entry.is_loopback || iface.is_loopback();
+        match iface.addr {
+            if_addrs::IfAddr::V4(v4) => {
+                let ip = v4.ip;
+                if !ip.is_loopback() && !ip.is_link_local() {
+                    entry.has_ipv4_lan = true;
+                }
+            }
+            if_addrs::IfAddr::V6(v6) => {
+                let ip = v6.ip;
+                if !ip.is_loopback() && !ip.is_unicast_link_local() {
+                    entry.has_ipv6_non_link_local = true;
+                }
+            }
+        }
+    }
+
+    let mut preferred: Vec<String> = by_name
+        .iter()
+        .filter(|(name, stats)| {
+            !stats.is_loopback
+                && !is_virtual_or_filtered_interface(name)
+                && (stats.has_ipv4_lan || stats.has_ipv6_non_link_local)
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    if preferred.is_empty() {
+        preferred = by_name
+            .iter()
+            .filter(|(name, stats)| !stats.is_loopback && !is_virtual_or_filtered_interface(name))
+            .map(|(name, _)| name.clone())
+            .collect();
+    }
+
+    preferred
 }
 
 fn sanitize_mdns_instance_name(name: &str) -> String {
@@ -120,5 +218,23 @@ fn sanitize_mdns_host_label(device_name: &str, fingerprint: &str) -> String {
         "dashdrop".to_string()
     } else {
         label
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn filters_virtual_interface_names() {
+        assert!(super::is_virtual_or_filtered_interface("utun4"));
+        assert!(super::is_virtual_or_filtered_interface("awdl0"));
+        assert!(super::is_virtual_or_filtered_interface("Loopback Pseudo-Interface 1"));
+        assert!(super::is_virtual_or_filtered_interface("vEthernet (Default Switch)"));
+    }
+
+    #[test]
+    fn keeps_normal_lan_interface_names() {
+        assert!(!super::is_virtual_or_filtered_interface("en0"));
+        assert!(!super::is_virtual_or_filtered_interface("Ethernet"));
+        assert!(!super::is_virtual_or_filtered_interface("以太网"));
     }
 }

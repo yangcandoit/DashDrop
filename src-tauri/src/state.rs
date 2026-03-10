@@ -346,6 +346,10 @@ pub struct AppState {
     pub mdns: tokio::sync::OnceCell<Arc<mdns_sd::ServiceDaemon>>,
     /// Last registered local mDNS service fullname for rename/re-registration.
     pub mdns_service_fullname: Arc<RwLock<Option<String>>>,
+    /// Effective mDNS interface policy ("all" or "filtered").
+    pub mdns_interface_policy: Arc<RwLock<String>>,
+    /// Enabled mDNS interface names when interface filtering is active.
+    pub mdns_enabled_interfaces: Arc<RwLock<Vec<String>>>,
     /// Last mDNS browser SearchStarted payload for interface/permission diagnostics.
     pub mdns_last_search_started: Arc<RwLock<Option<String>>>,
     /// mDNS browser event counters keyed by event name.
@@ -385,6 +389,8 @@ impl AppState {
             endpoint: tokio::sync::OnceCell::new(),
             mdns: tokio::sync::OnceCell::new(),
             mdns_service_fullname: Arc::new(RwLock::new(None)),
+            mdns_interface_policy: Arc::new(RwLock::new("all".to_string())),
+            mdns_enabled_interfaces: Arc::new(RwLock::new(Vec::new())),
             mdns_last_search_started: Arc::new(RwLock::new(None)),
             discovery_event_counts: Arc::new(RwLock::new(HashMap::new())),
             discovery_failure_counts: Arc::new(RwLock::new(HashMap::new())),

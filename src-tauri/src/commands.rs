@@ -959,6 +959,8 @@ pub async fn get_discovery_diagnostics(
 ) -> Result<serde_json::Value, String> {
     let runtime = state.runtime_status().await;
     let mdns_service_fullname = state.mdns_service_fullname.read().await.clone();
+    let mdns_interface_policy = state.mdns_interface_policy.read().await.clone();
+    let mdns_enabled_interfaces = state.mdns_enabled_interfaces.read().await.clone();
     let mdns_last_search_started = state.mdns_last_search_started.read().await.clone();
     let mdns_daemon_initialized = state.mdns.get().is_some();
     let session_index_count = state.session_index.read().await.len();
@@ -1080,6 +1082,27 @@ pub async fn get_discovery_diagnostics(
                 .to_string(),
         );
     }
+    let self_filtered = discovery_event_counts
+        .get("resolved_self_filtered")
+        .copied()
+        .unwrap_or_default();
+    if resolved_events > 0 && device_rows.is_empty() && self_filtered >= resolved_events {
+        quick_hints.push(
+            "mDNS resolved only self-advertisements on this host; no remote DashDrop peers observed."
+                .to_string(),
+        );
+    }
+    if discovery_failure_counts
+        .get("resolved_missing_fp_txt")
+        .copied()
+        .unwrap_or_default()
+        > 0
+    {
+        quick_hints.push(
+            "Some _dashdrop records were missing fp TXT; verify both peers run compatible builds and advertise required TXT keys."
+                .to_string(),
+        );
+    }
 
     Ok(serde_json::json!({
         "runtime": runtime,
@@ -1088,6 +1111,8 @@ pub async fn get_discovery_diagnostics(
         "own_platform": Platform::current(),
         "mdns_daemon_initialized": mdns_daemon_initialized,
         "mdns_service_fullname": mdns_service_fullname,
+        "mdns_interface_policy": mdns_interface_policy,
+        "mdns_enabled_interfaces": mdns_enabled_interfaces,
         "mdns_last_search_started": mdns_last_search_started,
         "local_instance_name": local_instance_name,
         "listener_mode": listener_mode,
