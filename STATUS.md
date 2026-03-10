@@ -129,6 +129,12 @@ Estimated completion:
 ## AirDrop-like target status
 
 - The design in `docs/AIRDROP_SEAMLESS_EXPERIENCE_DESIGN.md` is a target-state plan.
+- The target-state doc has been consolidated with explicit constraints for:
+  - fixed QUIC port preference + firewall bootstrap (`53319/udp` with fallback random),
+  - notification expiry lifecycle (`E_REQUEST_EXPIRED`),
+  - source snapshot validation before resume (`size/mtime/head_hash`),
+  - SQLite progress write coalescing (batch flush + WAL single writer),
+  - power-aware beacon policy and BLE rolling identifiers.
 - Daemon split, local IPC auth model, system share entry, BLE assist, and Wi-Fi direct link manager are not part of the current shipped architecture.
 - Current production baseline remains: single-process app + mDNS/beacon + QUIC transfer + diagnostics.
 
@@ -140,6 +146,7 @@ Estimated completion:
 - Code-signing / notarization currently remains optional hooks; production certificates and notarization credentials still need to be configured in repository secrets.
 - First-contact trust model remains TOFU; UI now enforces fingerprint confirmation for untrusted targets, but QR/out-of-band cryptographic verification is still planned for v0.2.
 - Linux GUI stack still includes GTK3/WebKit2GTK transitively via Tauri runtime; long-term mitigation is upgrading runtime dependency chain.
+- AirDrop-like implementation phases are not started: daemon IPC, system share entry, BLE assist, P2P/SoftAP scheduler, and 1:N fan-out reader/writer split remain design-only.
 
 ## Validation snapshot
 

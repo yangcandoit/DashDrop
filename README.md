@@ -27,6 +27,7 @@ Architecture note: current releases are single-process Tauri; daemon + local IPC
   - `revision` 仅在状态跃迁递增，`transfer_progress` 不再推动 revision 递增
 - 架构边界：
   - 已引入稳定 DTO（`DeviceView/SessionView/TransferView`），前端不再依赖 `SocketAddr/Instant`
+  - AirDrop-like 目标文档已补齐关键约束：固定端口+防火墙策略、通知过期闭环、恢复前源快照校验、功耗与隐私广播策略（目标态，未默认上线）
 - 功能补齐：
   - 已实现 `connect_by_address`（返回远端指纹摘要并进入确认/可选配对流程）
   - Nearby 对未信任设备发送前增加指纹确认弹窗（可选立即配对）

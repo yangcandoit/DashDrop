@@ -41,7 +41,7 @@
 |                   | (Arc<RwLock>)|                      |
 |                   +--------------+                      |
 +---------------------------------------------------------+
-        | UDP/5353 + UDP/53318  | QUIC/UDP (随机端口)
+        | UDP/5353 + UDP/53318  | QUIC/UDP (当前随机端口)
   +-----v------+          +-----v------+
   | LAN发现双通道|         | QUIC 传输  |
   | mDNS+beacon |         | TLS 1.3   |
@@ -62,6 +62,14 @@ DashDrop 是一个**单进程 Tauri 应用**。后端逻辑运行在 Rust 异步
 
 如需进程级隔离，未来可将 transport/discovery 拆为系统服务，通过 Unix socket / named pipe 与 UI 通信。  
 目标态 IPC 与权限模型见 [docs/AIRDROP_SEAMLESS_EXPERIENCE_DESIGN.md](./docs/AIRDROP_SEAMLESS_EXPERIENCE_DESIGN.md) §4.1。**当前 MVP 不实现 daemon 拆分**。
+
+### 1.2 当前实现与目标态差异（文档对齐）
+
+为避免“当前实现文档”和 AirDrop-like 目标文档混淆，以下差异明确保留：
+1. 当前 QUIC 监听端口为运行时动态端口；目标态优先固定 `53319/udp`（占用时再回退随机端口）。
+2. 当前通知链路不承担系统通知过期撤回与 `E_REQUEST_EXPIRED` 完整闭环；目标态要求强制闭环。
+3. 当前 MVP 不实现断点续传；目标态要求恢复前执行 `source_snapshot(size/mtime/head_hash)` 一致性校验。
+4. 当前为单进程 Tauri；目标态为 daemon + 本地 IPC（Unix socket / Named Pipe）。
 
 ---
 

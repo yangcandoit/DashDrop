@@ -18,6 +18,7 @@
 > - 已落地：partial 结果失败项可被发送端按文件级重试（无需整任务重发）。
 > - 已落地：工程门禁与发布自动化（CI + clippy、security audit、Code Scanning default setup、installers/release checksum）；协议行为不变，仅增强交付质量。
 > - 部分待补：协议文档中的“真实端到端集成测试要求”尚未完全达成（当前为单测+契约测试增强）。
+> - 目标态预留：AirDrop-like 设计中的 `risk_class`、`E_REQUEST_EXPIRED`、`E_SIZE_POLICY`、恢复前 `source_snapshot` 校验等能力，当前仅作为预留规范，默认实现未启用。
 
 ---
 
@@ -187,10 +188,13 @@ Sender                              Receiver
 | `E_INVALID_PATH` | `rel_path` 未通过安全校验（路径穿越/绝对路径/保留名等）|
 | `E_PATH_CONFLICT` | 同一传输内多个文件规范化后落盘路径相同 |
 | `E_UNSUPPORTED_FILE_TYPE` | 文件类型不在 MVP 允许范围（如符号链接、设备文件）|
+| `E_REQUEST_EXPIRED` | （预留）接收侧通知已过期后触发的无效操作 |
+| `E_SIZE_POLICY` | （预留）超出自动接收体积策略阈值 |
 
 错误码发射规则（强制）：
 1. 发送新事件时，必须优先使用新码：`E_REJECTED_BY_PEER`、`E_CANCELLED_BY_SENDER`、`E_CANCELLED_BY_RECEIVER`。
 2. 旧码 `E_REJECTED`、`E_CANCELLED` 仅用于**入站兼容解析**，不得作为新实现默认出站码。
+3. 预留码（如 `E_REQUEST_EXPIRED`、`E_SIZE_POLICY`）仅在对应功能落地后出站；MVP 默认不主动发射。
 
 ### 5.1 rel_path 安全规则（接收端强制执行）
 
@@ -361,6 +365,11 @@ cert_fp = SHA256(peer_tls_cert.public_key_der)
 | BLE 发现 | 替换/补充发现层，Hello 握手在连接层，天然兼容 |
 | 手动添加（IP:port）| 已纳入 M1：先连接并展示 fp 人工核验，确认后进入 PendingAccept |
 | 中继模式 | 新增 `relay` 连接类型，数据仍 E2E 加密 |
+
+补充（目标态预留，默认实现未启用）：
+1. `FileItem` 可新增可选字段 `risk_class`（`high|normal`），用于接收策略决策；老版本可忽略。
+2. 通知动作需绑定 `transfer_id + notification_id`，任务终态/超时后点击动作返回 `E_REQUEST_EXPIRED`。
+3. 断点恢复前需校验 `source_snapshot`（`size`、`mtime`、`head_hash`）；不一致时放弃旧进度并整文件重传。
 
 ---
 
