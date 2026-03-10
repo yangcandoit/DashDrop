@@ -59,11 +59,11 @@
 - [ ] 固化 SoftAP 安全与交互策略（一次一密凭据、用户显式同意、单网卡风险提示）。
 - [ ] 固化通知权限降级路径（托盘角标 + 前台 pending 队列），禁止“通知被禁用即静默超时”。
 - [ ] 固化跨 VLAN/子网边界提示策略（默认不支持自动发现，UI 指引 connect-by-address）。
-- [ ] 固化 Windows 防火墙策略：QUIC 固定端口 `53319/udp` 优先 + 端口占用时 fallback 随机端口 + 安装期/首次提权规则引导。
-- [ ] 固化通知生命周期：超时/取消/终态时强制撤回通知，过期点击统一返回 `E_REQUEST_EXPIRED`。
-- [ ] 固化断点恢复一致性：恢复前校验 `source_snapshot(size/mtime/head_hash)`，不一致必须整文件重传。
+- [x] 固化 Windows 防火墙策略：QUIC 固定端口 `53319/udp` 优先 + 端口占用时 fallback 随机端口 + 诊断输出 `listener_port_mode/firewall_rule_state` 已落地；安装期/首次提权引导仍见 P2 文档项。
+- [x] 固化通知生命周期：超时/取消/终态时强制撤回通知，过期点击统一返回 `E_REQUEST_EXPIRED`。
+- [x] 固化断点恢复一致性：恢复前校验 `source_snapshot(size/mtime/head_hash)`，不一致必须整文件重传。
 - [ ] 固化进度持久化写盘策略：SQLite 批量落盘（时间窗或字节窗）、WAL、单写线程。
-- [ ] 固化能耗与隐私策略：电源状态驱动广播降频、休眠前暂停/唤醒恢复、BLE rolling identifier。
+- [~] 固化能耗与隐私策略（**已实现电源状态驱动的 beacon 降频与诊断暴露；休眠联动与 BLE rolling identifier 仍未完成**）。
 - [ ] 明确 BLE 能力落地阶段（探测基线与凭据胶囊分发）及无 BLE 回退链路（二维码/短码）。
 
 ### 1. 产品功能完整度

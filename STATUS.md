@@ -1,10 +1,10 @@
 # DashDrop Status
 
-Last updated: 2026-03-10
+Last updated: 2026-03-11
 
 ## Overall
 
-Project is stable on the current single-process Tauri architecture, with discovery/transfer/security contracts implemented and validated locally.
+Project is stable on the current single-process Tauri architecture, with discovery/transfer/security contracts implemented and the A-E feature sequence integrated on `main`.
 
 Estimated completion:
 - Core product hardening (state contract + reliability): 95%+
@@ -57,6 +57,11 @@ Estimated completion:
 - Incoming handshake now emits `fingerprint_changed` (and audits it) when a trusted previous fp is replaced by cert fp on the same observed session context.
 - `fingerprint_changed` now has dedupe/anti-noise behavior (session+fingerprint tuple cooldown) to avoid repeated warning floods.
 - Sender/receiver/handshake key paths now include structured tracing fields (`transfer_id`, `peer_fp`, `phase`, `reason`).
+- Discovery beacon cadence now adapts to power profile and exports diagnostics fields for current power mode and interval selection.
+- Resume now validates persisted `source_snapshot(size/mtime/head_hash)` before reuse and logs `resume_source_changed` when it must restart from scratch.
+- Incoming request notifications now expire cleanly, retract stale actions, and return `E_REQUEST_EXPIRED` on late accept/reject clicks.
+- QUIC listener now prefers fixed `53319/udp`, falls back to a random port only when necessary, and exposes `listener_port_mode` plus `firewall_rule_state`.
+- Transfer history/event payloads now support optional `batch_id` for grouped transfers without renaming any terminal events.
 
 ### Frontend (Vue/TS)
 - Store event projection refactored for strict incoming/active-transfer handoff.
@@ -135,6 +140,7 @@ Estimated completion:
   - source snapshot validation before resume (`size/mtime/head_hash`),
   - SQLite progress write coalescing (batch flush + WAL single writer),
   - power-aware beacon policy and BLE rolling identifiers.
+- `main` now already implements the first four items above inside the current single-process architecture; BLE assist / rolling identifiers remain target-state only.
 - Daemon split, local IPC auth model, system share entry, BLE assist, and Wi-Fi direct link manager are not part of the current shipped architecture.
 - Current production baseline remains: single-process app + mDNS/beacon + QUIC transfer + diagnostics.
 
@@ -150,7 +156,7 @@ Estimated completion:
 
 ## Validation snapshot
 
-Latest local validations:
+Latest local validations (2026-03-11):
 - `cargo check` passed
 - `cargo test` passed
 - `npm run build` passed

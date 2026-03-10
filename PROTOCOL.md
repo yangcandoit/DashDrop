@@ -8,7 +8,7 @@
 > - **发现层与连接层身份关联**：发送端对目标 fp 做证书强绑定；接收端对 mDNS/TLS 不一致先告警审计（当前实现）
 > - **速率限制改为基于 fingerprint**，IP 在多网卡/IPv6 场景下不可靠
 
-> **实现状态快照（2026-03-10）**：
+> **实现状态快照（2026-03-11）**：
 > - 已落地：`transfer_started / transfer_incoming / transfer_accepted / transfer_progress` 进行中事件。
 > - 已落地：`transfer_complete / transfer_partial / transfer_rejected / transfer_cancelled_by_sender / transfer_cancelled_by_receiver / transfer_failed` 终态事件。
 > - 已落地：`transfer_progress` 不递增 revision，revision 仅在状态跃迁递增。
@@ -16,9 +16,10 @@
 > - 已落地：sender `Accept/Reject` 超时控制、`USER_RESPONSE_TIMEOUT_SECS=60`、目录 `Complete/Ack` 生命周期、`reason_code` 协议编码、fingerprint 限流、probe close `0xD0`。
 > - 已落地：接收端冲突策略执行（覆盖/重命名/跳过）与并发流上限配置接线（运行时可配）。
 > - 已落地：partial 结果失败项可被发送端按文件级重试（无需整任务重发）。
+> - 已落地：通知过期动作返回 `E_REQUEST_EXPIRED`，恢复前执行 `source_snapshot(size/mtime/head_hash)` 一致性校验，固定端口优先与防火墙状态诊断接线，以及可选 `batch_id` 扩展字段。
 > - 已落地：工程门禁与发布自动化（CI + clippy、security audit、Code Scanning default setup、installers/release checksum）；协议行为不变，仅增强交付质量。
 > - 部分待补：协议文档中的“真实端到端集成测试要求”尚未完全达成（当前为单测+契约测试增强）。
-> - 目标态预留：AirDrop-like 设计中的 `risk_class`、`E_REQUEST_EXPIRED`、`E_SIZE_POLICY`、恢复前 `source_snapshot` 校验等能力，当前仅作为预留规范，默认实现未启用。
+> - 目标态预留：AirDrop-like 设计中的 `risk_class`、`E_SIZE_POLICY`、daemon/system share/BLE assist 等能力，当前仍未启用。
 
 ---
 
@@ -156,16 +157,20 @@ Sender                              Receiver
 - 不得将 `PartialSuccess` 静默归并为成功或失败
 - `transfer_failed` 仅用于“零成功”的传输
 
-### 4.2 断点续传（MVP 不实现）
+### 4.2 断点恢复一致性
 
-**原因**：
-1. `ChunkPayload` 不含块级哈希，接收端无法判断已有块是否正确
-2. 重连后进程状态已丢失，无持久化块清单
-3. 正确实现需：持久化 `(transfer_id, file_id, chunk_id)` + 块级哈希 + 原子写入
+**当前实现**：
+1. `FileItem` 可携带可选 `source_snapshot { size, mtime, head_hash }`。
+2. 发送端在恢复前会比对持久化快照与当前源文件快照。
+3. 任一字段不一致时，必须丢弃旧进度并整文件重传，同时记录 `resume_source_changed` 诊断事件。
 
-**v0.2 目标**：补充块级哈希字段、持久化至本地 SQLite，再实现断点续传。
+**仍未实现**：
+1. 块级哈希验证与块清单持久化。
+2. 崩溃恢复后的块级继续发送。
 
-**MVP 行为**：传输中断后须重新发送整个文件。
+**兼容规则**：
+1. `source_snapshot` 为可选字段，老版本可忽略。
+2. 未提供 `source_snapshot` 时，发送端按“从头发送”或复用现有策略回退，不得破坏旧对端解析。
 
 ---
 
@@ -188,13 +193,13 @@ Sender                              Receiver
 | `E_INVALID_PATH` | `rel_path` 未通过安全校验（路径穿越/绝对路径/保留名等）|
 | `E_PATH_CONFLICT` | 同一传输内多个文件规范化后落盘路径相同 |
 | `E_UNSUPPORTED_FILE_TYPE` | 文件类型不在 MVP 允许范围（如符号链接、设备文件）|
-| `E_REQUEST_EXPIRED` | （预留）接收侧通知已过期后触发的无效操作 |
+| `E_REQUEST_EXPIRED` | 接收侧通知已过期后触发的无效操作 |
 | `E_SIZE_POLICY` | （预留）超出自动接收体积策略阈值 |
 
 错误码发射规则（强制）：
 1. 发送新事件时，必须优先使用新码：`E_REJECTED_BY_PEER`、`E_CANCELLED_BY_SENDER`、`E_CANCELLED_BY_RECEIVER`。
 2. 旧码 `E_REJECTED`、`E_CANCELLED` 仅用于**入站兼容解析**，不得作为新实现默认出站码。
-3. 预留码（如 `E_REQUEST_EXPIRED`、`E_SIZE_POLICY`）仅在对应功能落地后出站；MVP 默认不主动发射。
+3. 预留码当前仅包括 `E_SIZE_POLICY` 等未启用能力；已落地功能可正常出站 `E_REQUEST_EXPIRED`。
 
 ### 5.1 rel_path 安全规则（接收端强制执行）
 
@@ -359,7 +364,7 @@ cert_fp = SHA256(peer_tls_cert.public_key_der)
 
 | 功能 | 扩展方式 |
 |------|----------|
-| 断点续传 | v0.2：ChunkPayload 补块级哈希 + SQLite 持久化块清单 |
+| 断点续传 | 当前已实现 `source_snapshot` 一致性校验；v0.2+ 再补块级哈希 + SQLite 块清单 |
 | 带外验证（二维码配对）| v0.2：生成配对码，解决首次配对 MITM |
 | 剪贴板同步 | 新增 `caps=clipboard`，新消息类型 `ClipboardSync` |
 | BLE 发现 | 替换/补充发现层，Hello 握手在连接层，天然兼容 |
@@ -368,8 +373,8 @@ cert_fp = SHA256(peer_tls_cert.public_key_der)
 
 补充（目标态预留，默认实现未启用）：
 1. `FileItem` 可新增可选字段 `risk_class`（`high|normal`），用于接收策略决策；老版本可忽略。
-2. 通知动作需绑定 `transfer_id + notification_id`，任务终态/超时后点击动作返回 `E_REQUEST_EXPIRED`。
-3. 断点恢复前需校验 `source_snapshot`（`size`、`mtime`、`head_hash`）；不一致时放弃旧进度并整文件重传。
+2. daemon/system share 路径上的通知动作仍需沿用 `transfer_id + notification_id` 绑定约束。
+3. 后续若补块级恢复，仍需以 `source_snapshot` 通过后才允许复用旧进度。
 
 ---
 

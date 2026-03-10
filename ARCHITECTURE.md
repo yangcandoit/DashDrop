@@ -5,7 +5,7 @@
 > **文档版本**：v0.4（2026-03）
 > **主要修订**：五区 IA 与非阻塞接收模型、TransferStatus 与终态事件映射统一、接收方 Cancel 语义对齐、TransferHistoryEntry 与持久化约束、TrustedPeer/AppConfig 结构补全、Reachable Probe 归属与线协议约束
 
-> **实现状态快照（2026-03-10）**：
+> **实现状态快照（2026-03-11）**：
 > - 已实现：DTO 边界（`DeviceView/SessionView/TransferView`）、`transfer_accepted`、终态事件统一映射、`revision` 仅状态跃迁递增。
 > - 已实现：CI 门禁（`cargo check`、`cargo clippy --all-targets --all-features`、`cargo test`、`npm run build`、`npm run test:e2e`）。
 > - 已实现：GitHub 安全与发布自动化（`security-audit`、Code Scanning default setup、`Dependabot`、installers + checksums 上传）。
@@ -16,6 +16,8 @@
 > - 已实现：前端任务管理增强（批量取消、发送任务重试）、配对别名与最近使用时间展示。
 > - 已实现：partial 终态失败项按文件级重试（基于 `failed_file_ids` 与源路径映射）。
 > - 已实现：配置/信任持久化收口 SQLite（legacy `state.json` 仅迁移读取）。
+> - 已实现：固定 QUIC 端口优先（`53319/udp`）+ fallback 随机端口，运行时暴露 `listener_port_mode` 与 `firewall_rule_state`。
+> - 已实现：通知过期撤回与 `E_REQUEST_EXPIRED` 闭环、恢复前 `source_snapshot` 一致性校验、可选 `batch_id` 分组字段，以及电源状态驱动的 beacon 节流诊断。
 > - 未完成：真实双端 QUIC 多机编排压测（当前仍以合同测试+UI mock E2E 为主）。
 > - 说明：本文中若出现与代码细节不一致的结构定义，以 `src-tauri/src/*.rs` 与 `src/*.ts` 的当前实现为准。
 
@@ -66,11 +68,11 @@ DashDrop 是一个**单进程 Tauri 应用**。后端逻辑运行在 Rust 异步
 ### 1.2 当前实现与目标态差异（文档对齐）
 
 为避免“当前实现文档”和 AirDrop-like 目标文档混淆，以下差异明确保留：
-1. 当前 QUIC 监听端口为运行时动态端口；目标态优先固定 `53319/udp`（占用时再回退随机端口）。
-2. 当前通知链路不承担系统通知过期撤回与 `E_REQUEST_EXPIRED` 完整闭环；目标态要求强制闭环。
-3. 当前 MVP 不实现断点续传；目标态要求恢复前执行 `source_snapshot(size/mtime/head_hash)` 一致性校验。
+1. 当前单进程实现已优先监听固定 `53319/udp`，占用时才回退随机端口；目标态仍要求安装期/首次提权防火墙引导与 daemon 常驻化。
+2. 当前应用内通知链路已经处理过期撤回与 `E_REQUEST_EXPIRED`；目标态还要求系统分享入口与 daemon 路径沿用同一闭环语义。
+3. 当前恢复路径已执行 `source_snapshot(size/mtime/head_hash)` 一致性校验；目标态仍要求块级恢复与批量写盘策略。
 4. 当前为单进程 Tauri；目标态为 daemon + 本地 IPC（Unix socket / Named Pipe）。
-5. 当前主路径仍以 1:1 传输为核心；目标态要求 batch 级 1:N 调度与单读多发扇出能力。
+5. 当前已支持 `batch_id` 分组和逐目标状态/重试，但尚未实现 daemon 调度的 1:N 单读多发扇出。
 
 ---
 

@@ -604,7 +604,8 @@ impl AppState {
 mod tests {
     use super::{
         default_firewall_rule_state, default_listener_port_mode, AppConfig, AppState, DeviceInfo,
-        Platform, ReachabilityStatus, SessionInfo, TransferDirection, TransferStatus, TransferTask,
+        FileConflictStrategy, Platform, ReachabilityStatus, SessionInfo, TransferDirection,
+        TransferStatus, TransferTask,
     };
     use crate::crypto::Identity;
     use serde_json::json;
@@ -697,6 +698,20 @@ mod tests {
     fn runtime_status_defaults_are_backward_safe() {
         assert_eq!(default_listener_port_mode(), "fallback_random");
         assert_eq!(default_firewall_rule_state(), "unknown");
+    }
+
+    #[test]
+    fn app_config_deserializes_legacy_payload_with_safe_defaults() {
+        let config: AppConfig = serde_json::from_value(json!({
+            "device_name": "DashDrop Legacy",
+            "auto_accept": true,
+            "download_dir": null
+        }))
+        .expect("legacy config should deserialize");
+
+        assert!(config.auto_accept_trusted_only);
+        assert_eq!(config.file_conflict_strategy, FileConflictStrategy::Rename);
+        assert_eq!(config.max_parallel_streams, 4);
     }
 
     #[test]
