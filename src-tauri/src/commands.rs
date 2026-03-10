@@ -920,6 +920,56 @@ pub async fn get_runtime_status(
 }
 
 #[tauri::command]
+pub async fn get_discovery_diagnostics(
+    state: AppStateRef<'_>,
+) -> Result<serde_json::Value, String> {
+    let runtime = state.runtime_status().await;
+    let mdns_service_fullname = state.mdns_service_fullname.read().await.clone();
+    let mdns_daemon_initialized = state.mdns.get().is_some();
+    let devices = state.devices.read().await;
+
+    let device_rows: Vec<serde_json::Value> = devices
+        .values()
+        .map(|d| {
+            let mut sessions: Vec<serde_json::Value> = d
+                .sessions
+                .values()
+                .map(|s| {
+                    serde_json::json!({
+                        "session_id": s.session_id,
+                        "last_seen_unix": s.last_seen_unix,
+                        "addrs": s.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            sessions.sort_by_key(|s| {
+                std::cmp::Reverse(s["last_seen_unix"].as_u64().unwrap_or_default())
+            });
+            serde_json::json!({
+                "fingerprint": d.fingerprint,
+                "name": d.name,
+                "platform": d.platform,
+                "trusted": d.trusted,
+                "reachability": d.reachability,
+                "probe_fail_count": d.probe_fail_count,
+                "last_probe_at": d.last_probe_at,
+                "last_seen": d.last_seen,
+                "session_count": d.sessions.len(),
+                "sessions": sessions,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "runtime": runtime,
+        "mdns_daemon_initialized": mdns_daemon_initialized,
+        "mdns_service_fullname": mdns_service_fullname,
+        "device_count": device_rows.len(),
+        "devices": device_rows,
+    }))
+}
+
+#[tauri::command]
 pub async fn get_transfer_metrics(
     state: AppStateRef<'_>,
 ) -> Result<crate::state::TransferMetrics, String> {

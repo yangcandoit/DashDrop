@@ -22,6 +22,7 @@ import type {
   SecurityEvent,
   AppConfig,
   RuntimeStatus,
+  DiscoveryDiagnostics,
   TransferMetrics,
 } from "./types";
 
@@ -158,6 +159,10 @@ export async function getSecurityEvents(limit = 50, offset = 0): Promise<Securit
 
 export async function getRuntimeStatus(): Promise<RuntimeStatus> {
   return invokeCommand("get_runtime_status");
+}
+
+export async function getDiscoveryDiagnostics(): Promise<DiscoveryDiagnostics> {
+  return invokeCommand("get_discovery_diagnostics");
 }
 
 export async function getTransferMetrics(): Promise<TransferMetrics> {

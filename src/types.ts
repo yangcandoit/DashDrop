@@ -209,6 +209,29 @@ export interface RuntimeStatus {
   trusted_devices: number;
 }
 
+export interface DiscoveryDiagnostics {
+  runtime: RuntimeStatus;
+  mdns_daemon_initialized: boolean;
+  mdns_service_fullname?: string | null;
+  device_count: number;
+  devices: Array<{
+    fingerprint: string;
+    name: string;
+    platform: Platform;
+    trusted: boolean;
+    reachability: ReachabilityStatus;
+    probe_fail_count: number;
+    last_probe_at?: number | null;
+    last_seen: number;
+    session_count: number;
+    sessions: Array<{
+      session_id: string;
+      last_seen_unix: number;
+      addrs: string[];
+    }>;
+  }>;
+}
+
 export interface TransferMetrics {
   completed: number;
   partial: number;

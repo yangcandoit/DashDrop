@@ -2,6 +2,7 @@
 import { ref, onMounted } from 'vue';
 import {
   getAppConfig,
+  getDiscoveryDiagnostics,
   getLocalIdentity,
   getRuntimeStatus,
   getSecurityPosture,
@@ -71,6 +72,16 @@ async function copyFingerprint() {
     await navigator.clipboard.writeText(fingerprint.value);
   } catch (e) {
     console.error('Failed to copy', e);
+  }
+}
+
+async function copyDiscoveryDiagnostics() {
+  try {
+    const diagnostics = await getDiscoveryDiagnostics();
+    await navigator.clipboard.writeText(JSON.stringify(diagnostics, null, 2));
+    await message('Discovery diagnostics copied to clipboard.', { title: 'Copied', kind: 'info' });
+  } catch (e: unknown) {
+    await message(String(e), { title: 'Copy Diagnostics Failed', kind: 'error' });
   }
 }
 
@@ -198,6 +209,7 @@ async function save() {
       </div>
       <div class="actions">
         <button @click="loadRuntime" class="btn btn-secondary">Refresh Runtime</button>
+        <button @click="copyDiscoveryDiagnostics" class="btn btn-secondary">Copy Discovery Diagnostics</button>
         <button @click="save" class="btn btn-primary">Save Changes</button>
       </div>
     </main>
