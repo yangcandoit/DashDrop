@@ -30,25 +30,25 @@ async fn reject_control_stream(
 /// Called for each accepted incoming QUIC connection.
 /// Performs: cert fp binding → Hello exchange → route to receiver.
 pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppState>) -> Result<()> {
-    // 1. Extract peer TLS certificate fingerprint
-    let peer_cert_fp = extract_peer_fp(&conn)?;
+    // 1. Extract peer TLS certificate fingerprint if available.
+    // Current runtime accepts transfer clients without mandatory client-auth certs.
+    let peer_cert_fp = extract_peer_fp(&conn).ok();
 
-    if check_connection_rate_limit(&state, &peer_cert_fp)
-        .await
-        .is_some()
-    {
-        tracing::warn!(
-            peer_fp = %peer_cert_fp,
-            phase = "incoming",
-            "incoming connection rate limited"
-        );
-        conn.close(quinn::VarInt::from_u32(1), b"rate limited");
-        return Ok(());
+    if let Some(cert_fp) = peer_cert_fp.as_deref() {
+        if check_connection_rate_limit(&state, cert_fp).await.is_some() {
+            tracing::warn!(
+                peer_fp = %cert_fp,
+                phase = "incoming",
+                "incoming connection rate limited"
+            );
+            conn.close(quinn::VarInt::from_u32(1), b"rate limited");
+            return Ok(());
+        }
     }
 
     // 2. Auxiliary identity signal: compare against mDNS-by-IP and emit warning if mismatched.
     // Security decision is enforced by initiator-side fingerprint binding.
-    let mismatch = {
+    let mismatch = if let Some(cert_fp) = peer_cert_fp.as_deref() {
         let devices = state.devices.read().await;
         let mut found: Option<(String, String)> = None;
         for device in devices.values() {
@@ -59,7 +59,7 @@ pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppSta
                     .any(|a| a.ip() == conn.remote_address().ip())
                 {
                     // Found a matching mDNS device by IP
-                    if device.fingerprint != peer_cert_fp {
+                    if device.fingerprint != cert_fp {
                         found = Some((device.fingerprint.clone(), session.session_id.clone()));
                     }
                     break;
@@ -70,15 +70,18 @@ pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppSta
             }
         }
         found
+    } else {
+        None
     };
 
     if let Some((mdns_fp, session_id)) = mismatch {
         let remote_addr = conn.remote_address().to_string();
+        let cert_fp = peer_cert_fp.as_deref().unwrap_or("unknown");
         tracing::warn!(
             transfer_id = "",
             peer_fp = %mdns_fp,
             phase = "incoming",
-            cert_fp = %peer_cert_fp,
+            cert_fp = %cert_fp,
             "identity mismatch: mDNS fp != cert fp"
         );
         let _ = tauri::Emitter::emit(
@@ -87,7 +90,7 @@ pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppSta
             serde_json::json!({
                 "remote_addr": remote_addr,
                 "mdns_fp": mdns_fp.clone(),
-                "cert_fp": peer_cert_fp.clone(),
+                "cert_fp": cert_fp,
                 "phase": "incoming",
             }),
         );
@@ -102,13 +105,13 @@ pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppSta
         }
 
         let previous_trusted = state.is_trusted(&mdns_fp).await;
-        let current_trusted = state.is_trusted(&peer_cert_fp).await;
+        let current_trusted = state.is_trusted(cert_fp).await;
         if previous_trusted && !current_trusted {
             let now_unix = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let dedupe_key = format!("{session_id}|{mdns_fp}|{peer_cert_fp}");
+            let dedupe_key = format!("{session_id}|{mdns_fp}|{cert_fp}");
             let should_emit = {
                 let mut alerts = state.fingerprint_change_alerts.lock().await;
                 let last = alerts.get(&dedupe_key).copied().unwrap_or(0);
@@ -126,7 +129,7 @@ pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppSta
                     serde_json::json!({
                         "session_id": session_id.clone(),
                         "previous_fp": mdns_fp.clone(),
-                        "current_fp": peer_cert_fp.clone(),
+                        "current_fp": cert_fp,
                         "remote_addr": remote_addr,
                         "phase": "incoming",
                     }),
@@ -139,7 +142,7 @@ pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppSta
                         Some(&mdns_fp),
                         &format!(
                             "trusted fingerprint changed on session {}: previous={} current={}",
-                            session_id, mdns_fp, peer_cert_fp
+                            session_id, mdns_fp, cert_fp
                         ),
                     );
                 }
@@ -239,14 +242,36 @@ pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppSta
         }
     };
 
-    if let Some(reason) = check_offer_rate_limit(&state, &peer_cert_fp).await {
+    if offer.sender_fingerprint.trim().is_empty() {
+        let _ = reject_control_stream(
+            &mut send,
+            ErrorCode::Protocol("missing sender fingerprint in Offer".to_string()),
+            "incoming_offer_missing_sender_fp",
+        )
+        .await;
+        return Ok(());
+    }
+    if let Some(cert_fp) = peer_cert_fp.as_deref() {
+        if offer.sender_fingerprint != cert_fp {
+            let _ = reject_control_stream(
+                &mut send,
+                ErrorCode::IdentityMismatch,
+                "incoming_offer_sender_fp_mismatch",
+            )
+            .await;
+            return Ok(());
+        }
+    }
+
+    let peer_fp = offer.sender_fingerprint.clone();
+    if let Some(reason) = check_offer_rate_limit(&state, &peer_fp).await {
         let _ = reject_control_stream(&mut send, reason, "incoming_offer_rate_limit").await;
         return Ok(());
     }
 
     tracing::info!(
         transfer_id = %offer.transfer_id,
-        peer_fp = %peer_cert_fp,
+        peer_fp = %peer_fp,
         phase = "incoming_offer",
         sender_name = %offer.sender_name,
         item_count = offer.items.len(),
@@ -260,7 +285,8 @@ pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppSta
         conn,
         send,
         recv,
-        peer_cert_fp,
+        peer_fp,
+        peer_cert_fp.is_some(),
         chosen_version,
         app,
         state,

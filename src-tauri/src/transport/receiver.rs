@@ -123,6 +123,7 @@ pub async fn handle_offer(
     mut control_send: quinn::SendStream,
     mut _control_recv: quinn::RecvStream,
     peer_fp: String,
+    peer_authenticated: bool,
     chosen_version: u32,
     app: AppHandle,
     state: Arc<AppState>,
@@ -245,7 +246,10 @@ pub async fn handle_offer(
     );
 
     let auto_accept_enabled = state.config.read().await.auto_accept_trusted_only;
-    let (user_accepted, is_timeout) = if should_auto_accept(trusted, auto_accept_enabled) {
+    let (user_accepted, is_timeout) = if should_auto_accept(
+        trusted && peer_authenticated,
+        auto_accept_enabled,
+    ) {
         (true, false)
     } else {
         // Wait for user accept/reject
