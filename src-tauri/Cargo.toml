@@ -63,7 +63,7 @@ arboard = "3"
 security-framework = "3.7.0"
 
 [target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
-keyring = "2.3.3"
+keyring = "3.6.3"
 
 [profile.release]
 opt-level = "s"
