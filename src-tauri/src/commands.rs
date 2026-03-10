@@ -12,8 +12,16 @@ use tauri::{AppHandle, Emitter, State};
 
 type AppStateRef<'a> = State<'a, Arc<AppState>>;
 
-type PendingAcceptMap =
-    Arc<tokio::sync::RwLock<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>;
+const REQUEST_EXPIRED_CODE: &str = "E_REQUEST_EXPIRED";
+const REQUEST_EXPIRED_CAUSE: &str = "NotificationExpired";
+const REQUEST_EXPIRED_PHASE: &str = "notification_action";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncomingRequestActionState {
+    Pending,
+    Expired,
+    Missing,
+}
 
 fn classify_runtime_send_error(detail: &str) -> (&'static str, &'static str) {
     let s = detail.to_ascii_lowercase();
@@ -104,26 +112,145 @@ async fn persist_runtime_state(state: &Arc<AppState>) -> Result<(), String> {
     Ok(())
 }
 
-async fn accept_pending_transfer(
-    pending_accepts: &PendingAcceptMap,
-    transfer_id: &str,
-) -> Result<(), String> {
-    let tx = pending_accepts.write().await.remove(transfer_id);
+async fn accept_pending_transfer(state: &Arc<AppState>, transfer_id: &str) -> Result<(), String> {
+    match incoming_request_action_state(state, transfer_id).await {
+        IncomingRequestActionState::Expired => {
+            let _ = state.pending_accepts.write().await.remove(transfer_id);
+            state
+                .mark_incoming_request_notification_inactive(
+                    transfer_id,
+                    Some(REQUEST_EXPIRED_CODE),
+                )
+                .await;
+            return Err(REQUEST_EXPIRED_CODE.to_string());
+        }
+        IncomingRequestActionState::Missing => {
+            return Err(format!(
+                "transfer {transfer_id} not found or already handled"
+            ));
+        }
+        IncomingRequestActionState::Pending => {}
+    }
+
+    let tx = state.pending_accepts.write().await.remove(transfer_id);
     if let Some(sender) = tx {
+        state
+            .mark_incoming_request_notification_inactive(transfer_id, None)
+            .await;
         let _ = sender.send(true);
         Ok(())
     } else {
-        Err(format!(
-            "transfer {transfer_id} not found or already handled"
-        ))
+        match incoming_request_action_state(state, transfer_id).await {
+            IncomingRequestActionState::Expired => {
+                state
+                    .mark_incoming_request_notification_inactive(
+                        transfer_id,
+                        Some(REQUEST_EXPIRED_CODE),
+                    )
+                    .await;
+                Err(REQUEST_EXPIRED_CODE.to_string())
+            }
+            IncomingRequestActionState::Pending | IncomingRequestActionState::Missing => Err(
+                format!("transfer {transfer_id} not found or already handled"),
+            ),
+        }
     }
 }
 
-async fn reject_pending_transfer(pending_accepts: &PendingAcceptMap, transfer_id: &str) {
-    let tx = pending_accepts.write().await.remove(transfer_id);
-    if let Some(sender) = tx {
-        let _ = sender.send(false);
+async fn reject_pending_transfer(state: &Arc<AppState>, transfer_id: &str) -> Result<(), String> {
+    match incoming_request_action_state(state, transfer_id).await {
+        IncomingRequestActionState::Expired => {
+            let _ = state.pending_accepts.write().await.remove(transfer_id);
+            state
+                .mark_incoming_request_notification_inactive(
+                    transfer_id,
+                    Some(REQUEST_EXPIRED_CODE),
+                )
+                .await;
+            return Err(REQUEST_EXPIRED_CODE.to_string());
+        }
+        IncomingRequestActionState::Missing => return Ok(()),
+        IncomingRequestActionState::Pending => {}
     }
+
+    let tx = state.pending_accepts.write().await.remove(transfer_id);
+    if let Some(sender) = tx {
+        state
+            .mark_incoming_request_notification_inactive(transfer_id, None)
+            .await;
+        let _ = sender.send(false);
+        Ok(())
+    } else {
+        match incoming_request_action_state(state, transfer_id).await {
+            IncomingRequestActionState::Expired => {
+                state
+                    .mark_incoming_request_notification_inactive(
+                        transfer_id,
+                        Some(REQUEST_EXPIRED_CODE),
+                    )
+                    .await;
+                Err(REQUEST_EXPIRED_CODE.to_string())
+            }
+            IncomingRequestActionState::Pending | IncomingRequestActionState::Missing => Ok(()),
+        }
+    }
+}
+
+async fn incoming_request_action_state(
+    state: &Arc<AppState>,
+    transfer_id: &str,
+) -> IncomingRequestActionState {
+    let notification = state.incoming_request_notification(transfer_id).await;
+    let transfer_status = {
+        let transfers = state.transfers.read().await;
+        transfers.get(transfer_id).map(|task| task.status.clone())
+    };
+
+    match transfer_status {
+        Some(crate::state::TransferStatus::PendingAccept) => {
+            if notification
+                .as_ref()
+                .map(|entry| !entry.active)
+                .unwrap_or(false)
+            {
+                IncomingRequestActionState::Expired
+            } else {
+                IncomingRequestActionState::Pending
+            }
+        }
+        Some(_) => IncomingRequestActionState::Expired,
+        None => {
+            if notification
+                .as_ref()
+                .map(|entry| !entry.active)
+                .unwrap_or(false)
+            {
+                IncomingRequestActionState::Expired
+            } else if state.pending_accepts.read().await.contains_key(transfer_id) {
+                IncomingRequestActionState::Pending
+            } else {
+                IncomingRequestActionState::Missing
+            }
+        }
+    }
+}
+
+async fn emit_request_expired(app: &AppHandle, state: &Arc<AppState>, transfer_id: &str) {
+    let revision = {
+        let transfers = state.transfers.read().await;
+        transfers
+            .get(transfer_id)
+            .map(|task| task.revision)
+            .unwrap_or(0)
+    };
+    crate::transport::events::emit_transfer_error(
+        app,
+        Some(transfer_id),
+        REQUEST_EXPIRED_CODE,
+        REQUEST_EXPIRED_CAUSE,
+        REQUEST_EXPIRED_PHASE,
+        revision,
+    );
 }
 
 fn select_retry_paths(task: &crate::state::TransferTask) -> Result<Vec<String>, String> {
@@ -580,8 +707,16 @@ pub async fn connect_by_address(
 }
 
 #[tauri::command]
-pub async fn accept_transfer(transfer_id: String, state: AppStateRef<'_>) -> Result<(), String> {
-    accept_pending_transfer(&state.pending_accepts, &transfer_id).await
+pub async fn accept_transfer(
+    transfer_id: String,
+    app: AppHandle,
+    state: AppStateRef<'_>,
+) -> Result<(), String> {
+    let result = accept_pending_transfer(&state, &transfer_id).await;
+    if matches!(result.as_ref(), Err(err) if err == REQUEST_EXPIRED_CODE) {
+        emit_request_expired(&app, &state, &transfer_id).await;
+    }
+    result
 }
 
 #[tauri::command]
@@ -591,21 +726,29 @@ pub async fn accept_and_pair_transfer(
     app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<(), String> {
-    // Pair first
-    pair_device(sender_fp, app, State::clone(&state)).await?;
-    // Then accept
-    accept_transfer(transfer_id, state).await
+    accept_transfer(transfer_id, app.clone(), State::clone(&state)).await?;
+    pair_device(sender_fp, app, State::clone(&state)).await
 }
 
 #[tauri::command]
-pub async fn reject_transfer(transfer_id: String, state: AppStateRef<'_>) -> Result<(), String> {
-    reject_pending_transfer(&state.pending_accepts, &transfer_id).await;
-    Ok(())
+pub async fn reject_transfer(
+    transfer_id: String,
+    app: AppHandle,
+    state: AppStateRef<'_>,
+) -> Result<(), String> {
+    let result = reject_pending_transfer(&state, &transfer_id).await;
+    if matches!(result.as_ref(), Err(err) if err == REQUEST_EXPIRED_CODE) {
+        emit_request_expired(&app, &state, &transfer_id).await;
+    }
+    result
 }
 
 async fn cancel_transfer_inner(transfer_id: &str, app: &AppHandle, state: &Arc<AppState>) -> bool {
     let tx = state.pending_accepts.write().await.remove(transfer_id);
     if let Some(sender) = tx {
+        state
+            .mark_incoming_request_notification_inactive(transfer_id, Some("E_CANCELLED_BY_USER"))
+            .await;
         let _ = sender.send(false);
     }
     let mut cancelled = false;
@@ -747,28 +890,64 @@ mod diagnostics_tests {
 
     use crate::crypto::Identity;
     use crate::discovery::beacon::{BeaconCadence, PowerProfile};
-    use crate::state::AppConfig;
-    use crate::state::{FileItemMeta, TransferDirection, TransferStatus, TransferTask};
+    use crate::state::{AppConfig, FileItemMeta, TransferDirection, TransferStatus, TransferTask};
     use tokio::sync::oneshot;
-    use tokio::sync::RwLock;
 
     use super::{
-        accept_pending_transfer, build_discovery_diagnostics, reject_pending_transfer,
-        select_retry_paths,
+        accept_pending_transfer, build_discovery_diagnostics, incoming_request_action_state,
+        reject_pending_transfer, select_retry_paths, windows_non_admin_firewall_hint,
+        IncomingRequestActionState, REQUEST_EXPIRED_CODE,
     };
+
+    fn build_test_state() -> Arc<crate::state::AppState> {
+        let config_dir =
+            std::env::temp_dir().join(format!("dashdrop-commands-{}", uuid::Uuid::new_v4()));
+        let identity = Identity::load_or_create(&config_dir).expect("identity");
+        Arc::new(crate::state::AppState::new(
+            identity,
+            crate::state::AppConfig::default(),
+            rusqlite::Connection::open_in_memory().expect("db"),
+        ))
+    }
 
     #[tokio::test]
     async fn accept_pending_transfer_sends_true() {
-        let pending_accepts: Arc<RwLock<HashMap<String, oneshot::Sender<bool>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let state = build_test_state();
         let transfer_id = "transfer-accept".to_string();
         let (tx, rx) = oneshot::channel::<bool>();
-        pending_accepts
+        state
+            .pending_accepts
             .write()
             .await
             .insert(transfer_id.clone(), tx);
+        state.transfers.write().await.insert(
+            transfer_id.clone(),
+            TransferTask {
+                id: transfer_id.clone(),
+                direction: TransferDirection::Receive,
+                peer_fingerprint: "fp".into(),
+                peer_name: "peer".into(),
+                items: vec![],
+                status: TransferStatus::PendingAccept,
+                bytes_transferred: 0,
+                total_bytes: 0,
+                revision: 0,
+                started_at_unix: 1,
+                ended_at_unix: None,
+                terminal_reason_code: None,
+                error: None,
+                source_paths: None,
+                source_path_by_file_id: None,
+                failed_file_ids: None,
+                conn: None,
+                ended_at: None,
+            },
+        );
+        state
+            .ensure_incoming_request_notification(&transfer_id)
+            .await;
 
-        accept_pending_transfer(&pending_accepts, &transfer_id)
+        accept_pending_transfer(&state, &transfer_id)
             .await
             .expect("accept should succeed");
         let accepted = rx.await.expect("receiver should get value");
@@ -777,18 +956,91 @@ mod diagnostics_tests {
 
     #[tokio::test]
     async fn reject_pending_transfer_sends_false() {
-        let pending_accepts: Arc<RwLock<HashMap<String, oneshot::Sender<bool>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let state = build_test_state();
         let transfer_id = "transfer-reject".to_string();
         let (tx, rx) = oneshot::channel::<bool>();
-        pending_accepts
+        state
+            .pending_accepts
             .write()
             .await
             .insert(transfer_id.clone(), tx);
+        state.transfers.write().await.insert(
+            transfer_id.clone(),
+            TransferTask {
+                id: transfer_id.clone(),
+                direction: TransferDirection::Receive,
+                peer_fingerprint: "fp".into(),
+                peer_name: "peer".into(),
+                items: vec![],
+                status: TransferStatus::PendingAccept,
+                bytes_transferred: 0,
+                total_bytes: 0,
+                revision: 0,
+                started_at_unix: 1,
+                ended_at_unix: None,
+                terminal_reason_code: None,
+                error: None,
+                source_paths: None,
+                source_path_by_file_id: None,
+                failed_file_ids: None,
+                conn: None,
+                ended_at: None,
+            },
+        );
+        state
+            .ensure_incoming_request_notification(&transfer_id)
+            .await;
 
-        reject_pending_transfer(&pending_accepts, &transfer_id).await;
+        reject_pending_transfer(&state, &transfer_id)
+            .await
+            .expect("reject should succeed");
         let accepted = rx.await.expect("receiver should get value");
         assert!(!accepted);
+    }
+
+    #[tokio::test]
+    async fn expired_click_returns_request_expired_code() {
+        let state = build_test_state();
+        let transfer_id = "transfer-expired".to_string();
+        state.transfers.write().await.insert(
+            transfer_id.clone(),
+            TransferTask {
+                id: transfer_id.clone(),
+                direction: TransferDirection::Receive,
+                peer_fingerprint: "fp".into(),
+                peer_name: "peer".into(),
+                items: vec![],
+                status: TransferStatus::Rejected,
+                bytes_transferred: 0,
+                total_bytes: 0,
+                revision: 3,
+                started_at_unix: 1,
+                ended_at_unix: Some(2),
+                terminal_reason_code: Some("E_TIMEOUT".into()),
+                error: None,
+                source_paths: None,
+                source_path_by_file_id: None,
+                failed_file_ids: None,
+                conn: None,
+                ended_at: None,
+            },
+        );
+        state
+            .ensure_incoming_request_notification(&transfer_id)
+            .await;
+        state
+            .mark_incoming_request_notification_inactive(&transfer_id, Some("E_TIMEOUT"))
+            .await;
+
+        assert_eq!(
+            incoming_request_action_state(&state, &transfer_id).await,
+            IncomingRequestActionState::Expired
+        );
+
+        let err = accept_pending_transfer(&state, &transfer_id)
+            .await
+            .expect_err("expired request should fail");
+        assert_eq!(err, REQUEST_EXPIRED_CODE);
     }
 
     #[test]
@@ -909,6 +1161,51 @@ mod diagnostics_tests {
                 .map(|value| value.contains("discovery latency is intentionally relaxed"))
                 .unwrap_or(false)
         }));
+    }
+
+    #[tokio::test]
+    async fn discovery_diagnostics_exposes_listener_port_and_firewall_state() {
+        let state = Arc::new(crate::state::AppState::new(
+            Identity {
+                fingerprint: "self-fp".into(),
+                cert_der: Vec::new(),
+                key_der: Vec::new(),
+                device_name: "Windows Host".into(),
+            },
+            AppConfig::default(),
+            rusqlite::Connection::open_in_memory().expect("in-memory db"),
+        ));
+        *state.local_port.write().await = 54001;
+        *state.listener_port_mode.write().await = "fallback_random".to_string();
+        *state.firewall_rule_state.write().await = "user_scope_unmanaged".to_string();
+
+        let diagnostics = build_discovery_diagnostics(
+            &state,
+            BeaconCadence {
+                power_profile: PowerProfile::Balanced,
+                interval_secs: 3,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            diagnostics["runtime"]["listener_port_mode"],
+            "fallback_random"
+        );
+        assert_eq!(
+            diagnostics["runtime"]["firewall_rule_state"],
+            "user_scope_unmanaged"
+        );
+        assert_eq!(diagnostics["listener_port_mode"], "fallback_random");
+        assert_eq!(diagnostics["firewall_rule_state"], "user_scope_unmanaged");
+    }
+
+    #[test]
+    fn windows_non_admin_hint_mentions_manual_firewall_steps() {
+        let hint = windows_non_admin_firewall_hint(54001, "fallback_random");
+        assert!(hint.contains("Windows Defender Firewall"));
+        assert!(hint.contains("53319"));
+        assert!(hint.contains("54001"));
     }
 }
 
@@ -1052,6 +1349,148 @@ pub async fn get_runtime_status(
     Ok(state.runtime_status().await)
 }
 
+struct DiscoveryQuickHintContext<'a> {
+    own_platform: &'a str,
+    mdns_daemon_initialized: bool,
+    browser_active: bool,
+    browser_restart_count: u64,
+    search_started_events: u64,
+    resolved_events: u64,
+    reachable_devices: usize,
+    listener_mode: &'a str,
+    listener_port_mode: &'a str,
+    firewall_rule_state: &'a str,
+    local_port: u16,
+    ipv6_only_candidates: usize,
+    resolved_no_usable_addrs: u64,
+    scope_less_link_local_peers: usize,
+    stale_session_pruned: u64,
+    beacon_sent: u64,
+    beacon_received: u64,
+    device_rows_empty: bool,
+    self_filtered: u64,
+    resolved_missing_fp_txt: u64,
+}
+
+fn windows_non_admin_firewall_hint(local_port: u16, listener_port_mode: &str) -> String {
+    if listener_port_mode == "fallback_random" && local_port > 0 && local_port != 53319 {
+        format!(
+            "DashDrop is running without Windows administrator rights, so firewall rules were not managed automatically. Allow the Windows Defender Firewall prompt if shown, or manually add inbound UDP allow rules for DashDrop and ports 53319 and {local_port}."
+        )
+    } else {
+        "DashDrop is running without Windows administrator rights, so firewall rules were not managed automatically. Allow the Windows Defender Firewall prompt if shown, or manually add an inbound UDP allow rule for DashDrop and port 53319.".to_string()
+    }
+}
+
+fn build_discovery_quick_hints(ctx: &DiscoveryQuickHintContext<'_>) -> Vec<String> {
+    let mut quick_hints = Vec::new();
+    if !ctx.mdns_daemon_initialized {
+        quick_hints.push(
+            "Local mDNS responder is not fully initialized; this device may not be discoverable."
+                .to_string(),
+        );
+    }
+    if !ctx.browser_active {
+        quick_hints.push(
+            "mDNS browser is currently inactive and auto-restarting; discovery may be temporarily stale."
+                .to_string(),
+        );
+    }
+    if ctx.search_started_events == 0 && ctx.browser_restart_count == 0 {
+        quick_hints.push(
+            "mDNS browser has not reported SearchStarted; check local-network permission and multicast interface availability."
+                .to_string(),
+        );
+    } else if ctx.resolved_events == 0 {
+        quick_hints.push(
+            "No peers resolved from mDNS browse yet; likely multicast traffic is blocked across firewall/VLAN/subnet."
+                .to_string(),
+        );
+    }
+    if ctx.resolved_events > 0 && ctx.reachable_devices == 0 {
+        quick_hints.push(
+            "Peers were discovered but none are probe-reachable; verify firewall rules for UDP listener port and QUIC traffic."
+                .to_string(),
+        );
+    }
+    if ctx.listener_port_mode == "fallback_random" && ctx.local_port > 0 {
+        quick_hints.push(format!(
+            "Preferred QUIC port 53319 is unavailable on this host, so DashDrop is listening on UDP {} for this session.",
+            ctx.local_port
+        ));
+    }
+    if ctx.listener_mode == "ipv4_only_fallback" {
+        quick_hints.push(
+            "Listener is running in IPv4-only fallback mode; IPv6-only peers may fail to connect."
+                .to_string(),
+        );
+        if ctx.ipv6_only_candidates > 0 {
+            quick_hints.push(
+                "Some discovered peers currently advertise IPv6-only candidate addresses while listener is IPv4-only."
+                    .to_string(),
+            );
+        }
+    }
+    if ctx.resolved_no_usable_addrs > 0 {
+        quick_hints.push(
+            "Some peers resolved without usable addresses; inspect virtual adapters/VPN interfaces and peer IP advertisement."
+                .to_string(),
+        );
+    }
+    if ctx.scope_less_link_local_peers > 0 {
+        quick_hints.push(
+            "Some peers are advertising scope-less IPv6 link-local addresses (fe80:: without interface scope); these are often not connectable across platforms."
+                .to_string(),
+        );
+    }
+    if ctx.stale_session_pruned > 0 {
+        quick_hints.push(
+            "Stale discovery sessions were pruned locally; if peers keep flapping, compare diagnostics from both ends for mDNS remove/resolved parity."
+                .to_string(),
+        );
+    }
+    if ctx.beacon_sent > 0 && ctx.beacon_received == 0 && ctx.resolved_events == 0 {
+        quick_hints.push(
+            "No inbound discovery packets seen from mDNS or UDP beacon; check AP isolation, VLAN segmentation, or host firewall multicast/broadcast rules."
+                .to_string(),
+        );
+    } else if ctx.beacon_received > 0 && ctx.resolved_events == 0 {
+        quick_hints.push(
+            "UDP beacon fallback is receiving peers while mDNS is silent; mDNS multicast is likely blocked on this network."
+                .to_string(),
+        );
+    }
+    if ctx.resolved_events > 0 && ctx.device_rows_empty && ctx.self_filtered >= ctx.resolved_events
+    {
+        quick_hints.push(
+            "mDNS resolved only self-advertisements on this host; no remote DashDrop peers observed."
+                .to_string(),
+        );
+    }
+    if ctx.resolved_missing_fp_txt > 0 {
+        quick_hints.push(
+            "Some _dashdrop records were missing fp TXT; verify both peers run compatible builds and advertise required TXT keys."
+                .to_string(),
+        );
+    }
+    if ctx.own_platform == "Windows" {
+        match ctx.firewall_rule_state {
+            "user_scope_unmanaged" => {
+                quick_hints.push(windows_non_admin_firewall_hint(
+                    ctx.local_port,
+                    ctx.listener_port_mode,
+                ));
+            }
+            "unknown" => quick_hints.push(
+                "Windows firewall rule state is unknown. If peers cannot reach this device, allow DashDrop through Windows Defender Firewall or add an inbound UDP rule for the active listener port."
+                    .to_string(),
+            ),
+            _ => {}
+        }
+    }
+    quick_hints
+}
+
 #[tauri::command]
 pub async fn copy_to_clipboard(text: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
@@ -1080,6 +1519,7 @@ async fn build_discovery_diagnostics(
     beacon_cadence: crate::discovery::beacon::BeaconCadence,
 ) -> serde_json::Value {
     let runtime = state.runtime_status().await;
+    let own_platform = Platform::current();
     let mdns_service_fullname = state.mdns_service_fullname.read().await.clone();
     let mdns_interface_policy = state.mdns_interface_policy.read().await.clone();
     let mdns_enabled_interfaces = state.mdns_enabled_interfaces.read().await.clone();
@@ -1090,6 +1530,8 @@ async fn build_discovery_diagnostics(
     let discovery_failure_counts = state.discovery_failure_counts_snapshot().await;
     let browser_status = state.browser_status_snapshot().await;
     let listener_mode = state.listener_mode.read().await.clone();
+    let listener_port_mode = state.listener_port_mode.read().await.clone();
+    let firewall_rule_state = state.firewall_rule_state.read().await.clone();
     let listener_addrs = state.listener_addrs.read().await.clone();
     let network_interfaces = collect_network_interfaces();
     let devices = state.devices.read().await;
@@ -1139,108 +1581,41 @@ async fn build_discovery_diagnostics(
     let local_instance_name = mdns_service_fullname
         .as_ref()
         .and_then(|s| s.split('.').next().map(|part| part.to_string()));
-    let mut quick_hints = Vec::new();
-    if !mdns_daemon_initialized || mdns_service_fullname.is_none() {
-        quick_hints.push(
-            "Local mDNS responder is not fully initialized; this device may not be discoverable."
-                .to_string(),
-        );
-    }
-    if !browser_status.active {
-        quick_hints.push(
-            "mDNS browser is currently inactive and auto-restarting; discovery may be temporarily stale."
-                .to_string(),
-        );
-    }
-    if search_started_events == 0 && browser_status.restart_count == 0 {
-        quick_hints.push(
-            "mDNS browser has not reported SearchStarted; check local-network permission and multicast interface availability."
-                .to_string(),
-        );
-    } else if resolved_events == 0 {
-        quick_hints.push(
-            "No peers resolved from mDNS browse yet; likely multicast traffic is blocked across firewall/VLAN/subnet."
-                .to_string(),
-        );
-    }
-    if resolved_events > 0 && reachable_devices == 0 {
-        quick_hints.push(
-            "Peers were discovered but none are probe-reachable; verify firewall rules for UDP listener port and QUIC traffic."
-                .to_string(),
-        );
-    }
-    if listener_mode == "ipv4_only_fallback" {
-        quick_hints.push(
-            "Listener is running in IPv4-only fallback mode; IPv6-only peers may fail to connect."
-                .to_string(),
-        );
-        if ipv6_only_candidates > 0 {
-            quick_hints.push(
-                "Some discovered peers currently advertise IPv6-only candidate addresses while listener is IPv4-only."
-                    .to_string(),
-            );
-        }
-    }
-    if discovery_failure_counts
-        .get("resolved_no_usable_addrs")
-        .copied()
-        .unwrap_or_default()
-        > 0
-    {
-        quick_hints.push(
-            "Some peers resolved without usable addresses; inspect virtual adapters/VPN interfaces and peer IP advertisement."
-                .to_string(),
-        );
-    }
-    if scope_less_link_local_peers > 0 {
-        quick_hints.push(
-            "Some peers are advertising scope-less IPv6 link-local addresses (fe80:: without interface scope); these are often not connectable across platforms."
-                .to_string(),
-        );
-    }
-    if discovery_event_counts
-        .get("stale_session_pruned")
-        .copied()
-        .unwrap_or_default()
-        > 0
-    {
-        quick_hints.push(
-            "Stale discovery sessions were pruned locally; if peers keep flapping, compare diagnostics from both ends for mDNS remove/resolved parity."
-                .to_string(),
-        );
-    }
-    if beacon_sent > 0 && beacon_received == 0 && resolved_events == 0 {
-        quick_hints.push(
-            "No inbound discovery packets seen from mDNS or UDP beacon; check AP isolation, VLAN segmentation, or host firewall multicast/broadcast rules."
-                .to_string(),
-        );
-    } else if beacon_received > 0 && resolved_events == 0 {
-        quick_hints.push(
-            "UDP beacon fallback is receiving peers while mDNS is silent; mDNS multicast is likely blocked on this network."
-                .to_string(),
-        );
-    }
     let self_filtered = discovery_event_counts
         .get("resolved_self_filtered")
         .copied()
         .unwrap_or_default();
-    if resolved_events > 0 && device_rows.is_empty() && self_filtered >= resolved_events {
-        quick_hints.push(
-            "mDNS resolved only self-advertisements on this host; no remote DashDrop peers observed."
-                .to_string(),
-        );
-    }
-    if discovery_failure_counts
-        .get("resolved_missing_fp_txt")
-        .copied()
-        .unwrap_or_default()
-        > 0
-    {
-        quick_hints.push(
-            "Some _dashdrop records were missing fp TXT; verify both peers run compatible builds and advertise required TXT keys."
-                .to_string(),
-        );
-    }
+    let mut quick_hints = build_discovery_quick_hints(&DiscoveryQuickHintContext {
+        own_platform,
+        mdns_daemon_initialized: mdns_daemon_initialized && mdns_service_fullname.is_some(),
+        browser_active: browser_status.active,
+        browser_restart_count: browser_status.restart_count,
+        search_started_events,
+        resolved_events,
+        reachable_devices,
+        listener_mode: &listener_mode,
+        listener_port_mode: &listener_port_mode,
+        firewall_rule_state: &firewall_rule_state,
+        local_port: runtime.local_port,
+        ipv6_only_candidates,
+        resolved_no_usable_addrs: discovery_failure_counts
+            .get("resolved_no_usable_addrs")
+            .copied()
+            .unwrap_or_default(),
+        scope_less_link_local_peers,
+        stale_session_pruned: discovery_event_counts
+            .get("stale_session_pruned")
+            .copied()
+            .unwrap_or_default(),
+        beacon_sent,
+        beacon_received,
+        device_rows_empty: device_rows.is_empty(),
+        self_filtered,
+        resolved_missing_fp_txt: discovery_failure_counts
+            .get("resolved_missing_fp_txt")
+            .copied()
+            .unwrap_or_default(),
+    });
     if beacon_cadence.power_profile == crate::discovery::beacon::PowerProfile::LowPower {
         quick_hints.push(
             "Low-power mode is active, so discovery latency is intentionally relaxed to reduce energy use; beacon-based peer appearance may take longer than on AC."
@@ -1255,7 +1630,7 @@ async fn build_discovery_diagnostics(
         "power_profile": beacon_cadence.power_profile,
         "beacon_interval_secs": beacon_cadence.interval_secs,
         "own_fingerprint": state.identity.fingerprint.clone(),
-        "own_platform": Platform::current(),
+        "own_platform": own_platform,
         "mdns_daemon_initialized": mdns_daemon_initialized,
         "mdns_service_fullname": mdns_service_fullname,
         "mdns_interface_policy": mdns_interface_policy,
@@ -1263,6 +1638,8 @@ async fn build_discovery_diagnostics(
         "mdns_last_search_started": mdns_last_search_started,
         "local_instance_name": local_instance_name,
         "listener_mode": listener_mode,
+        "listener_port_mode": listener_port_mode,
+        "firewall_rule_state": firewall_rule_state,
         "listener_addrs": listener_addrs,
         "network_interfaces": network_interfaces,
         "browser_status": serde_json::json!({

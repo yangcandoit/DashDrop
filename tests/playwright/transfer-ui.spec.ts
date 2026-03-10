@@ -4,6 +4,7 @@ test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
     type Handler = (payload: unknown) => void;
     const listeners = new Map<string, Set<Handler>>();
+    const expiredIncomingIds = new Set<string>();
     const state = {
       devices: {} as Record<string, any>,
       transfers: {} as Record<string, any>,
@@ -157,6 +158,17 @@ test.beforeEach(async ({ page }) => {
             return [];
           case "accept_transfer": {
             const transferId = String(args?.transferId);
+            if (expiredIncomingIds.has(transferId)) {
+              delete state.incoming[transferId];
+              emit("transfer_error", {
+                transfer_id: transferId,
+                reason_code: "E_REQUEST_EXPIRED",
+                terminal_cause: "NotificationExpired",
+                phase: "notification_action",
+                revision: 0,
+              });
+              throw new Error("E_REQUEST_EXPIRED");
+            }
             let t = state.transfers[transferId];
             if (!t && state.incoming[transferId]) {
               const incoming = state.incoming[transferId];
@@ -187,6 +199,17 @@ test.beforeEach(async ({ page }) => {
           }
           case "reject_transfer": {
             const transferId = String(args?.transferId);
+            if (expiredIncomingIds.has(transferId)) {
+              delete state.incoming[transferId];
+              emit("transfer_error", {
+                transfer_id: transferId,
+                reason_code: "E_REQUEST_EXPIRED",
+                terminal_cause: "NotificationExpired",
+                phase: "notification_action",
+                revision: 0,
+              });
+              throw new Error("E_REQUEST_EXPIRED");
+            }
             let t = state.transfers[transferId];
             if (!t && state.incoming[transferId]) {
               const incoming = state.incoming[transferId];
@@ -250,6 +273,13 @@ test.beforeEach(async ({ page }) => {
       emit("transfer_incoming", payload);
     };
 
+    (window as any).__seedIncomingTransfer = (transferId: string, senderName: string) => {
+      seedIncoming(transferId, senderName);
+    };
+    (window as any).__expireIncomingTransfer = (transferId: string) => {
+      expiredIncomingIds.add(transferId);
+    };
+
     setTimeout(() => {
       seedIncoming("t-accept", "Peer Accept");
       seedIncoming("t-reject", "Peer Reject");
@@ -280,6 +310,22 @@ test("incoming -> reject -> history visible", async ({ page }) => {
   await page.getByRole("button", { name: "History" }).click();
   await expect(page.getByText("Peer Reject")).toBeVisible();
   await expect(page.locator(".status-badge.rejected").first()).toBeVisible();
+});
+
+test("expired incoming action shows expiry error and does not create active transfer", async ({ page }) => {
+  await page.getByRole("button", { name: "Transfers" }).click();
+  await page.evaluate(() => {
+    (window as any).__seedIncomingTransfer("t-expired", "Peer Expired");
+    (window as any).__expireIncomingTransfer("t-expired");
+  });
+
+  const expiredCard = page.locator("article.incoming-card", { hasText: "Peer Expired" });
+  await expect(expiredCard).toBeVisible();
+  await expiredCard.getByRole("button", { name: "Accept", exact: true }).click();
+
+  await expect(page.getByText("This transfer request expired")).toBeVisible();
+  await expect(expiredCard).toHaveCount(0);
+  await expect(page.locator(".transfer-card", { hasText: "Peer Expired" })).toHaveCount(0);
 });
 
 test("connect by address dialog/confirm flow", async ({ page }) => {

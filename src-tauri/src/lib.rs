@@ -8,7 +8,7 @@ pub mod state;
 pub mod transport;
 
 use crypto::Identity;
-use state::{AppConfig, AppState};
+use state::{AppConfig, AppState, TransferStatus};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
@@ -243,6 +243,55 @@ pub fn run() {
                             true
                         }
                     });
+                }
+            });
+
+            let state_notifications = Arc::clone(&state);
+            tauri::async_runtime::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                loop {
+                    interval.tick().await;
+                    let transfer_states = {
+                        let transfers = state_notifications.transfers.read().await;
+                        transfers
+                            .values()
+                            .map(|task| {
+                                (
+                                    task.id.clone(),
+                                    task.status.clone(),
+                                    task.terminal_reason_code.clone(),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    };
+
+                    let mut pending_ids = std::collections::HashSet::new();
+                    let mut inactive_ids = Vec::new();
+
+                    for (transfer_id, status, terminal_reason_code) in transfer_states {
+                        if status == TransferStatus::PendingAccept {
+                            pending_ids.insert(transfer_id.clone());
+                            state_notifications
+                                .ensure_incoming_request_notification(&transfer_id)
+                                .await;
+                        } else {
+                            inactive_ids.push((transfer_id, terminal_reason_code));
+                        }
+                    }
+
+                    {
+                        let mut pending_accepts = state_notifications.pending_accepts.write().await;
+                        pending_accepts.retain(|transfer_id, _| pending_ids.contains(transfer_id));
+                    }
+
+                    for (transfer_id, terminal_reason_code) in inactive_ids {
+                        state_notifications
+                            .mark_incoming_request_notification_inactive(
+                                &transfer_id,
+                                terminal_reason_code.as_deref(),
+                            )
+                            .await;
+                    }
                 }
             });
 

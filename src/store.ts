@@ -45,6 +45,7 @@ export const sendingPeerFingerprints = computed(() => {
 
 let unlistens: Array<() => void> = [];
 let clearSystemErrorTimer: ReturnType<typeof setTimeout> | null = null;
+const handledExpiredRequestErrors = new Set<string>();
 
 function actionableMessage(summary: string, nextSteps: string[]): string {
   if (nextSteps.length === 0) return summary;
@@ -53,6 +54,8 @@ function actionableMessage(summary: string, nextSteps: string[]): string {
 
 function transferErrorNextSteps(reasonCode: string): string[] {
   switch (reasonCode) {
+    case "E_REQUEST_EXPIRED":
+      return ["Ask the sender to share the files again."];
     case "E_TIMEOUT":
       return ["Check both devices are online and retry."];
     case "E_DISK_FULL":
@@ -77,6 +80,9 @@ function normalizeReasonCode(reasonCode: string): string {
 
 function summarizeTransferError(err: { reason_code: string; terminal_cause: string; detail?: string }): string {
   const code = normalizeReasonCode(err.reason_code);
+  if (code === "E_REQUEST_EXPIRED") {
+    return "This transfer request expired";
+  }
   if (code === "E_TIMEOUT") {
     return "Timed out while waiting for peer response";
   }
@@ -240,6 +246,10 @@ function addOrUpdateTerminalError(
   });
 }
 
+function expiredRequestErrorKey(err: { transfer_id: string | null; reason_code: string; revision: number }): string {
+  return `${err.transfer_id ?? "global"}:${err.reason_code}:${err.revision}`;
+}
+
 export async function fetchSnapshot() {
   try {
     const transfers = await getTransfers();
@@ -375,6 +385,27 @@ export async function initAppStore() {
   unlistens.push(
     await onTransferError((err) => {
       const normalizedReasonCode = normalizeReasonCode(err.reason_code);
+      if (normalizedReasonCode === "E_REQUEST_EXPIRED") {
+        if (err.transfer_id) {
+          removeIncoming(err.transfer_id);
+        }
+        const key = expiredRequestErrorKey({
+          transfer_id: err.transfer_id,
+          reason_code: normalizedReasonCode,
+          revision: err.revision,
+        });
+        if (handledExpiredRequestErrors.has(key)) {
+          return;
+        }
+        handledExpiredRequestErrors.add(key);
+        setSystemError(
+          actionableMessage(
+            summarizeTransferError(err),
+            transferErrorNextSteps(normalizedReasonCode),
+          ),
+        );
+        return;
+      }
       if (err.transfer_id) {
         addOrUpdateTerminalError(err.transfer_id, "Failed", normalizedReasonCode, err.revision);
       }
@@ -469,4 +500,5 @@ export function destroyAppStore() {
     clearTimeout(clearSystemErrorTimer);
     clearSystemErrorTimer = null;
   }
+  handledExpiredRequestErrors.clear();
 }

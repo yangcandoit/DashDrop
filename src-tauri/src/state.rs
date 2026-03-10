@@ -280,6 +280,10 @@ pub struct RuntimeStatus {
     pub mdns_registered: bool,
     pub discovered_devices: usize,
     pub trusted_devices: usize,
+    #[serde(default = "default_listener_port_mode")]
+    pub listener_port_mode: String,
+    #[serde(default = "default_firewall_rule_state")]
+    pub firewall_rule_state: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,6 +291,16 @@ pub struct BrowserStatus {
     pub active: bool,
     pub restart_count: u64,
     pub last_disconnect_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncomingRequestNotification {
+    pub notification_id: String,
+    pub transfer_id: String,
+    pub active: bool,
+    #[serde(default)]
+    pub terminal_reason_code: Option<String>,
+    pub updated_at_unix: u64,
 }
 
 impl Default for AppConfig {
@@ -299,6 +313,14 @@ impl Default for AppConfig {
             max_parallel_streams: default_max_parallel_streams(),
         }
     }
+}
+
+fn default_listener_port_mode() -> String {
+    "fallback_random".to_string()
+}
+
+fn default_firewall_rule_state() -> String {
+    "unknown".to_string()
 }
 
 // ─── AppState ─────────────────────────────────────────────────────────────────
@@ -327,6 +349,9 @@ pub struct AppState {
     /// Pending incoming transfers waiting for user accept/reject.
     /// transfer_id → oneshot sender (true = accept, false = reject).
     pub pending_accepts: Arc<RwLock<HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
+
+    /// Incoming transfer notification lifecycle keyed by transfer_id.
+    pub incoming_request_notifications: Arc<RwLock<HashMap<String, IncomingRequestNotification>>>,
 
     /// Incoming offer rate limiter keyed by peer fingerprint.
     pub offer_rate_limits: Arc<tokio::sync::Mutex<HashMap<String, (u32, std::time::Instant)>>>,
@@ -362,6 +387,10 @@ pub struct AppState {
     pub pending_removed_sessions: Arc<tokio::sync::Mutex<HashSet<String>>>,
     /// Listener mode ("dual_stack" or "ipv4_only_fallback").
     pub listener_mode: Arc<RwLock<String>>,
+    /// Listener port mode ("fixed" or "fallback_random").
+    pub listener_port_mode: Arc<RwLock<String>>,
+    /// Firewall rule state for diagnostics.
+    pub firewall_rule_state: Arc<RwLock<String>>,
     /// Listener bind addrs exposed in diagnostics.
     pub listener_addrs: Arc<RwLock<Vec<String>>>,
 
@@ -383,6 +412,7 @@ impl AppState {
             config: Arc::new(RwLock::new(config)),
             local_port: Arc::new(RwLock::new(0)),
             pending_accepts: Arc::new(RwLock::new(HashMap::new())),
+            incoming_request_notifications: Arc::new(RwLock::new(HashMap::new())),
             offer_rate_limits: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             incoming_conn_rate_limits: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             fingerprint_change_alerts: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -401,6 +431,8 @@ impl AppState {
             })),
             pending_removed_sessions: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             listener_mode: Arc::new(RwLock::new("unknown".to_string())),
+            listener_port_mode: Arc::new(RwLock::new(default_listener_port_mode())),
+            firewall_rule_state: Arc::new(RwLock::new(default_firewall_rule_state())),
             listener_addrs: Arc::new(RwLock::new(Vec::new())),
             db: std::sync::Mutex::new(db),
             metrics: Arc::new(RwLock::new(TransferMetrics::default())),
@@ -411,6 +443,61 @@ impl AppState {
         let mut guard = map.write().await;
         let next = guard.get(key).copied().unwrap_or(0).saturating_add(1);
         guard.insert(key.to_string(), next);
+    }
+
+    fn now_unix() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    pub async fn ensure_incoming_request_notification(&self, transfer_id: &str) -> String {
+        let mut guard = self.incoming_request_notifications.write().await;
+        if let Some(existing) = guard.get_mut(transfer_id) {
+            existing.active = true;
+            existing.updated_at_unix = Self::now_unix();
+            return existing.notification_id.clone();
+        }
+
+        let notification_id = uuid::Uuid::new_v4().to_string();
+        guard.insert(
+            transfer_id.to_string(),
+            IncomingRequestNotification {
+                notification_id: notification_id.clone(),
+                transfer_id: transfer_id.to_string(),
+                active: true,
+                terminal_reason_code: None,
+                updated_at_unix: Self::now_unix(),
+            },
+        );
+        notification_id
+    }
+
+    pub async fn mark_incoming_request_notification_inactive(
+        &self,
+        transfer_id: &str,
+        reason_code: Option<&str>,
+    ) -> Option<String> {
+        let mut guard = self.incoming_request_notifications.write().await;
+        let entry = guard.get_mut(transfer_id)?;
+        entry.active = false;
+        entry.updated_at_unix = Self::now_unix();
+        if let Some(code) = reason_code {
+            entry.terminal_reason_code = Some(code.to_string());
+        }
+        Some(entry.notification_id.clone())
+    }
+
+    pub async fn incoming_request_notification(
+        &self,
+        transfer_id: &str,
+    ) -> Option<IncomingRequestNotification> {
+        self.incoming_request_notifications
+            .read()
+            .await
+            .get(transfer_id)
+            .cloned()
     }
 
     pub async fn bump_discovery_event(&self, key: &str) {
@@ -469,6 +556,8 @@ impl AppState {
             mdns_registered: self.mdns_service_fullname.read().await.is_some(),
             discovered_devices: self.devices.read().await.len(),
             trusted_devices: self.trusted_peers.read().await.len(),
+            listener_port_mode: self.listener_port_mode.read().await.clone(),
+            firewall_rule_state: self.firewall_rule_state.read().await.clone(),
         }
     }
 
@@ -511,7 +600,11 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceInfo, Platform, ReachabilityStatus, SessionInfo};
+    use super::{
+        default_firewall_rule_state, default_listener_port_mode, AppConfig, AppState, DeviceInfo,
+        Platform, ReachabilityStatus, SessionInfo,
+    };
+    use crate::crypto::Identity;
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::str::FromStr;
@@ -558,13 +651,48 @@ mod tests {
             SocketAddr::from_str("192.168.1.8:9443").expect("addr"),
         ]);
         let best = device.best_addrs().expect("best addrs");
-        assert_eq!(best, vec![SocketAddr::from_str("192.168.1.8:9443").expect("addr")]);
+        assert_eq!(
+            best,
+            vec![SocketAddr::from_str("192.168.1.8:9443").expect("addr")]
+        );
     }
 
     #[test]
     fn best_addrs_keeps_scope_less_link_local_when_only_candidate() {
         let device = sample_device(vec![SocketAddr::from_str("[fe80::1]:9443").expect("addr")]);
         let best = device.best_addrs().expect("best addrs");
-        assert_eq!(best, vec![SocketAddr::from_str("[fe80::1]:9443").expect("addr")]);
+        assert_eq!(
+            best,
+            vec![SocketAddr::from_str("[fe80::1]:9443").expect("addr")]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_status_exposes_listener_port_and_firewall_state() {
+        let state = AppState::new(
+            Identity {
+                fingerprint: "fp".to_string(),
+                cert_der: Vec::new(),
+                key_der: Vec::new(),
+                device_name: "DashDrop Test".to_string(),
+            },
+            AppConfig::default(),
+            rusqlite::Connection::open_in_memory().expect("in-memory db"),
+        );
+
+        *state.local_port.write().await = 53319;
+        *state.listener_port_mode.write().await = "fixed".to_string();
+        *state.firewall_rule_state.write().await = "managed".to_string();
+
+        let runtime = state.runtime_status().await;
+        assert_eq!(runtime.local_port, 53319);
+        assert_eq!(runtime.listener_port_mode, "fixed");
+        assert_eq!(runtime.firewall_rule_state, "managed");
+    }
+
+    #[test]
+    fn runtime_status_defaults_are_backward_safe() {
+        assert_eq!(default_listener_port_mode(), "fallback_random");
+        assert_eq!(default_firewall_rule_state(), "unknown");
     }
 }
