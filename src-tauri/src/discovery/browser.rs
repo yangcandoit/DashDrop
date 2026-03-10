@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use flume::RecvTimeoutError;
 use mdns_sd::{HostnameResolutionEvent, ServiceDaemon, ServiceEvent};
 use std::collections::HashSet;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -14,6 +15,11 @@ use crate::state::{AppState, DeviceInfo, Platform, SessionIndexEntry, SessionInf
 const OFFLINE_GRACE_SECS: u64 = 15;
 const DEVICE_LOST_RETENTION_SECS: u64 = 45;
 const HOSTNAME_RESOLVE_TIMEOUT_MS: u64 = 1500;
+
+enum BrowserReceiveAction {
+    Continue,
+    Restart,
+}
 
 fn is_usable_peer_addr(addr: &SocketAddr) -> bool {
     if addr.ip().is_loopback() || addr.ip().is_unspecified() || addr.ip().is_multicast() {
@@ -38,6 +44,27 @@ fn sort_dedupe_addrs(addrs: &mut Vec<SocketAddr>) {
     addrs.retain(|a| seen.insert(*a));
 }
 
+fn is_connectable_probe_addr(addr: &SocketAddr) -> bool {
+    match addr {
+        SocketAddr::V4(_) => true,
+        SocketAddr::V6(v6) => !(v6.ip().is_unicast_link_local() && v6.scope_id() == 0),
+    }
+}
+
+fn select_probe_addrs(mut addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    sort_dedupe_addrs(&mut addrs);
+    let filtered: Vec<SocketAddr> = addrs
+        .iter()
+        .copied()
+        .filter(is_connectable_probe_addr)
+        .collect();
+    if filtered.is_empty() {
+        addrs
+    } else {
+        filtered
+    }
+}
+
 fn should_apply_deferred_remove(
     current_last_seen: u64,
     observed_last_seen: u64,
@@ -45,6 +72,33 @@ fn should_apply_deferred_remove(
 ) -> bool {
     current_last_seen <= observed_last_seen
         && now_unix.saturating_sub(current_last_seen) >= OFFLINE_GRACE_SECS
+}
+
+fn browser_receive_action(err: &RecvTimeoutError) -> BrowserReceiveAction {
+    match err {
+        RecvTimeoutError::Timeout => BrowserReceiveAction::Continue,
+        RecvTimeoutError::Disconnected => BrowserReceiveAction::Restart,
+    }
+}
+
+fn pending_remove_key(fp: &str, session_id: &str) -> String {
+    format!("{fp}|{session_id}")
+}
+
+fn classify_probe_error(detail: &str) -> (&'static str, &'static str) {
+    let s = detail.to_ascii_lowercase();
+    if s.contains("timeout") || s.contains("timed out") {
+        ("probe_timeout", "timeout")
+    } else if s.contains("handshake") {
+        ("probe_handshake", "handshake")
+    } else if s.contains("refused")
+        || s.contains("unreachable")
+        || s.contains("invalid remote address")
+    {
+        ("probe_connect", "connect")
+    } else {
+        ("probe_other", "other")
+    }
 }
 
 async fn resolve_hostname_with_mdns(
@@ -185,7 +239,12 @@ pub async fn start_browser(
 
     let app_events = app.clone();
     let state_events = state.clone();
+    {
+        let mut status = state.browser_status.write().await;
+        status.active = true;
+    }
     tokio::spawn(async move {
+        let mut receiver = receiver;
         let mut join_error_backoff_ms: u64 = 100;
         loop {
             // mdns-sd channel receiver is Sync, use spawn_blocking to not block tokio
@@ -212,16 +271,69 @@ pub async fn start_browser(
                     handle_removed(&fullname, &app_events, &state_events).await;
                 }
                 Ok(Ok(_)) => {} // SearchStarted, other events
-                Ok(Err(_)) => {
-                    // Timeout or channel closed — just loop
-                }
+                Ok(Err(err)) => match browser_receive_action(&err) {
+                    BrowserReceiveAction::Continue => {
+                        // Timeout — normal idle cycle.
+                    }
+                    BrowserReceiveAction::Restart => {
+                        state_events
+                            .bump_discovery_failure("browser_channel_disconnected")
+                            .await;
+                        {
+                            let mut status = state_events.browser_status.write().await;
+                            status.active = false;
+                            status.restart_count = status.restart_count.saturating_add(1);
+                            status.last_disconnect_at = Some(now_unix_secs());
+                        }
+                        tokio::time::sleep(Duration::from_millis(join_error_backoff_ms)).await;
+                        match mdns.browse(SERVICE_TYPE) {
+                            Ok(next_receiver) => {
+                                receiver = next_receiver;
+                                join_error_backoff_ms = 100;
+                                state_events.bump_discovery_event("browser_restarted").await;
+                                let mut status = state_events.browser_status.write().await;
+                                status.active = true;
+                            }
+                            Err(e) => {
+                                state_events
+                                    .bump_discovery_failure("browser_restart_failed")
+                                    .await;
+                                tracing::warn!("mDNS browser restart failed: {e}");
+                                join_error_backoff_ms =
+                                    (join_error_backoff_ms.saturating_mul(2)).min(5000);
+                            }
+                        }
+                    }
+                },
                 Err(e) => {
                     tracing::warn!("mDNS browser task error: {e}");
                     state_events
                         .bump_discovery_failure("browser_spawn_blocking_join_error")
                         .await;
+                    {
+                        let mut status = state_events.browser_status.write().await;
+                        status.active = false;
+                    }
                     tokio::time::sleep(Duration::from_millis(join_error_backoff_ms)).await;
-                    join_error_backoff_ms = (join_error_backoff_ms.saturating_mul(2)).min(5000);
+                    match mdns.browse(SERVICE_TYPE) {
+                        Ok(next_receiver) => {
+                            receiver = next_receiver;
+                            join_error_backoff_ms = 100;
+                            state_events.bump_discovery_event("browser_restarted").await;
+                            let mut status = state_events.browser_status.write().await;
+                            status.active = true;
+                        }
+                        Err(restart_err) => {
+                            state_events
+                                .bump_discovery_failure("browser_restart_failed")
+                                .await;
+                            tracing::warn!(
+                                "mDNS browser restart after task error failed: {restart_err}"
+                            );
+                            join_error_backoff_ms =
+                                (join_error_backoff_ms.saturating_mul(2)).min(5000);
+                        }
+                    }
                 }
             }
         }
@@ -313,10 +425,14 @@ async fn handle_resolved(
 
     let port = info.get_port();
 
-    let mut addrs: Vec<SocketAddr> = info
+    let raw_addrs: Vec<SocketAddr> = info
         .get_addresses()
         .iter()
         .map(|ip| SocketAddr::new(*ip, port))
+        .collect();
+    let mut addrs: Vec<SocketAddr> = raw_addrs
+        .iter()
+        .copied()
         .filter(is_usable_peer_addr)
         .collect();
 
@@ -352,6 +468,8 @@ async fn handle_resolved(
             .bump_discovery_event("resolved_kept_without_addrs")
             .await;
     }
+    let usable_addr_count = addrs.len() as u32;
+    let raw_addr_count = raw_addrs.len() as u32;
 
     let trusted = state.is_trusted(&fp).await;
     let now_unix = now_unix_secs();
@@ -370,6 +488,16 @@ async fn handle_resolved(
             reachability: crate::state::ReachabilityStatus::Discovered,
             probe_fail_count: 0,
             last_probe_at: None,
+            last_probe_result: None,
+            last_probe_error: None,
+            last_probe_error_detail: None,
+            last_probe_addr: None,
+            last_probe_attempted_addrs: Vec::new(),
+            last_resolve_raw_addr_count: 0,
+            last_resolve_usable_addr_count: 0,
+            last_resolve_hostname: None,
+            last_resolve_port: None,
+            last_resolve_at: None,
         });
 
         device.sessions.insert(
@@ -383,6 +511,11 @@ async fn handle_resolved(
         );
         device.trusted = trusted;
         device.last_seen = now_unix;
+        device.last_resolve_raw_addr_count = raw_addr_count;
+        device.last_resolve_usable_addr_count = usable_addr_count;
+        device.last_resolve_hostname = Some(info.get_hostname().to_string());
+        device.last_resolve_port = Some(port);
+        device.last_resolve_at = Some(now_unix);
         if !device.sessions.is_empty()
             && matches!(
                 device.reachability,
@@ -453,6 +586,18 @@ async fn handle_removed(remove_key: &str, app: &AppHandle, state: &Arc<AppState>
         return;
     };
 
+    let pending_key = pending_remove_key(&entry.fingerprint, &entry.session_id);
+    let should_schedule = {
+        let mut pending = state.pending_removed_sessions.lock().await;
+        pending.insert(pending_key.clone())
+    };
+    if !should_schedule {
+        state
+            .bump_discovery_event("service_removed_deferred_duplicate")
+            .await;
+        return;
+    }
+
     state.bump_discovery_event("service_removed_deferred").await;
     let fp = entry.fingerprint.clone();
     let session_id = entry.session_id.clone();
@@ -499,6 +644,8 @@ async fn handle_removed(remove_key: &str, app: &AppHandle, state: &Arc<AppState>
                 let payload = DeviceView::from(&dev);
                 app2.emit("device_updated", &payload).ok();
             }
+            let mut pending = state2.pending_removed_sessions.lock().await;
+            pending.remove(&pending_key);
             return;
         }
 
@@ -511,6 +658,8 @@ async fn handle_removed(remove_key: &str, app: &AppHandle, state: &Arc<AppState>
                 .bump_discovery_event("service_removed_skipped_stale")
                 .await;
         }
+        let mut pending = state2.pending_removed_sessions.lock().await;
+        pending.remove(&pending_key);
     });
 }
 
@@ -524,14 +673,28 @@ async fn run_probe_update(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let addrs = select_probe_addrs(addrs);
+    let attempted_addrs = addrs.iter().map(|addr| addr.to_string()).collect::<Vec<_>>();
     let mut ok = false;
+    let mut success_addr: Option<String> = None;
+    let mut last_error_reason: Option<String> = None;
+    let mut last_error_detail: Option<String> = None;
+    let mut last_error_addr: Option<String> = None;
     for addr in addrs {
-        if crate::transport::probe::probe_addr(state, addr)
-            .await
-            .is_ok()
-        {
-            ok = true;
-            break;
+        match crate::transport::probe::probe_addr(state, addr).await {
+            Ok(()) => {
+                ok = true;
+                success_addr = Some(addr.to_string());
+                break;
+            }
+            Err(e) => {
+                let detail = format!("{e:#}");
+                let (counter_key, reason) = classify_probe_error(&detail);
+                state.bump_discovery_failure(counter_key).await;
+                last_error_reason = Some(reason.to_string());
+                last_error_detail = Some(detail);
+                last_error_addr = Some(addr.to_string());
+            }
         }
     }
 
@@ -544,6 +707,10 @@ async fn run_probe_update(
         if ok {
             device.reachability = crate::state::ReachabilityStatus::Reachable;
             device.probe_fail_count = 0;
+            device.last_probe_result = Some("ok".to_string());
+            device.last_probe_error = None;
+            device.last_probe_error_detail = None;
+            device.last_probe_addr = success_addr;
         } else {
             let next_fail_count = device.probe_fail_count.saturating_add(1);
             device.probe_fail_count = next_fail_count;
@@ -556,7 +723,12 @@ async fn run_probe_update(
             ) {
                 device.reachability = crate::state::ReachabilityStatus::Discovered;
             }
+            device.last_probe_result = Some("failed".to_string());
+            device.last_probe_error = last_error_reason;
+            device.last_probe_error_detail = last_error_detail;
+            device.last_probe_addr = last_error_addr;
         }
+        device.last_probe_attempted_addrs = attempted_addrs;
         DeviceView::from(&*device)
     };
     if !ok {
@@ -567,7 +739,7 @@ async fn run_probe_update(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::net::SocketAddr;
     use std::str::FromStr;
     use std::time::Instant;
@@ -604,6 +776,16 @@ mod tests {
                 reachability: crate::state::ReachabilityStatus::Discovered,
                 probe_fail_count: 0,
                 last_probe_at: None,
+                last_probe_result: None,
+                last_probe_error: None,
+                last_probe_error_detail: None,
+                last_probe_addr: None,
+                last_probe_attempted_addrs: Vec::new(),
+                last_resolve_raw_addr_count: 0,
+                last_resolve_usable_addr_count: 0,
+                last_resolve_hostname: None,
+                last_resolve_port: None,
+                last_resolve_at: None,
             },
         );
         let entry = SessionIndexEntry {
@@ -645,6 +827,44 @@ mod tests {
     }
 
     #[test]
+    fn browser_timeout_keeps_loop_running() {
+        let action = super::browser_receive_action(&flume::RecvTimeoutError::Timeout);
+        assert!(matches!(action, super::BrowserReceiveAction::Continue));
+    }
+
+    #[test]
+    fn browser_disconnect_requests_restart() {
+        let action = super::browser_receive_action(&flume::RecvTimeoutError::Disconnected);
+        assert!(matches!(action, super::BrowserReceiveAction::Restart));
+    }
+
+    #[test]
+    fn pending_remove_key_is_stable_and_deduplicates() {
+        let key = super::pending_remove_key("fp-a", "session-a");
+        assert_eq!(key, "fp-a|session-a");
+        let mut pending = HashSet::new();
+        assert!(pending.insert(key.clone()));
+        assert!(!pending.insert(key));
+    }
+
+    #[test]
+    fn select_probe_addrs_prefers_connectable_candidates() {
+        let input = vec![
+            SocketAddr::from_str("[fe80::1]:9443").expect("addr"),
+            SocketAddr::from_str("192.168.1.9:9443").expect("addr"),
+        ];
+        let selected = super::select_probe_addrs(input);
+        assert_eq!(selected, vec![SocketAddr::from_str("192.168.1.9:9443").expect("addr")]);
+    }
+
+    #[test]
+    fn select_probe_addrs_keeps_scope_less_link_local_when_only_choice() {
+        let input = vec![SocketAddr::from_str("[fe80::1]:9443").expect("addr")];
+        let selected = super::select_probe_addrs(input.clone());
+        assert_eq!(selected, input);
+    }
+
+    #[test]
     fn offline_candidate_promotes_after_grace_period() {
         let device = DeviceInfo {
             fingerprint: "peer-fp".into(),
@@ -656,6 +876,16 @@ mod tests {
             reachability: crate::state::ReachabilityStatus::OfflineCandidate,
             probe_fail_count: 0,
             last_probe_at: None,
+            last_probe_result: None,
+            last_probe_error: None,
+            last_probe_error_detail: None,
+            last_probe_addr: None,
+            last_probe_attempted_addrs: Vec::new(),
+            last_resolve_raw_addr_count: 0,
+            last_resolve_usable_addr_count: 0,
+            last_resolve_hostname: None,
+            last_resolve_port: None,
+            last_resolve_at: None,
         };
         assert!(!super::should_mark_offline(&device, 114));
         assert!(super::should_mark_offline(&device, 115));
@@ -673,6 +903,16 @@ mod tests {
             reachability: crate::state::ReachabilityStatus::Offline,
             probe_fail_count: 0,
             last_probe_at: None,
+            last_probe_result: None,
+            last_probe_error: None,
+            last_probe_error_detail: None,
+            last_probe_addr: None,
+            last_probe_attempted_addrs: Vec::new(),
+            last_resolve_raw_addr_count: 0,
+            last_resolve_usable_addr_count: 0,
+            last_resolve_hostname: None,
+            last_resolve_port: None,
+            last_resolve_at: None,
         };
         assert!(!super::should_emit_device_lost(&device, 144));
         assert!(super::should_emit_device_lost(&device, 145));

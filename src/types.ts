@@ -211,12 +211,27 @@ export interface RuntimeStatus {
 
 export interface DiscoveryDiagnostics {
   runtime: RuntimeStatus;
+  service_type?: string;
   own_fingerprint?: string;
   own_platform?: Platform;
   mdns_daemon_initialized: boolean;
   mdns_service_fullname?: string | null;
   mdns_last_search_started?: string | null;
   local_instance_name?: string | null;
+  listener_mode?: string;
+  listener_addrs?: string[];
+  network_interfaces?: Array<{
+    name: string;
+    is_loopback: boolean;
+    ipv4: string[];
+    ipv6: string[];
+  }>;
+  browser_status?: {
+    active: boolean;
+    restart_count: number;
+    last_disconnect_at?: number | null;
+    last_search_started?: string | null;
+  };
   session_index_count?: number;
   discovery_event_counts?: Record<string, number>;
   discovery_failure_counts?: Record<string, number>;
@@ -233,6 +248,22 @@ export interface DiscoveryDiagnostics {
     last_seen: number;
     session_count: number;
     best_addrs?: string[];
+    scope_less_link_local_ipv6_count?: number;
+    last_resolve_stats?: {
+      raw_addr_count: number;
+      usable_addr_count: number;
+      hostname?: string | null;
+      port?: number | null;
+      at?: number | null;
+    };
+    last_probe_result?: {
+      result?: string | null;
+      error?: string | null;
+      error_detail?: string | null;
+      addr?: string | null;
+      attempted_addrs?: string[];
+      at?: number | null;
+    };
     sessions: Array<{
       session_id: string;
       last_seen_unix: number;

@@ -5,6 +5,7 @@ test.beforeEach(async ({ page }) => {
     type Handler = (payload: unknown) => void;
     const listeners = new Map<string, Set<Handler>>();
     const state = {
+      devices: {} as Record<string, any>,
       transfers: {} as Record<string, any>,
       incoming: {} as Record<string, any>,
       history: [] as any[],
@@ -22,9 +23,26 @@ test.beforeEach(async ({ page }) => {
 
     (window as any).__emitTestEvent = (event: string, payload: unknown) => emit(event, payload);
     (window as any).__getTestState = () => JSON.parse(JSON.stringify(state));
+    (window as any).__setTrustedPeers = (peers: any[]) => {
+      state.trustedPeers = peers.map((peer) => ({ ...peer }));
+    };
+    (window as any).__setMockDevices = (devices: any[]) => {
+      state.devices = Object.fromEntries(devices.map((device) => [device.fingerprint, { ...device }]));
+    };
     (window as any).__pushHistoryTransfer = (transfer: any) => {
       state.history.unshift(transfer);
     };
+
+    const clipboardState = { text: "" };
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: async (text: string) => {
+          clipboardState.text = String(text);
+        },
+      },
+    });
+    (window as any).__getClipboardText = () => clipboardState.text;
 
     (window as any).__DASHDROP_TEST_MOCK__ = {
       invoke(command: string, args?: Record<string, unknown>) {
@@ -32,7 +50,7 @@ test.beforeEach(async ({ page }) => {
           case "get_local_identity":
             return { fingerprint: "local-fp", device_name: "Test Device", port: 7000 };
           case "get_devices":
-            return [];
+            return Object.values(state.devices);
           case "get_transfers":
             return Object.values(state.transfers);
           case "get_transfer":
@@ -68,6 +86,39 @@ test.beforeEach(async ({ page }) => {
               bytes_received: 0,
               average_duration_ms: 0,
               failure_distribution: {},
+            };
+          case "get_discovery_diagnostics":
+            return {
+              runtime: {
+                local_port: 7000,
+                mdns_registered: true,
+                discovered_devices: Object.keys(state.devices).length,
+                trusted_devices: state.trustedPeers.length,
+              },
+              service_type: "_dashdrop._udp.local.",
+              own_fingerprint: "local-fp",
+              own_platform: "Mac",
+              mdns_daemon_initialized: true,
+              mdns_service_fullname: "Test-Device._dashdrop._udp.local.",
+              mdns_last_search_started: "if=0.0.0.0",
+              local_instance_name: "Test-Device",
+              listener_mode: "dual_stack",
+              listener_addrs: ["[::]:7000", "0.0.0.0:7000"],
+              network_interfaces: [
+                { name: "en0", is_loopback: false, ipv4: ["192.168.1.8"], ipv6: ["fe80::1"] },
+              ],
+              browser_status: {
+                active: true,
+                restart_count: 0,
+                last_disconnect_at: null,
+                last_search_started: "if=0.0.0.0",
+              },
+              session_index_count: 1,
+              discovery_event_counts: { search_started: 1, service_resolved: 1 },
+              discovery_failure_counts: {},
+              quick_hints: [],
+              device_count: Object.keys(state.devices).length,
+              devices: Object.values(state.devices),
             };
           case "get_trusted_peers":
             return state.trustedPeers;
@@ -360,4 +411,56 @@ test("retry button triggers retry command for failed send", async ({ page }) => 
   await page.locator(".transfer-card", { hasText: "Retry Peer" }).getByRole("button", { name: "Retry" }).click();
   const state = await page.evaluate(() => (window as any).__getTestState());
   expect(state.retryCalls).toContain("t-retry");
+});
+
+test("nearby and trusted share online rule when session has no usable address", async ({ page }) => {
+  await page.evaluate(() => {
+    (window as any).__setTrustedPeers([
+      {
+        fingerprint: "fp-no-addr",
+        name: "NoAddr Peer",
+        paired_at: 1,
+        alias: null,
+        last_used_at: null,
+      },
+    ]);
+    (window as any).__emitTestEvent("device_discovered", {
+      fingerprint: "fp-no-addr",
+      name: "NoAddr Peer",
+      platform: "Windows",
+      trusted: true,
+      sessions: {
+        "session-no-addr": {
+          session_id: "session-no-addr",
+          addrs: [],
+          last_seen_unix: 1,
+        },
+      },
+      last_seen: 1,
+      reachability: "discovered",
+      probe_fail_count: 0,
+      last_probe_at: null,
+    });
+  });
+
+  await page.getByRole("button", { name: "Nearby" }).click();
+  await expect(page.getByText("Discovering (address pending)")).toBeVisible();
+
+  await page.getByRole("button", { name: "Trusted Devices" }).click();
+  const trustedCard = page.locator(".trusted-card", { hasText: "NoAddr Peer" });
+  await expect(trustedCard.getByText("Offline")).toBeVisible();
+});
+
+test("settings diagnostics copy includes extended discovery fields", async ({ page }) => {
+  await page.locator(".app-rail").getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByRole("button", { name: "Copy Discovery Diagnostics" }).click();
+
+  const copied = await page.evaluate(() => (window as any).__getClipboardText());
+  const diagnostics = JSON.parse(copied);
+
+  expect(diagnostics.service_type).toBe("_dashdrop._udp.local.");
+  expect(diagnostics.listener_mode).toBe("dual_stack");
+  expect(Array.isArray(diagnostics.listener_addrs)).toBeTruthy();
+  expect(Array.isArray(diagnostics.network_interfaces)).toBeTruthy();
+  expect(diagnostics.browser_status?.active).toBeTruthy();
 });

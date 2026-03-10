@@ -4,6 +4,7 @@ import type { TrustedPeer } from '../types';
 import { getTrustedPeers, setTrustedAlias, unpairDevice } from '../ipc';
 import { devices } from '../store';
 import ConfirmModal from '../components/ConfirmModal.vue';
+import { isDeviceOnline } from '../devicePresence';
 
 const emit = defineEmits(['openSettings']);
 
@@ -17,8 +18,9 @@ const unpairTarget = ref<TrustedPeer | null>(null);
 const onlineFingerprints = computed(() => {
   const set = new Set<string>();
   for (const d of devices.value) {
-    const alive = Object.keys(d.sessions || {}).length > 0 && d.reachability !== 'offline';
-    if (alive) set.add(d.fingerprint);
+    if (isDeviceOnline(d)) {
+      set.add(d.fingerprint);
+    }
   }
   return set;
 });

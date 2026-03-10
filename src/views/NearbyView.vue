@@ -77,17 +77,37 @@ const executeSend = async (paths: string[], device: DeviceView) => {
     console.error('Failed to send files:', e);
     const detail = String(e || '').toLowerCase();
     let userReason = 'Unknown transport error.';
+    let extraHint = '';
     if (detail.includes('all connection attempts failed')) {
       userReason = 'Peer is unreachable on all known addresses.';
+      const firstAttempt = String(e || '')
+        .split('(')[1]
+        ?.split('|')[0]
+        ?.replace(/\)$/, '')
+        ?.trim();
+      if (firstAttempt) {
+        extraHint = `First failed endpoint: ${firstAttempt}`;
+      }
+      if (detail.includes('invalid remote address')) {
+        userReason = 'Peer only exposed an unusable IPv6 link-local address.';
+        extraHint = 'Wait for discovery refresh, or use Connect by Address with a LAN IPv4 endpoint.';
+      } else if (detail.includes('connection refused')) {
+        extraHint = 'Peer app may not be listening, or firewall is blocking the receiver port.';
+      } else if (detail.includes('timed out')) {
+        extraHint = 'Network path exists but peer did not respond in time.';
+      }
     } else if (detail.includes('quic handshake')) {
       userReason = 'Secure handshake failed.';
     } else if (detail.includes('identity mismatch')) {
       userReason = 'Identity verification failed.';
     } else if (detail.includes('timeout')) {
       userReason = 'Peer did not respond in time.';
+    } else if (detail.includes('device has no reachable address')) {
+      userReason = 'Peer is discovered but currently has no usable address.';
+      extraHint = 'Open Settings and copy diagnostics on both devices for comparison.';
     }
     await message(
-      `Failed to send files to ${device.name}.\nReason: ${userReason}\nOpen Transfers or Security Events for details, then retry.`,
+      `Failed to send files to ${device.name}.\nReason: ${userReason}${extraHint ? `\n${extraHint}` : ''}\nOpen Transfers or Security Events for details, then retry.`,
       { title: 'Transfer Failed', kind: 'error' },
     );
   }

@@ -86,6 +86,16 @@ pub struct DeviceInfo {
     pub reachability: ReachabilityStatus,
     pub probe_fail_count: u32,
     pub last_probe_at: Option<u64>,
+    pub last_probe_result: Option<String>,
+    pub last_probe_error: Option<String>,
+    pub last_probe_error_detail: Option<String>,
+    pub last_probe_addr: Option<String>,
+    pub last_probe_attempted_addrs: Vec<String>,
+    pub last_resolve_raw_addr_count: u32,
+    pub last_resolve_usable_addr_count: u32,
+    pub last_resolve_hostname: Option<String>,
+    pub last_resolve_port: Option<u16>,
+    pub last_resolve_at: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +105,13 @@ pub struct SessionIndexEntry {
 }
 
 impl DeviceInfo {
+    fn is_connectable_addr(addr: &SocketAddr) -> bool {
+        match addr {
+            SocketAddr::V4(_) => true,
+            SocketAddr::V6(v6) => !(v6.ip().is_unicast_link_local() && v6.scope_id() == 0),
+        }
+    }
+
     /// Build address candidates across all known sessions, preferring newest sessions first.
     pub fn best_addrs(&self) -> Option<Vec<SocketAddr>> {
         let mut sessions: Vec<&SessionInfo> = self.sessions.values().collect();
@@ -113,7 +130,16 @@ impl DeviceInfo {
         if addrs.is_empty() {
             None
         } else {
-            Some(addrs)
+            let connectable: Vec<SocketAddr> = addrs
+                .iter()
+                .copied()
+                .filter(Self::is_connectable_addr)
+                .collect();
+            if connectable.is_empty() {
+                Some(addrs)
+            } else {
+                Some(connectable)
+            }
         }
     }
 }
@@ -256,6 +282,13 @@ pub struct RuntimeStatus {
     pub trusted_devices: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserStatus {
+    pub active: bool,
+    pub restart_count: u64,
+    pub last_disconnect_at: Option<u64>,
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         AppConfig {
@@ -319,6 +352,14 @@ pub struct AppState {
     pub discovery_event_counts: Arc<RwLock<HashMap<String, u64>>>,
     /// Discovery failure counters keyed by reason code.
     pub discovery_failure_counts: Arc<RwLock<HashMap<String, u64>>>,
+    /// Browser status snapshot for diagnostics and auto-recovery visibility.
+    pub browser_status: Arc<RwLock<BrowserStatus>>,
+    /// Pending deferred remove keys to dedupe ServiceRemoved storms.
+    pub pending_removed_sessions: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    /// Listener mode ("dual_stack" or "ipv4_only_fallback").
+    pub listener_mode: Arc<RwLock<String>>,
+    /// Listener bind addrs exposed in diagnostics.
+    pub listener_addrs: Arc<RwLock<Vec<String>>>,
 
     /// SQLite Database for persistent transfer history.
     pub db: std::sync::Mutex<rusqlite::Connection>,
@@ -347,6 +388,14 @@ impl AppState {
             mdns_last_search_started: Arc::new(RwLock::new(None)),
             discovery_event_counts: Arc::new(RwLock::new(HashMap::new())),
             discovery_failure_counts: Arc::new(RwLock::new(HashMap::new())),
+            browser_status: Arc::new(RwLock::new(BrowserStatus {
+                active: false,
+                restart_count: 0,
+                last_disconnect_at: None,
+            })),
+            pending_removed_sessions: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            listener_mode: Arc::new(RwLock::new("unknown".to_string())),
+            listener_addrs: Arc::new(RwLock::new(Vec::new())),
             db: std::sync::Mutex::new(db),
             metrics: Arc::new(RwLock::new(TransferMetrics::default())),
         }
@@ -372,6 +421,10 @@ impl AppState {
 
     pub async fn discovery_failure_counts_snapshot(&self) -> HashMap<String, u64> {
         self.discovery_failure_counts.read().await.clone()
+    }
+
+    pub async fn browser_status_snapshot(&self) -> BrowserStatus {
+        self.browser_status.read().await.clone()
     }
 
     pub async fn is_trusted(&self, fp: &str) -> bool {
@@ -447,5 +500,65 @@ impl AppState {
                 metrics.bytes_received = metrics.bytes_received.saturating_add(bytes_transferred);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeviceInfo, Platform, ReachabilityStatus, SessionInfo};
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::str::FromStr;
+    use std::time::Instant;
+
+    fn sample_device(addrs: Vec<SocketAddr>) -> DeviceInfo {
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "s1".to_string(),
+            SessionInfo {
+                session_id: "s1".to_string(),
+                addrs,
+                last_seen_unix: 1,
+                last_seen_instant: Instant::now(),
+            },
+        );
+        DeviceInfo {
+            fingerprint: "fp".to_string(),
+            name: "peer".to_string(),
+            platform: Platform::Windows,
+            trusted: false,
+            sessions,
+            last_seen: 1,
+            reachability: ReachabilityStatus::Discovered,
+            probe_fail_count: 0,
+            last_probe_at: None,
+            last_probe_result: None,
+            last_probe_error: None,
+            last_probe_error_detail: None,
+            last_probe_addr: None,
+            last_probe_attempted_addrs: Vec::new(),
+            last_resolve_raw_addr_count: 0,
+            last_resolve_usable_addr_count: 0,
+            last_resolve_hostname: None,
+            last_resolve_port: None,
+            last_resolve_at: None,
+        }
+    }
+
+    #[test]
+    fn best_addrs_prefers_connectable_when_mixed_candidates_exist() {
+        let device = sample_device(vec![
+            SocketAddr::from_str("[fe80::1]:9443").expect("addr"),
+            SocketAddr::from_str("192.168.1.8:9443").expect("addr"),
+        ]);
+        let best = device.best_addrs().expect("best addrs");
+        assert_eq!(best, vec![SocketAddr::from_str("192.168.1.8:9443").expect("addr")]);
+    }
+
+    #[test]
+    fn best_addrs_keeps_scope_less_link_local_when_only_candidate() {
+        let device = sample_device(vec![SocketAddr::from_str("[fe80::1]:9443").expect("addr")]);
+        let best = device.best_addrs().expect("best addrs");
+        assert_eq!(best, vec![SocketAddr::from_str("[fe80::1]:9443").expect("addr")]);
     }
 }

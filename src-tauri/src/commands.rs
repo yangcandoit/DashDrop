@@ -3,7 +3,7 @@ use crate::state::{AppState, DeviceInfo, Platform, ReachabilityStatus, SessionIn
 use crate::transport::connect_to_peer;
 use crate::transport::sender::send_files;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -453,6 +453,16 @@ pub async fn connect_by_address(
                 reachability: ReachabilityStatus::Reachable,
                 probe_fail_count: 0,
                 last_probe_at: Some(now_unix),
+                last_probe_result: Some("ok".to_string()),
+                last_probe_error: None,
+                last_probe_error_detail: None,
+                last_probe_addr: Some(selected_addr.to_string()),
+                last_probe_attempted_addrs: vec![selected_addr.to_string()],
+                last_resolve_raw_addr_count: 1,
+                last_resolve_usable_addr_count: 1,
+                last_resolve_hostname: Some(selected_addr.ip().to_string()),
+                last_resolve_port: Some(selected_addr.port()),
+                last_resolve_at: Some(now_unix),
             });
         device.sessions.insert(
             session_id.clone(),
@@ -467,6 +477,16 @@ pub async fn connect_by_address(
         device.reachability = ReachabilityStatus::Reachable;
         device.last_probe_at = Some(now_unix);
         device.probe_fail_count = 0;
+        device.last_probe_result = Some("ok".to_string());
+        device.last_probe_error = None;
+        device.last_probe_error_detail = None;
+        device.last_probe_addr = Some(selected_addr.to_string());
+        device.last_probe_attempted_addrs = vec![selected_addr.to_string()];
+        device.last_resolve_raw_addr_count = 1;
+        device.last_resolve_usable_addr_count = 1;
+        device.last_resolve_hostname = Some(selected_addr.ip().to_string());
+        device.last_resolve_port = Some(selected_addr.port());
+        device.last_resolve_at = Some(now_unix);
         device.trusted = trusted;
         let name = device.name.clone();
         let payload = DeviceView::from(&*device);
@@ -649,7 +669,7 @@ pub async fn retry_transfer(
 }
 
 #[cfg(test)]
-mod tests {
+mod diagnostics_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -930,45 +950,15 @@ pub async fn get_discovery_diagnostics(
     let session_index_count = state.session_index.read().await.len();
     let discovery_event_counts = state.discovery_event_counts_snapshot().await;
     let discovery_failure_counts = state.discovery_failure_counts_snapshot().await;
+    let browser_status = state.browser_status_snapshot().await;
+    let listener_mode = state.listener_mode.read().await.clone();
+    let listener_addrs = state.listener_addrs.read().await.clone();
+    let network_interfaces = collect_network_interfaces();
     let devices = state.devices.read().await;
 
     let device_rows: Vec<serde_json::Value> = devices
         .values()
-        .map(|d| {
-            let mut sessions: Vec<serde_json::Value> = d
-                .sessions
-                .values()
-                .map(|s| {
-                    serde_json::json!({
-                        "session_id": s.session_id,
-                        "last_seen_unix": s.last_seen_unix,
-                        "addrs": s.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
-                    })
-                })
-                .collect();
-            sessions.sort_by_key(|s| {
-                std::cmp::Reverse(s["last_seen_unix"].as_u64().unwrap_or_default())
-            });
-            let best_addrs = d
-                .best_addrs()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|a| a.to_string())
-                .collect::<Vec<_>>();
-            serde_json::json!({
-                "fingerprint": d.fingerprint,
-                "name": d.name,
-                "platform": d.platform,
-                "trusted": d.trusted,
-                "reachability": d.reachability,
-                "probe_fail_count": d.probe_fail_count,
-                "last_probe_at": d.last_probe_at,
-                "last_seen": d.last_seen,
-                "session_count": d.sessions.len(),
-                "best_addrs": best_addrs,
-                "sessions": sessions,
-            })
-        })
+        .map(discovery_device_row)
         .collect();
 
     let resolved_events = discovery_event_counts
@@ -983,6 +973,26 @@ pub async fn get_discovery_diagnostics(
         .values()
         .filter(|d| d.reachability == ReachabilityStatus::Reachable)
         .count();
+    let ipv6_only_candidates = devices
+        .values()
+        .filter(|d| {
+            let best = d.best_addrs().unwrap_or_default();
+            !best.is_empty() && best.iter().all(|addr| addr.is_ipv6())
+        })
+        .count();
+    let scope_less_link_local_peers = devices
+        .values()
+        .filter(|d| {
+            d.sessions.values().any(|s| {
+                s.addrs.iter().any(|addr| match addr {
+                    std::net::SocketAddr::V6(v6) => {
+                        v6.ip().is_unicast_link_local() && v6.scope_id() == 0
+                    }
+                    std::net::SocketAddr::V4(_) => false,
+                })
+            })
+        })
+        .count();
     let local_instance_name = mdns_service_fullname
         .as_ref()
         .and_then(|s| s.split('.').next().map(|part| part.to_string()));
@@ -993,7 +1003,13 @@ pub async fn get_discovery_diagnostics(
                 .to_string(),
         );
     }
-    if search_started_events == 0 {
+    if !browser_status.active {
+        quick_hints.push(
+            "mDNS browser is currently inactive and auto-restarting; discovery may be temporarily stale."
+                .to_string(),
+        );
+    }
+    if search_started_events == 0 && browser_status.restart_count == 0 {
         quick_hints.push(
             "mDNS browser has not reported SearchStarted; check local-network permission and multicast interface availability."
                 .to_string(),
@@ -1010,6 +1026,18 @@ pub async fn get_discovery_diagnostics(
                 .to_string(),
         );
     }
+    if listener_mode == "ipv4_only_fallback" {
+        quick_hints.push(
+            "Listener is running in IPv4-only fallback mode; IPv6-only peers may fail to connect."
+                .to_string(),
+        );
+        if ipv6_only_candidates > 0 {
+            quick_hints.push(
+                "Some discovered peers currently advertise IPv6-only candidate addresses while listener is IPv4-only."
+                    .to_string(),
+            );
+        }
+    }
     if discovery_failure_counts
         .get("resolved_no_usable_addrs")
         .copied()
@@ -1021,15 +1049,31 @@ pub async fn get_discovery_diagnostics(
                 .to_string(),
         );
     }
+    if scope_less_link_local_peers > 0 {
+        quick_hints.push(
+            "Some peers are advertising scope-less IPv6 link-local addresses (fe80:: without interface scope); these are often not connectable across platforms."
+                .to_string(),
+        );
+    }
 
     Ok(serde_json::json!({
         "runtime": runtime,
+        "service_type": crate::discovery::service::SERVICE_TYPE,
         "own_fingerprint": state.identity.fingerprint.clone(),
         "own_platform": Platform::current(),
         "mdns_daemon_initialized": mdns_daemon_initialized,
         "mdns_service_fullname": mdns_service_fullname,
         "mdns_last_search_started": mdns_last_search_started,
         "local_instance_name": local_instance_name,
+        "listener_mode": listener_mode,
+        "listener_addrs": listener_addrs,
+        "network_interfaces": network_interfaces,
+        "browser_status": serde_json::json!({
+            "active": browser_status.active,
+            "restart_count": browser_status.restart_count,
+            "last_disconnect_at": browser_status.last_disconnect_at,
+            "last_search_started": mdns_last_search_started,
+        }),
         "session_index_count": session_index_count,
         "discovery_event_counts": discovery_event_counts,
         "discovery_failure_counts": discovery_failure_counts,
@@ -1037,6 +1081,168 @@ pub async fn get_discovery_diagnostics(
         "device_count": device_rows.len(),
         "devices": device_rows,
     }))
+}
+
+fn collect_network_interfaces() -> Vec<serde_json::Value> {
+    let mut grouped: BTreeMap<String, (bool, Vec<String>, Vec<String>)> = BTreeMap::new();
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in ifaces {
+            let entry = grouped
+                .entry(iface.name.clone())
+                .or_insert((iface.is_loopback(), Vec::new(), Vec::new()));
+            entry.0 = entry.0 || iface.is_loopback();
+            let ip = iface.ip().to_string();
+            if iface.ip().is_ipv4() {
+                if !entry.1.contains(&ip) {
+                    entry.1.push(ip);
+                }
+            } else if !entry.2.contains(&ip) {
+                entry.2.push(ip);
+            }
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(name, (is_loopback, ipv4, ipv6))| {
+            serde_json::json!({
+                "name": name,
+                "is_loopback": is_loopback,
+                "ipv4": ipv4,
+                "ipv6": ipv6,
+            })
+        })
+        .collect()
+}
+
+fn discovery_device_row(d: &DeviceInfo) -> serde_json::Value {
+    let scope_less_link_local_ipv6 = d
+        .sessions
+        .values()
+        .flat_map(|s| s.addrs.iter())
+        .filter(|addr| match addr {
+            std::net::SocketAddr::V6(v6) => v6.ip().is_unicast_link_local() && v6.scope_id() == 0,
+            std::net::SocketAddr::V4(_) => false,
+        })
+        .count();
+    let mut sessions: Vec<serde_json::Value> = d
+        .sessions
+        .values()
+        .map(|s| {
+            serde_json::json!({
+                "session_id": s.session_id,
+                "last_seen_unix": s.last_seen_unix,
+                "addrs": s.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    sessions.sort_by_key(|s| std::cmp::Reverse(s["last_seen_unix"].as_u64().unwrap_or_default()));
+    let best_addrs = d
+        .best_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| a.to_string())
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "fingerprint": d.fingerprint,
+        "name": d.name,
+        "platform": d.platform,
+        "trusted": d.trusted,
+        "reachability": d.reachability,
+        "probe_fail_count": d.probe_fail_count,
+        "last_probe_at": d.last_probe_at,
+        "last_seen": d.last_seen,
+        "session_count": d.sessions.len(),
+        "best_addrs": best_addrs,
+        "scope_less_link_local_ipv6_count": scope_less_link_local_ipv6,
+        "last_resolve_stats": {
+            "raw_addr_count": d.last_resolve_raw_addr_count,
+            "usable_addr_count": d.last_resolve_usable_addr_count,
+            "hostname": d.last_resolve_hostname,
+            "port": d.last_resolve_port,
+            "at": d.last_resolve_at,
+        },
+        "last_probe_result": {
+            "result": d.last_probe_result,
+            "error": d.last_probe_error,
+            "error_detail": d.last_probe_error_detail,
+            "addr": d.last_probe_addr,
+            "attempted_addrs": d.last_probe_attempted_addrs,
+            "at": d.last_probe_at,
+        },
+        "sessions": sessions,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collect_network_interfaces, discovery_device_row};
+    use crate::state::{DeviceInfo, Platform, ReachabilityStatus, SessionInfo};
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::str::FromStr;
+    use std::time::Instant;
+
+    #[test]
+    fn discovery_device_row_contains_resolve_and_probe_details() {
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "s1".to_string(),
+            SessionInfo {
+                session_id: "s1".to_string(),
+                addrs: vec![SocketAddr::from_str("192.168.1.8:9443").expect("addr")],
+                last_seen_unix: 200,
+                last_seen_instant: Instant::now(),
+            },
+        );
+        let device = DeviceInfo {
+            fingerprint: "fp-1".to_string(),
+            name: "peer".to_string(),
+            platform: Platform::Windows,
+            trusted: false,
+            sessions,
+            last_seen: 200,
+            reachability: ReachabilityStatus::Discovered,
+            probe_fail_count: 2,
+            last_probe_at: Some(199),
+            last_probe_result: Some("failed".to_string()),
+            last_probe_error: Some("timeout".to_string()),
+            last_probe_error_detail: Some("connection timed out".to_string()),
+            last_probe_addr: Some("192.168.1.8:9443".to_string()),
+            last_probe_attempted_addrs: vec!["192.168.1.8:9443".to_string()],
+            last_resolve_raw_addr_count: 2,
+            last_resolve_usable_addr_count: 1,
+            last_resolve_hostname: Some("peer.local.".to_string()),
+            last_resolve_port: Some(9443),
+            last_resolve_at: Some(198),
+        };
+
+        let row = discovery_device_row(&device);
+        assert_eq!(row["last_resolve_stats"]["raw_addr_count"].as_u64(), Some(2));
+        assert_eq!(row["last_resolve_stats"]["usable_addr_count"].as_u64(), Some(1));
+        assert_eq!(
+            row["last_probe_result"]["result"].as_str(),
+            Some("failed")
+        );
+        assert_eq!(
+            row["last_probe_result"]["error"].as_str(),
+            Some("timeout")
+        );
+        assert_eq!(
+            row["last_probe_result"]["addr"].as_str(),
+            Some("192.168.1.8:9443")
+        );
+    }
+
+    #[test]
+    fn collect_network_interfaces_has_family_buckets() {
+        let rows = collect_network_interfaces();
+        for row in rows {
+            assert!(row.get("name").is_some());
+            assert!(row.get("is_loopback").is_some());
+            assert!(row.get("ipv4").is_some());
+            assert!(row.get("ipv6").is_some());
+        }
+    }
 }
 
 #[tauri::command]

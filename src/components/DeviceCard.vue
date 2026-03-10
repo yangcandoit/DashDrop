@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref, watchEffect } from 'vue';
+import { computed, ref } from 'vue';
 import type { DeviceView } from '../types';
+import { firstUsableAddress, hasAnySession, hasUsableAddress, isDeviceOnline } from '../devicePresence';
 
 const props = defineProps<{
   device: DeviceView;
@@ -53,9 +54,15 @@ const timeAgo = (unixSecs: number) => {
 };
 
 const getAddr = () => {
-  const sessions = Object.values(props.device.sessions || {});
-  if (sessions.length > 0 && sessions[0].addrs && sessions[0].addrs.length > 0) {
-    return sessions[0].addrs[0];
+  const usableAddr = firstUsableAddress(props.device);
+  if (usableAddr) {
+    return usableAddr;
+  }
+  if (hasAnySession(props.device) && !hasUsableAddress(props.device)) {
+    if (props.device.reachability === 'offline' || props.device.reachability === 'offline_candidate') {
+      return 'Unreachable (address pending)';
+    }
+    return 'Discovering (address pending)';
   }
   if (props.device.last_seen && props.device.last_seen > 0) {
     return `Last seen ${timeAgo(props.device.last_seen)}`;
@@ -63,10 +70,7 @@ const getAddr = () => {
   return 'Offline';
 };
 
-const isOffline = ref(Object.keys(props.device.sessions || {}).length === 0);
-watchEffect(() => {
-  isOffline.value = Object.keys(props.device.sessions || {}).length === 0;
-});
+const isOffline = computed(() => !isDeviceOnline(props.device));
 </script>
 
 <template>

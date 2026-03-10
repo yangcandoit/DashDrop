@@ -69,19 +69,50 @@ onMounted(async () => {
 
 async function copyFingerprint() {
   try {
-    await navigator.clipboard.writeText(fingerprint.value);
+    await copyToClipboard(fingerprint.value);
   } catch (e) {
     console.error('Failed to copy', e);
+  }
+}
+
+async function copyToClipboard(text: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return;
+  } catch (clipboardErr) {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', 'true');
+    textarea.style.position = 'fixed';
+    textarea.style.top = '-9999px';
+    textarea.style.left = '-9999px';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    const copied = document.execCommand('copy');
+    document.body.removeChild(textarea);
+    if (!copied) {
+      throw clipboardErr;
+    }
   }
 }
 
 async function copyDiscoveryDiagnostics() {
   try {
     const diagnostics = await getDiscoveryDiagnostics();
-    await navigator.clipboard.writeText(JSON.stringify(diagnostics, null, 2));
-    await message('Discovery diagnostics copied to clipboard.', { title: 'Copied', kind: 'info' });
+    await copyToClipboard(JSON.stringify(diagnostics, null, 2));
+    try {
+      await message('Discovery diagnostics copied to clipboard.', { title: 'Copied', kind: 'info' });
+    } catch (noticeError) {
+      console.debug('Unable to show copied notice:', noticeError);
+    }
   } catch (e: unknown) {
-    await message(String(e), { title: 'Copy Diagnostics Failed', kind: 'error' });
+    try {
+      await message(String(e), { title: 'Copy Diagnostics Failed', kind: 'error' });
+    } catch (noticeError) {
+      console.debug('Unable to show diagnostics error notice:', noticeError);
+    }
   }
 }
 
@@ -251,6 +282,9 @@ async function save() {
   display: flex;
   flex-direction: column;
   gap: 16px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .security-warning {

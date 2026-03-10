@@ -85,6 +85,16 @@ fn probe_state_transitions_to_offline_after_grace_period() {
         reachability: ReachabilityStatus::OfflineCandidate,
         probe_fail_count: 1,
         last_probe_at: Some(100),
+        last_probe_result: None,
+        last_probe_error: None,
+        last_probe_error_detail: None,
+        last_probe_addr: None,
+        last_probe_attempted_addrs: Vec::new(),
+        last_resolve_raw_addr_count: 0,
+        last_resolve_usable_addr_count: 0,
+        last_resolve_hostname: None,
+        last_resolve_port: None,
+        last_resolve_at: None,
     };
 
     assert!(!dashdrop_lib::discovery::browser::should_mark_offline(
@@ -115,6 +125,16 @@ fn offline_device_emits_lost_after_retention_window() {
         reachability: ReachabilityStatus::Offline,
         probe_fail_count: 2,
         last_probe_at: Some(100),
+        last_probe_result: None,
+        last_probe_error: None,
+        last_probe_error_detail: None,
+        last_probe_addr: None,
+        last_probe_attempted_addrs: Vec::new(),
+        last_resolve_raw_addr_count: 0,
+        last_resolve_usable_addr_count: 0,
+        last_resolve_hostname: None,
+        last_resolve_port: None,
+        last_resolve_at: None,
     };
     assert!(!dashdrop_lib::discovery::browser::should_emit_device_lost(
         &device, 144

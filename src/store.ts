@@ -96,7 +96,7 @@ function summarizeTransferError(err: { reason_code: string; terminal_cause: stri
   const rawDetail = err.detail || (!err.reason_code.startsWith("E_") ? err.reason_code : "");
   const detail = rawDetail.toLowerCase();
   if (detail.includes("read len") || detail.includes("read body")) {
-    return "Peer closed control stream before accept/reject";
+    return "Peer closed the control stream unexpectedly";
   }
   if (err.terminal_cause === "ProtocolSequenceError") {
     return "Peer rejected protocol sequence (possible version mismatch)";
