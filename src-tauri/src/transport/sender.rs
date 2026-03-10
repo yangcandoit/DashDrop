@@ -19,11 +19,19 @@ use crate::transport::events::{
 };
 use crate::transport::protocol::{
     read_message, write_message, ChunkPayload, CompletePayload, DashMessage, ErrorCode, FailedFile,
-    FileItem, FileType, OfferPayload, TransferOutcome, CHUNK_SIZE, USER_RESPONSE_TIMEOUT_SECS,
+    FileItem, FileType, OfferPayload, SourceSnapshot, TransferOutcome, CHUNK_SIZE,
+    USER_RESPONSE_TIMEOUT_SECS,
 };
 
 type AckResult = (u32, bool, Option<ErrorCode>);
 type AckWaiters = Arc<Mutex<HashMap<u32, oneshot::Sender<(bool, Option<ErrorCode>)>>>>;
+const SOURCE_SNAPSHOT_HEAD_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResumeSourcePolicy {
+    ReuseExistingProgress,
+    RestartFull { reason: String },
+}
 
 fn error_code_key(code: &ErrorCode) -> String {
     code.reason_code().to_string()
@@ -55,6 +63,22 @@ pub async fn send_files(
     }
 
     let items: Vec<FileItem> = items_with_paths.iter().map(|(i, _)| i.clone()).collect();
+    let current_source_snapshots: HashMap<u32, SourceSnapshot> = items
+        .iter()
+        .filter_map(|item| {
+            item.source_snapshot
+                .clone()
+                .map(|snapshot| (item.file_id, snapshot))
+        })
+        .collect();
+    let existing_source_snapshots = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|guard| crate::db::load_transfer_source_snapshots(&guard, &transfer_id).ok())
+        .flatten();
+    let resume_source_policy =
+        validate_resume_source_snapshots(existing_source_snapshots.as_ref(), &items);
 
     let total_size: u64 = items.iter().map(|f| f.size).sum();
     let started_at_unix = std::time::SystemTime::now()
@@ -111,6 +135,30 @@ pub async fn send_files(
                 conn: Some(conn.clone()),
                 ended_at: None,
             },
+        );
+    }
+    if let ResumeSourcePolicy::RestartFull { reason } = &resume_source_policy {
+        tracing::warn!(
+            transfer_id = %transfer_id,
+            peer_fp = %peer_fp,
+            reason = %reason,
+            "source snapshot changed before resume; falling back to full retransmit"
+        );
+        if let Ok(guard) = state.db.lock() {
+            let _ = crate::db::log_security_event(
+                &guard,
+                "resume_source_changed",
+                "send_prepare",
+                Some(&peer_fp),
+                reason,
+            );
+        }
+    }
+    if let Ok(guard) = state.db.lock() {
+        let _ = crate::db::save_transfer_source_snapshots(
+            &guard,
+            &transfer_id,
+            &current_source_snapshots,
         );
     }
 
@@ -589,6 +637,74 @@ fn determine_outcome(
     }
 }
 
+fn validate_resume_source_snapshots(
+    previous: Option<&HashMap<u32, SourceSnapshot>>,
+    items: &[FileItem],
+) -> ResumeSourcePolicy {
+    let Some(previous) = previous else {
+        return ResumeSourcePolicy::ReuseExistingProgress;
+    };
+
+    let current: HashMap<u32, (&str, &SourceSnapshot)> = items
+        .iter()
+        .filter_map(|item| {
+            item.source_snapshot
+                .as_ref()
+                .map(|snapshot| (item.file_id, (item.rel_path.as_str(), snapshot)))
+        })
+        .collect();
+
+    let mut changed = Vec::new();
+    let mut previous_ids: Vec<u32> = previous.keys().copied().collect();
+    previous_ids.sort_unstable();
+    for file_id in previous_ids {
+        let Some(previous_snapshot) = previous.get(&file_id) else {
+            continue;
+        };
+        match current.get(&file_id) {
+            Some((rel_path, current_snapshot)) => {
+                let mut fields = Vec::new();
+                if previous_snapshot.size != current_snapshot.size {
+                    fields.push("size");
+                }
+                if previous_snapshot.mtime_unix_ms != current_snapshot.mtime_unix_ms {
+                    fields.push("mtime");
+                }
+                if previous_snapshot.head_hash != current_snapshot.head_hash {
+                    fields.push("head_hash");
+                }
+                if !fields.is_empty() {
+                    changed.push(format!(
+                        "{rel_path}(file_id={file_id}):{}",
+                        fields.join(",")
+                    ));
+                }
+            }
+            None => changed.push(format!("file_id={file_id}:missing")),
+        }
+    }
+
+    let mut current_only_ids: Vec<u32> = current
+        .keys()
+        .copied()
+        .filter(|file_id| !previous.contains_key(file_id))
+        .collect();
+    current_only_ids.sort_unstable();
+    for file_id in current_only_ids {
+        if let Some((rel_path, _)) = current.get(&file_id) {
+            changed.push(format!("{rel_path}(file_id={file_id}):added"));
+        }
+    }
+
+    if changed.is_empty() {
+        ResumeSourcePolicy::ReuseExistingProgress
+    } else {
+        ResumeSourcePolicy::RestartFull {
+            reason: format!("source snapshot mismatch: {}", changed.join("; ")),
+        }
+    }
+}
+
 async fn send_one_file(
     item: FileItem,
     src_path: PathBuf,
@@ -828,6 +944,7 @@ async fn collect_items(
                 size: 0,
                 file_type: FileType::Directory,
                 modified,
+                source_snapshot: None,
             },
             path.clone(),
         ));
@@ -839,6 +956,8 @@ async fn collect_items(
             Box::pin(collect_items(&child_path, base, items, next_id)).await?;
         }
     } else if meta.is_file() {
+        let source_snapshot =
+            Some(build_source_snapshot(path, meta.len(), meta.modified().ok()).await?);
         // Only regular files; symlinks already skipped above
         items.push((
             FileItem {
@@ -848,6 +967,7 @@ async fn collect_items(
                 size: meta.len(),
                 file_type: FileType::RegularFile,
                 modified,
+                source_snapshot,
             },
             path.clone(),
         ));
@@ -858,10 +978,51 @@ async fn collect_items(
     Ok(())
 }
 
+async fn build_source_snapshot(
+    path: &PathBuf,
+    file_size: u64,
+    modified: Option<std::time::SystemTime>,
+) -> Result<SourceSnapshot> {
+    let file = File::open(path)
+        .await
+        .with_context(|| format!("open source snapshot file {}", path.display()))?;
+    let mut limited = file.take(std::cmp::min(SOURCE_SNAPSHOT_HEAD_BYTES as u64, file_size));
+    let mut hasher = Hasher::new();
+    let mut buf = vec![0u8; 64 * 1024];
+
+    loop {
+        let n = limited
+            .read(&mut buf)
+            .await
+            .with_context(|| format!("read source snapshot head {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+
+    let mtime_unix_ms = modified
+        .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+
+    Ok(SourceSnapshot {
+        size: file_size,
+        mtime_unix_ms,
+        head_hash: hasher.finalize().into(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::determine_outcome;
+    use super::{
+        build_source_snapshot, determine_outcome, validate_resume_source_snapshots,
+        ResumeSourcePolicy, SOURCE_SNAPSHOT_HEAD_BYTES,
+    };
     use crate::transport::protocol::{ErrorCode, FileItem, FileType, TransferOutcome};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::time::Duration;
     use tokio::task::JoinHandle;
 
     fn file(file_id: u32, name: &str) -> FileItem {
@@ -872,7 +1033,12 @@ mod tests {
             size: 1,
             file_type: FileType::RegularFile,
             modified: 0,
+            source_snapshot: None,
         }
+    }
+
+    fn temp_file_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("dashdrop-{name}-{}", uuid::Uuid::new_v4()))
     }
 
     #[test]
@@ -1012,5 +1178,70 @@ mod tests {
                 "recovery must be Success at round {round}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn source_snapshot_hashes_entire_small_file_under_one_megabyte() {
+        let path = temp_file_path("small-snapshot.bin");
+        let data = vec![0x5Au8; SOURCE_SNAPSHOT_HEAD_BYTES - 17];
+        tokio::fs::write(&path, &data)
+            .await
+            .expect("write test file");
+
+        let snapshot = build_source_snapshot(&path, data.len() as u64, None)
+            .await
+            .expect("snapshot");
+
+        assert_eq!(snapshot.size, data.len() as u64);
+        let expected_hash: [u8; 32] = blake3::hash(&data).into();
+        assert_eq!(snapshot.head_hash, expected_hash);
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn modified_source_forces_full_restart_before_resume() {
+        let path = temp_file_path("resume-change.bin");
+        tokio::fs::write(&path, b"original-content")
+            .await
+            .expect("write original file");
+        let previous_snapshot = build_source_snapshot(&path, 16, None)
+            .await
+            .expect("previous snapshot");
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::fs::write(&path, b"updated-content!")
+            .await
+            .expect("rewrite file");
+        let metadata = tokio::fs::metadata(&path).await.expect("metadata");
+        let current_snapshot =
+            build_source_snapshot(&path, metadata.len(), metadata.modified().ok())
+                .await
+                .expect("current snapshot");
+        let items = vec![FileItem {
+            file_id: 1,
+            name: "resume-change.bin".into(),
+            rel_path: "resume-change.bin".into(),
+            size: metadata.len(),
+            file_type: FileType::RegularFile,
+            modified: 0,
+            source_snapshot: Some(current_snapshot),
+        }];
+
+        let policy = validate_resume_source_snapshots(
+            Some(&HashMap::from([(1u32, previous_snapshot)])),
+            &items,
+        );
+
+        match policy {
+            ResumeSourcePolicy::RestartFull { reason } => {
+                assert!(reason.contains("resume-change.bin"));
+            }
+            ResumeSourcePolicy::ReuseExistingProgress => {
+                panic!("modified source must force a full restart")
+            }
+        }
+
+        let _ = tokio::fs::remove_file(&path).await;
     }
 }

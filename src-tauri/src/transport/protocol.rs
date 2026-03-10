@@ -77,6 +77,13 @@ pub enum FileType {
     Directory,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceSnapshot {
+    pub size: u64,
+    pub mtime_unix_ms: u64,
+    pub head_hash: [u8; 32],
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileItem {
     pub file_id: u32,
@@ -85,6 +92,8 @@ pub struct FileItem {
     pub size: u64,
     pub file_type: FileType,
     pub modified: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_snapshot: Option<SourceSnapshot>,
 }
 
 // ─── Message Payloads ─────────────────────────────────────────────────────────
@@ -218,7 +227,7 @@ pub async fn read_message(recv: &mut quinn::RecvStream) -> Result<DashMessage> {
 
 #[cfg(test)]
 mod tests {
-    use super::ErrorCode;
+    use super::{ErrorCode, FileItem, FileType, SourceSnapshot};
 
     #[test]
     fn reason_codes_match_protocol_shape() {
@@ -226,5 +235,40 @@ mod tests {
         assert_eq!(ErrorCode::Timeout.reason_code(), "E_TIMEOUT");
         assert_eq!(ErrorCode::RateLimited.reason_code(), "E_RATE_LIMITED");
         assert_eq!(ErrorCode::Protocol("x".into()).reason_code(), "E_PROTOCOL");
+    }
+
+    #[test]
+    fn file_item_deserializes_without_optional_source_snapshot() {
+        let json = serde_json::json!({
+            "file_id": 7,
+            "name": "demo.txt",
+            "rel_path": "demo.txt",
+            "size": 12,
+            "file_type": "RegularFile",
+            "modified": 42
+        });
+
+        let item: FileItem = serde_json::from_value(json).expect("file item");
+        assert!(item.source_snapshot.is_none());
+    }
+
+    #[test]
+    fn file_item_serializes_with_source_snapshot_when_present() {
+        let item = FileItem {
+            file_id: 1,
+            name: "demo.txt".into(),
+            rel_path: "demo.txt".into(),
+            size: 3,
+            file_type: FileType::RegularFile,
+            modified: 99,
+            source_snapshot: Some(SourceSnapshot {
+                size: 3,
+                mtime_unix_ms: 1234,
+                head_hash: [9u8; 32],
+            }),
+        };
+
+        let value = serde_json::to_value(item).expect("serialize");
+        assert!(value.get("source_snapshot").is_some());
     }
 }

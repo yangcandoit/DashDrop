@@ -1,6 +1,7 @@
 use crate::state::{
     AppConfig, SecurityEvent, TransferDirection, TransferMetrics, TransferTask, TrustedPeer,
 };
+use crate::transport::protocol::SourceSnapshot;
 use anyhow::Result;
 use rusqlite::types::Type;
 use rusqlite::{params, Connection};
@@ -74,6 +75,14 @@ pub fn init_db(app: &AppHandle) -> Result<Connection> {
             phase TEXT NOT NULL,
             peer_fingerprint TEXT,
             reason TEXT NOT NULL
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS transfer_resume_snapshots (
+            transfer_id TEXT PRIMARY KEY,
+            snapshots_json TEXT NOT NULL
         )",
         [],
     )?;
@@ -306,6 +315,39 @@ pub fn get_transfer_metrics(conn: &Connection) -> Result<TransferMetrics> {
     Ok(metrics)
 }
 
+pub fn save_transfer_source_snapshots(
+    conn: &Connection,
+    transfer_id: &str,
+    snapshots: &HashMap<u32, SourceSnapshot>,
+) -> Result<()> {
+    let snapshots_json = serde_json::to_string(snapshots)?;
+    conn.execute(
+        "INSERT INTO transfer_resume_snapshots (transfer_id, snapshots_json)
+         VALUES (?1, ?2)
+         ON CONFLICT(transfer_id) DO UPDATE SET snapshots_json = excluded.snapshots_json",
+        params![transfer_id, snapshots_json],
+    )?;
+    Ok(())
+}
+
+pub fn load_transfer_source_snapshots(
+    conn: &Connection,
+    transfer_id: &str,
+) -> Result<Option<HashMap<u32, SourceSnapshot>>> {
+    let mut stmt = conn.prepare(
+        "SELECT snapshots_json
+         FROM transfer_resume_snapshots
+         WHERE transfer_id = ?1",
+    )?;
+    let mut rows = stmt.query(params![transfer_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let snapshots_json: String = row.get(0)?;
+    let snapshots = serde_json::from_str(&snapshots_json)?;
+    Ok(Some(snapshots))
+}
+
 pub fn log_security_event(
     conn: &Connection,
     event_type: &str,
@@ -355,8 +397,43 @@ pub fn get_security_events(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_direction;
+    use super::{load_transfer_source_snapshots, parse_direction, save_transfer_source_snapshots};
     use crate::state::TransferDirection;
+    use crate::transport::protocol::SourceSnapshot;
+    use rusqlite::Connection;
+    use std::collections::HashMap;
+
+    fn setup_test_db() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute(
+            "CREATE TABLE transfers_history (
+                id TEXT PRIMARY KEY,
+                direction TEXT NOT NULL,
+                peer_fingerprint TEXT NOT NULL,
+                peer_name TEXT NOT NULL,
+                items TEXT NOT NULL,
+                status TEXT NOT NULL,
+                bytes_transferred INTEGER NOT NULL,
+                total_bytes INTEGER NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0,
+                started_at INTEGER NOT NULL DEFAULT 0,
+                ended_at INTEGER NOT NULL,
+                reason_code TEXT,
+                error TEXT
+            )",
+            [],
+        )
+        .expect("history table");
+        conn.execute(
+            "CREATE TABLE transfer_resume_snapshots (
+                transfer_id TEXT PRIMARY KEY,
+                snapshots_json TEXT NOT NULL
+            )",
+            [],
+        )
+        .expect("snapshot table");
+        conn
+    }
 
     #[test]
     fn parse_direction_rejects_invalid_value() {
@@ -375,5 +452,24 @@ mod tests {
             parse_direction("Receive".to_string()).expect("receive direction"),
             TransferDirection::Receive
         );
+    }
+
+    #[test]
+    fn transfer_source_snapshots_round_trip() {
+        let conn = setup_test_db();
+        let mut snapshots = HashMap::new();
+        snapshots.insert(
+            1,
+            SourceSnapshot {
+                size: 12,
+                mtime_unix_ms: 34,
+                head_hash: [7u8; 32],
+            },
+        );
+
+        save_transfer_source_snapshots(&conn, "transfer-1", &snapshots).expect("save snapshots");
+        let loaded = load_transfer_source_snapshots(&conn, "transfer-1").expect("load snapshots");
+
+        assert_eq!(loaded, Some(snapshots));
     }
 }
