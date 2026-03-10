@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
-use mdns_sd::{ServiceDaemon, ServiceEvent};
+use mdns_sd::{HostnameResolutionEvent, ServiceDaemon, ServiceEvent};
 use std::collections::HashSet;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter};
 
@@ -12,6 +13,7 @@ use crate::state::{AppState, DeviceInfo, Platform, SessionIndexEntry, SessionInf
 
 const OFFLINE_GRACE_SECS: u64 = 15;
 const DEVICE_LOST_RETENTION_SECS: u64 = 45;
+const HOSTNAME_RESOLVE_TIMEOUT_MS: u64 = 1500;
 
 fn is_usable_peer_addr(addr: &SocketAddr) -> bool {
     if addr.ip().is_loopback() || addr.ip().is_unspecified() || addr.ip().is_multicast() {
@@ -19,9 +21,122 @@ fn is_usable_peer_addr(addr: &SocketAddr) -> bool {
     }
     match addr {
         SocketAddr::V4(_v4) => true,
-        // Link-local IPv6 without scope id is typically not routable to peer.
-        SocketAddr::V6(v6) => !(v6.ip().is_unicast_link_local() && v6.scope_id() == 0),
+        SocketAddr::V6(_v6) => true,
     }
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn sort_dedupe_addrs(addrs: &mut Vec<SocketAddr>) {
+    addrs.sort_by_key(|a| if a.is_ipv4() { 0 } else { 1 });
+    let mut seen = HashSet::new();
+    addrs.retain(|a| seen.insert(*a));
+}
+
+fn should_apply_deferred_remove(
+    current_last_seen: u64,
+    observed_last_seen: u64,
+    now_unix: u64,
+) -> bool {
+    current_last_seen <= observed_last_seen
+        && now_unix.saturating_sub(current_last_seen) >= OFFLINE_GRACE_SECS
+}
+
+async fn resolve_hostname_with_mdns(
+    state: &Arc<AppState>,
+    hostname: &str,
+    port: u16,
+) -> Vec<SocketAddr> {
+    let Some(mdns) = state.mdns.get().cloned() else {
+        return Vec::new();
+    };
+    let lookup = if hostname.ends_with('.') {
+        hostname.to_string()
+    } else {
+        format!("{hostname}.")
+    };
+
+    let receiver = match mdns.resolve_hostname(&lookup, Some(HOSTNAME_RESOLVE_TIMEOUT_MS)) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("mDNS hostname resolve start failed for {lookup}: {e}");
+            state
+                .bump_discovery_failure("hostname_mdns_resolve_start_failed")
+                .await;
+            return Vec::new();
+        }
+    };
+
+    let deadline = std::time::Instant::now()
+        + Duration::from_millis(HOSTNAME_RESOLVE_TIMEOUT_MS.saturating_add(300));
+    let mut addrs = Vec::new();
+    while std::time::Instant::now() < deadline {
+        let wait = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .min(Duration::from_millis(250));
+        let event = tokio::task::spawn_blocking({
+            let recv = receiver.clone();
+            move || recv.recv_timeout(wait)
+        })
+        .await;
+
+        match event {
+            Ok(Ok(HostnameResolutionEvent::AddressesFound(_, found))) => {
+                addrs.extend(
+                    found
+                        .into_iter()
+                        .map(|ip| SocketAddr::new(ip, port))
+                        .filter(is_usable_peer_addr),
+                );
+                if !addrs.is_empty() {
+                    break;
+                }
+            }
+            Ok(Ok(HostnameResolutionEvent::SearchTimeout(_)))
+            | Ok(Ok(HostnameResolutionEvent::SearchStopped(_))) => break,
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => break,
+            Err(e) => {
+                tracing::warn!("mDNS hostname resolve join error for {lookup}: {e}");
+                state
+                    .bump_discovery_failure("hostname_mdns_resolve_join_error")
+                    .await;
+                break;
+            }
+        }
+    }
+
+    let _ = mdns.stop_resolve_hostname(&lookup);
+    sort_dedupe_addrs(&mut addrs);
+    if addrs.is_empty() {
+        state
+            .bump_discovery_failure("hostname_mdns_resolve_no_usable_addr")
+            .await;
+    }
+    addrs
+}
+
+async fn resolve_hostname_with_system_dns(hostname: &str, port: u16) -> Vec<SocketAddr> {
+    let resolve_target = format!("{}:{port}", hostname.trim_end_matches('.'));
+    let mut addrs = Vec::new();
+    if let Ok(resolved) = tokio::task::spawn_blocking(move || {
+        resolve_target
+            .to_socket_addrs()
+            .map(|iter| iter.collect::<Vec<SocketAddr>>())
+    })
+    .await
+    {
+        if let Ok(extra) = resolved {
+            addrs.extend(extra.into_iter().filter(is_usable_peer_addr));
+        }
+    }
+    sort_dedupe_addrs(&mut addrs);
+    addrs
 }
 
 fn remove_session_from_state(
@@ -29,18 +144,19 @@ fn remove_session_from_state(
     index: &mut std::collections::HashMap<String, SessionIndexEntry>,
     devices: &mut std::collections::HashMap<String, DeviceInfo>,
 ) -> Option<(String, bool, Option<DeviceInfo>)> {
-    let entry = index.remove(remove_key)?;
-    index.remove(&entry.session_id);
+    let entry = index
+        .get(remove_key)
+        .cloned()
+        .or_else(|| index.values().find(|e| e.session_id == remove_key).cloned())?;
+    // Remove all lookup aliases for this session id so stale fullnames can't poison future removals.
+    index.retain(|_, v| v.session_id != entry.session_id);
     let fp = entry.fingerprint.clone();
     if let Some(device) = devices.get_mut(&fp) {
         device.sessions.remove(&entry.session_id);
-        let now_empty = device.sessions.is_empty();
-        if now_empty {
+        if device.sessions.is_empty() {
             device.reachability = crate::state::ReachabilityStatus::OfflineCandidate;
-            Some((fp, false, Some(device.clone())))
-        } else {
-            Some((fp, false, Some(device.clone())))
         }
+        Some((fp, false, Some(device.clone())))
     } else {
         Some((fp, false, None))
     }
@@ -70,6 +186,7 @@ pub async fn start_browser(
     let app_events = app.clone();
     let state_events = state.clone();
     tokio::spawn(async move {
+        let mut join_error_backoff_ms: u64 = 100;
         loop {
             // mdns-sd channel receiver is Sync, use spawn_blocking to not block tokio
             let event = tokio::task::spawn_blocking({
@@ -79,10 +196,19 @@ pub async fn start_browser(
             .await;
 
             match event {
+                Ok(Ok(ServiceEvent::SearchStarted(payload))) => {
+                    *state_events.mdns_last_search_started.write().await = Some(payload.clone());
+                    state_events.bump_discovery_event("search_started").await;
+                    tracing::info!("mDNS browse started: {payload}");
+                }
                 Ok(Ok(ServiceEvent::ServiceResolved(info))) => {
+                    join_error_backoff_ms = 100;
+                    state_events.bump_discovery_event("service_resolved").await;
                     handle_resolved(&info, &own_fp, &app_events, &state_events).await;
                 }
                 Ok(Ok(ServiceEvent::ServiceRemoved(_service_type, fullname))) => {
+                    join_error_backoff_ms = 100;
+                    state_events.bump_discovery_event("service_removed").await;
                     handle_removed(&fullname, &app_events, &state_events).await;
                 }
                 Ok(Ok(_)) => {} // SearchStarted, other events
@@ -91,11 +217,14 @@ pub async fn start_browser(
                 }
                 Err(e) => {
                     tracing::warn!("mDNS browser task error: {e}");
-                    break;
+                    state_events
+                        .bump_discovery_failure("browser_spawn_blocking_join_error")
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(join_error_backoff_ms)).await;
+                    join_error_backoff_ms = (join_error_backoff_ms.saturating_mul(2)).min(5000);
                 }
             }
         }
-        tracing::info!("mDNS browser stopped");
     });
 
     let app_for_offline = app.clone();
@@ -192,25 +321,25 @@ async fn handle_resolved(
         .collect();
 
     if addrs.is_empty() {
-        let host = info.get_hostname().trim_end_matches('.').to_string();
-        let resolve_target = format!("{host}:{port}");
-        if let Ok(resolved) = tokio::task::spawn_blocking(move || {
-            resolve_target
-                .to_socket_addrs()
-                .map(|iter| iter.collect::<Vec<SocketAddr>>())
-        })
-        .await
-        {
-            if let Ok(extra) = resolved {
-                addrs.extend(extra.into_iter().filter(is_usable_peer_addr));
-            }
+        state.bump_discovery_event("resolved_empty_addr_set").await;
+        addrs.extend(resolve_hostname_with_mdns(state, info.get_hostname(), port).await);
+    }
+
+    if addrs.is_empty() {
+        addrs.extend(resolve_hostname_with_system_dns(info.get_hostname(), port).await);
+        if !addrs.is_empty() {
+            state
+                .bump_discovery_event("resolved_addr_via_system_dns")
+                .await;
+        } else {
+            state
+                .bump_discovery_failure("resolved_no_usable_addrs")
+                .await;
         }
     }
 
     // Prefer IPv4 first for cross-platform LAN interoperability.
-    addrs.sort_by_key(|a| if a.is_ipv4() { 0 } else { 1 });
-    let mut seen = HashSet::new();
-    addrs.retain(|a| seen.insert(*a));
+    sort_dedupe_addrs(&mut addrs);
 
     if addrs.is_empty() {
         tracing::debug!(
@@ -218,10 +347,14 @@ async fn handle_resolved(
             info.get_hostname(),
             port
         );
-        return;
+        // Keep unresolved peers visible for diagnostics and later refreshes.
+        state
+            .bump_discovery_event("resolved_kept_without_addrs")
+            .await;
     }
 
     let trusted = state.is_trusted(&fp).await;
+    let now_unix = now_unix_secs();
 
     let (is_new, device_model) = {
         let mut devices = state.devices.write().await;
@@ -244,18 +377,12 @@ async fn handle_resolved(
             SessionInfo {
                 session_id: session_id.clone(),
                 addrs: addrs.clone(),
-                last_seen_unix: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
+                last_seen_unix: now_unix,
                 last_seen_instant: Instant::now(),
             },
         );
         device.trusted = trusted;
-        device.last_seen = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        device.last_seen = now_unix;
         if !device.sessions.is_empty()
             && matches!(
                 device.reachability,
@@ -292,28 +419,99 @@ async fn handle_resolved(
     let probe_app = app.clone();
     let probe_state = state.clone();
     tokio::spawn(async move {
+        if addrs.is_empty() {
+            return;
+        }
         run_probe_update(&probe_state, &probe_app, &fp, addrs).await;
     });
 }
 
 async fn handle_removed(remove_key: &str, app: &AppHandle, state: &Arc<AppState>) {
-    let (fp, device_gone, updated_device) = {
-        let mut idx = state.session_index.write().await;
-        let mut devices = state.devices.write().await;
-        match remove_session_from_state(remove_key, &mut idx, &mut devices) {
-            Some((fp, gone, dev)) => (fp, gone, dev),
-            None => return,
-        }
+    let Some(entry) = ({
+        let idx = state.session_index.read().await;
+        idx.get(remove_key)
+            .cloned()
+            .or_else(|| idx.values().find(|e| e.session_id == remove_key).cloned())
+    }) else {
+        state
+            .bump_discovery_failure("service_removed_without_index_entry")
+            .await;
+        return;
     };
 
-    if device_gone {
-        tracing::info!("Device offline: fp={fp}");
-        app.emit("device_lost", serde_json::json!({ "fingerprint": fp }))
-            .ok();
-    } else if let Some(dev) = updated_device {
-        let payload = DeviceView::from(&dev);
-        app.emit("device_updated", &payload).ok();
-    }
+    let observed_last_seen = {
+        let devices = state.devices.read().await;
+        devices
+            .get(&entry.fingerprint)
+            .and_then(|d| d.sessions.get(&entry.session_id))
+            .map(|s| s.last_seen_unix)
+    };
+    let Some(observed_last_seen) = observed_last_seen else {
+        state
+            .bump_discovery_failure("service_removed_without_session")
+            .await;
+        return;
+    };
+
+    state.bump_discovery_event("service_removed_deferred").await;
+    let fp = entry.fingerprint.clone();
+    let session_id = entry.session_id.clone();
+    let app2 = app.clone();
+    let state2 = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(OFFLINE_GRACE_SECS)).await;
+        let now_unix = now_unix_secs();
+        let (removed, refreshed) = {
+            let mut idx = state2.session_index.write().await;
+            let mut devices = state2.devices.write().await;
+            if let Some(device) = devices.get_mut(&fp) {
+                let should_remove = match device.sessions.get(&session_id) {
+                    Some(s) => {
+                        should_apply_deferred_remove(s.last_seen_unix, observed_last_seen, now_unix)
+                    }
+                    None => false,
+                };
+                if should_remove {
+                    (
+                        remove_session_from_state(&session_id, &mut idx, &mut devices),
+                        false,
+                    )
+                } else {
+                    let refreshed = device
+                        .sessions
+                        .get(&session_id)
+                        .map(|s| s.last_seen_unix > observed_last_seen)
+                        .unwrap_or(false);
+                    (None, refreshed)
+                }
+            } else {
+                (None, false)
+            }
+        };
+
+        if let Some((fp, device_gone, updated_device)) = removed {
+            state2.bump_discovery_event("service_removed_applied").await;
+            if device_gone {
+                tracing::info!("Device offline: fp={fp}");
+                app2.emit("device_lost", serde_json::json!({ "fingerprint": fp }))
+                    .ok();
+            } else if let Some(dev) = updated_device {
+                let payload = DeviceView::from(&dev);
+                app2.emit("device_updated", &payload).ok();
+            }
+            return;
+        }
+
+        if refreshed {
+            state2
+                .bump_discovery_event("service_removed_skipped_refreshed")
+                .await;
+        } else {
+            state2
+                .bump_discovery_event("service_removed_skipped_stale")
+                .await;
+        }
+    });
 }
 
 async fn run_probe_update(
@@ -347,11 +545,23 @@ async fn run_probe_update(
             device.reachability = crate::state::ReachabilityStatus::Reachable;
             device.probe_fail_count = 0;
         } else {
-            device.probe_fail_count = device.probe_fail_count.saturating_add(1);
-            device.reachability = crate::state::ReachabilityStatus::OfflineCandidate;
+            let next_fail_count = device.probe_fail_count.saturating_add(1);
+            device.probe_fail_count = next_fail_count;
+            if next_fail_count >= 3 {
+                device.reachability = crate::state::ReachabilityStatus::OfflineCandidate;
+            } else if matches!(
+                device.reachability,
+                crate::state::ReachabilityStatus::Offline
+                    | crate::state::ReachabilityStatus::OfflineCandidate
+            ) {
+                device.reachability = crate::state::ReachabilityStatus::Discovered;
+            }
         }
         DeviceView::from(&*device)
     };
+    if !ok {
+        state.bump_discovery_failure("probe_failed").await;
+    }
     app.emit("device_updated", payload).ok();
 }
 
@@ -371,6 +581,7 @@ mod tests {
         let fp = "peer-fp".to_string();
         let session_id = "session-1".to_string();
         let fullname = "service._dashdrop._udp.local.".to_string();
+        let alias_fullname = "service-alias._dashdrop._udp.local.".to_string();
         let mut sessions = HashMap::new();
         sessions.insert(
             session_id.clone(),
@@ -400,6 +611,7 @@ mod tests {
             session_id: session_id.clone(),
         };
         idx.insert(fullname.clone(), entry.clone());
+        idx.insert(alias_fullname.clone(), entry.clone());
         idx.insert(session_id.clone(), entry);
 
         let removed = super::remove_session_from_state(&fullname, &mut idx, &mut devices);
@@ -411,7 +623,25 @@ mod tests {
             crate::state::ReachabilityStatus::OfflineCandidate
         );
         assert!(!idx.contains_key(&fullname));
+        assert!(!idx.contains_key(&alias_fullname));
         assert!(!idx.contains_key(&session_id));
+    }
+
+    #[test]
+    fn deferred_remove_is_skipped_when_session_refreshed() {
+        assert!(!super::should_apply_deferred_remove(101, 100, 140));
+    }
+
+    #[test]
+    fn deferred_remove_requires_grace_window() {
+        assert!(!super::should_apply_deferred_remove(100, 100, 114));
+        assert!(super::should_apply_deferred_remove(100, 100, 115));
+    }
+
+    #[test]
+    fn link_local_ipv6_without_scope_is_not_filtered() {
+        let addr = SocketAddr::from_str("[fe80::1]:9443").expect("valid addr");
+        assert!(super::is_usable_peer_addr(&addr));
     }
 
     #[test]

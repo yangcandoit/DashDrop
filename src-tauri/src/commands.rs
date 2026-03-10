@@ -925,7 +925,11 @@ pub async fn get_discovery_diagnostics(
 ) -> Result<serde_json::Value, String> {
     let runtime = state.runtime_status().await;
     let mdns_service_fullname = state.mdns_service_fullname.read().await.clone();
+    let mdns_last_search_started = state.mdns_last_search_started.read().await.clone();
     let mdns_daemon_initialized = state.mdns.get().is_some();
+    let session_index_count = state.session_index.read().await.len();
+    let discovery_event_counts = state.discovery_event_counts_snapshot().await;
+    let discovery_failure_counts = state.discovery_failure_counts_snapshot().await;
     let devices = state.devices.read().await;
 
     let device_rows: Vec<serde_json::Value> = devices
@@ -945,6 +949,12 @@ pub async fn get_discovery_diagnostics(
             sessions.sort_by_key(|s| {
                 std::cmp::Reverse(s["last_seen_unix"].as_u64().unwrap_or_default())
             });
+            let best_addrs = d
+                .best_addrs()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>();
             serde_json::json!({
                 "fingerprint": d.fingerprint,
                 "name": d.name,
@@ -955,15 +965,75 @@ pub async fn get_discovery_diagnostics(
                 "last_probe_at": d.last_probe_at,
                 "last_seen": d.last_seen,
                 "session_count": d.sessions.len(),
+                "best_addrs": best_addrs,
                 "sessions": sessions,
             })
         })
         .collect();
 
+    let resolved_events = discovery_event_counts
+        .get("service_resolved")
+        .copied()
+        .unwrap_or_default();
+    let search_started_events = discovery_event_counts
+        .get("search_started")
+        .copied()
+        .unwrap_or_default();
+    let reachable_devices = devices
+        .values()
+        .filter(|d| d.reachability == ReachabilityStatus::Reachable)
+        .count();
+    let local_instance_name = mdns_service_fullname
+        .as_ref()
+        .and_then(|s| s.split('.').next().map(|part| part.to_string()));
+    let mut quick_hints = Vec::new();
+    if !mdns_daemon_initialized || mdns_service_fullname.is_none() {
+        quick_hints.push(
+            "Local mDNS responder is not fully initialized; this device may not be discoverable."
+                .to_string(),
+        );
+    }
+    if search_started_events == 0 {
+        quick_hints.push(
+            "mDNS browser has not reported SearchStarted; check local-network permission and multicast interface availability."
+                .to_string(),
+        );
+    } else if resolved_events == 0 {
+        quick_hints.push(
+            "No peers resolved from mDNS browse yet; likely multicast traffic is blocked across firewall/VLAN/subnet."
+                .to_string(),
+        );
+    }
+    if resolved_events > 0 && reachable_devices == 0 {
+        quick_hints.push(
+            "Peers were discovered but none are probe-reachable; verify firewall rules for UDP listener port and QUIC traffic."
+                .to_string(),
+        );
+    }
+    if discovery_failure_counts
+        .get("resolved_no_usable_addrs")
+        .copied()
+        .unwrap_or_default()
+        > 0
+    {
+        quick_hints.push(
+            "Some peers resolved without usable addresses; inspect virtual adapters/VPN interfaces and peer IP advertisement."
+                .to_string(),
+        );
+    }
+
     Ok(serde_json::json!({
         "runtime": runtime,
+        "own_fingerprint": state.identity.fingerprint.clone(),
+        "own_platform": Platform::current(),
         "mdns_daemon_initialized": mdns_daemon_initialized,
         "mdns_service_fullname": mdns_service_fullname,
+        "mdns_last_search_started": mdns_last_search_started,
+        "local_instance_name": local_instance_name,
+        "session_index_count": session_index_count,
+        "discovery_event_counts": discovery_event_counts,
+        "discovery_failure_counts": discovery_failure_counts,
+        "quick_hints": quick_hints,
         "device_count": device_rows.len(),
         "devices": device_rows,
     }))

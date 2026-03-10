@@ -313,6 +313,12 @@ pub struct AppState {
     pub mdns: tokio::sync::OnceCell<Arc<mdns_sd::ServiceDaemon>>,
     /// Last registered local mDNS service fullname for rename/re-registration.
     pub mdns_service_fullname: Arc<RwLock<Option<String>>>,
+    /// Last mDNS browser SearchStarted payload for interface/permission diagnostics.
+    pub mdns_last_search_started: Arc<RwLock<Option<String>>>,
+    /// mDNS browser event counters keyed by event name.
+    pub discovery_event_counts: Arc<RwLock<HashMap<String, u64>>>,
+    /// Discovery failure counters keyed by reason code.
+    pub discovery_failure_counts: Arc<RwLock<HashMap<String, u64>>>,
 
     /// SQLite Database for persistent transfer history.
     pub db: std::sync::Mutex<rusqlite::Connection>,
@@ -338,9 +344,34 @@ impl AppState {
             endpoint: tokio::sync::OnceCell::new(),
             mdns: tokio::sync::OnceCell::new(),
             mdns_service_fullname: Arc::new(RwLock::new(None)),
+            mdns_last_search_started: Arc::new(RwLock::new(None)),
+            discovery_event_counts: Arc::new(RwLock::new(HashMap::new())),
+            discovery_failure_counts: Arc::new(RwLock::new(HashMap::new())),
             db: std::sync::Mutex::new(db),
             metrics: Arc::new(RwLock::new(TransferMetrics::default())),
         }
+    }
+
+    async fn bump_counter(map: &Arc<RwLock<HashMap<String, u64>>>, key: &str) {
+        let mut guard = map.write().await;
+        let next = guard.get(key).copied().unwrap_or(0).saturating_add(1);
+        guard.insert(key.to_string(), next);
+    }
+
+    pub async fn bump_discovery_event(&self, key: &str) {
+        Self::bump_counter(&self.discovery_event_counts, key).await;
+    }
+
+    pub async fn bump_discovery_failure(&self, key: &str) {
+        Self::bump_counter(&self.discovery_failure_counts, key).await;
+    }
+
+    pub async fn discovery_event_counts_snapshot(&self) -> HashMap<String, u64> {
+        self.discovery_event_counts.read().await.clone()
+    }
+
+    pub async fn discovery_failure_counts_snapshot(&self) -> HashMap<String, u64> {
+        self.discovery_failure_counts.read().await.clone()
     }
 
     pub async fn is_trusted(&self, fp: &str) -> bool {

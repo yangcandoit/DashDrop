@@ -71,16 +71,17 @@ async fn register_on_daemon(mdns: &ServiceDaemon, state: &Arc<AppState>) -> Resu
 }
 
 fn sanitize_mdns_instance_name(name: &str) -> String {
-    let s: String = name
+    let mut s: String = name
         .chars()
         .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' {
+            if c.is_ascii_alphanumeric() || c == '-' {
                 c
             } else {
                 '-'
             }
         })
         .collect();
+    s = s.trim_matches('-').to_string();
     if s.is_empty() {
         "DashDrop".into()
     } else {
@@ -105,7 +106,11 @@ fn sanitize_mdns_host_label(device_name: &str, fingerprint: &str) -> String {
         base = "dashdrop".to_string();
     }
 
-    let short_fp = fingerprint.chars().take(8).collect::<String>().to_ascii_lowercase();
+    let short_fp = fingerprint
+        .chars()
+        .take(8)
+        .collect::<String>()
+        .to_ascii_lowercase();
     let mut label = format!("{base}-{short_fp}");
     if label.len() > 63 {
         label.truncate(63);

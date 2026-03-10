@@ -211,8 +211,16 @@ export interface RuntimeStatus {
 
 export interface DiscoveryDiagnostics {
   runtime: RuntimeStatus;
+  own_fingerprint?: string;
+  own_platform?: Platform;
   mdns_daemon_initialized: boolean;
   mdns_service_fullname?: string | null;
+  mdns_last_search_started?: string | null;
+  local_instance_name?: string | null;
+  session_index_count?: number;
+  discovery_event_counts?: Record<string, number>;
+  discovery_failure_counts?: Record<string, number>;
+  quick_hints?: string[];
   device_count: number;
   devices: Array<{
     fingerprint: string;
@@ -224,6 +232,7 @@ export interface DiscoveryDiagnostics {
     last_probe_at?: number | null;
     last_seen: number;
     session_count: number;
+    best_addrs?: string[];
     sessions: Array<{
       session_id: string;
       last_seen_unix: number;
