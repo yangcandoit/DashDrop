@@ -15,6 +15,7 @@
 4. 对可信设备做到低摩擦直达，对未知设备保持安全确认。
 5. 网络抖动与短时中断可自动恢复，用户无需重复操作。
 6. 同时支持一对一与一对多（批量下发）两类传输模式，且体验一致。
+7. 传输链路不局限于同一 LAN，支持近场直连 Wi‑Fi（P2P/热点）作为扩展路径。
 
 ---
 
@@ -22,7 +23,7 @@
 
 ### 2.1 用户侧 SLO
 
-1. 同网段设备可见延迟：P50 <= 2s，P95 <= 5s。
+1. 附近设备可见延迟（LAN 或近场直连可用）：P50 <= 2s，P95 <= 5s。
 2. 从“系统分享”到“对端收到可操作通知”延迟：P50 <= 2s，P95 <= 6s。
 3. 已配对设备发送步骤：不超过 2 步（选择设备 -> 发送）。
 4. 未配对设备发送步骤：不超过 3 步（选择设备 -> 指纹确认 -> 发送）。
@@ -36,6 +37,7 @@
 3. 接收确认超时与失败均可解释（可操作文案 + 诊断字段）。
 4. 无“静默失败”：任意失败路径必须沉淀可追踪 reason_code 与 phase。
 5. 一对多任务中单目标失败不拖垮整体任务，支持按目标重试。
+6. 链路切换成功率（LAN -> P2P/Hotspot fallback）：>= 95%（支持设备范围内）。
 
 ---
 
@@ -51,6 +53,7 @@
 5. 缺少断点续传与后台队列恢复。
 6. 缺少一对多批量发送模型（当前以单目标发送为主）。
 7. 缺少 BLE 能力探测与跨硬件差异处理策略。
+8. 缺少 Wi‑Fi 直连链路（P2P/SoftAP）与多链路调度策略。
 
 ---
 
@@ -62,6 +65,7 @@ flowchart LR
   SHARE["System Share Entry\n(Finder/Explorer/Share Target)"] -->|"Local IPC"| DAEMON
   NOTIFY["System Notification Center"] <-->|"accept/reject actions"| DAEMON
   DAEMON --> DISC["Discovery Engine\nmDNS + UDP Beacon + BLE assist"]
+  DAEMON --> LINK["Link Manager\nLAN infra / Wi‑Fi P2P / SoftAP"]
   DAEMON --> TRANS["Transfer Engine\nQUIC/TLS + Resume + Queue"]
   DAEMON --> SCHED["Dispatch Scheduler\n1:1 + 1:N batch orchestration"]
   DAEMON --> TRUST["Trust Engine\nPairing + Fingerprint Policy"]
@@ -75,6 +79,7 @@ flowchart LR
 3. 所有入口（主界面、系统分享、右键菜单）都走同一服务 API。
 4. 协议与状态事件向后兼容，终态事件命名保持稳定。
 5. 调度层必须同时支持 1:1 与 1:N，且复用同一状态机与诊断体系。
+6. 链路管理层必须支持“能力探测 + 动态选路 + 失败自动降级”。
 
 ---
 
@@ -89,6 +94,10 @@ flowchart LR
    1. Local Network（Bonjour/mDNS）
    2. Notifications
    3. 文件访问（用户选择路径范围）
+5. 链路扩展：
+   1. 优先基础设施 Wi‑Fi（LAN）
+   2. 次选临时热点直连（SoftAP）
+   3. 不依赖 AWDL 私有能力
 
 ### 5.2 Windows
 
@@ -99,12 +108,19 @@ flowchart LR
    1. mDNS: UDP 5353
    2. Beacon: UDP 53318
    3. QUIC listener: 随机 UDP 端口（应用进程）
+5. 链路扩展：
+   1. Wi‑Fi Direct（可用机型启用）
+   2. 不可用时自动降级到 SoftAP 或 LAN
 
 ### 5.3 Linux（阶段性）
 
 1. 托盘常驻 + autostart `.desktop`。
 2. 文件管理器入口优先支持常见桌面环境（Nautilus/Dolphin）。
 3. 通知动作依赖 Desktop Notifications 能力矩阵，先提供统一降级路径。
+4. 链路扩展：
+   1. 优先 LAN
+   2. 次选 NetworkManager 支持下的热点直连
+   3. Wi‑Fi P2P 仅在驱动与发行版能力明确时启用
 
 ---
 
@@ -115,6 +131,18 @@ flowchart LR
 1. 主通道：mDNS（设备身份 + 会话信息 + 端口）。
 2. 兜底通道：UDP beacon（组播受限时保持可见性）。
 3. 统一会话模型：`sessions[session_id]` 聚合，同一 fingerprint 合并显示。
+
+### 6.1a 多链路连接策略（LAN + Wi‑Fi 直连）
+
+连接链路优先级：
+1. 基础设施 LAN（当前主路径，最稳）
+2. Wi‑Fi P2P（平台支持时）
+3. 临时热点 SoftAP（跨平台保底）
+
+策略规则：
+1. 先探测链路能力，再决定是否尝试非 LAN 直连。
+2. 对端可达但 LAN 不通时，自动发起链路切换。
+3. 链路切换不改变上层传输状态契约（事件名、终态语义保持一致）。
 
 ### 6.2 地址与可达性策略
 
@@ -151,6 +179,21 @@ BLE 的角色定义：仅做“近距快速发现/唤醒”，不作为唯一发
    1. `ble_capabilities`
    2. `ble_runtime_state`
    3. `ble_failure_counts`
+
+### 6.5 Wi‑Fi 直连能力探测与降级
+
+1. 启动时探测：
+   1. `wifi_p2p_supported`
+   2. `softap_supported`
+   3. `wifi_adapter_mode`（single/dual radio）
+2. 运行时策略：
+   1. 支持 P2P：优先尝试 P2P 建链。
+   2. P2P 失败或不支持：尝试 SoftAP。
+   3. SoftAP 失败：回退 LAN 并给出可操作提示。
+3. 诊断字段（新增）：
+   1. `link_capabilities`
+   2. `link_current_mode`（lan/p2p/softap）
+   3. `link_fallback_count`
 
 ---
 
@@ -193,6 +236,7 @@ BLE 的角色定义：仅做“近距快速发现/唤醒”，不作为唯一发
 
 1. 一对一（1:1）：单发送方 -> 单接收方。
 2. 一对多（1:N）：单发送方 -> 多接收方（每个接收方独立连接与结果）。
+3. 每个目标支持独立链路模式：LAN / P2P / SoftAP。
 
 ### 8.1 统一入口
 
@@ -208,6 +252,7 @@ BLE 的角色定义：仅做“近距快速发现/唤醒”，不作为唯一发
 1. 目标选择支持多选设备。
 2. 每个目标独立建立连接并并发执行。
 3. 每目标独立可取消、失败、重试，不相互阻塞。
+4. 每目标可独立触发链路降级（如 LAN 失败转 P2P），不影响其它目标。
 
 ### 8.1a 一对多任务模型（Batch）
 
@@ -234,6 +279,7 @@ BLE 的角色定义：仅做“近距快速发现/唤醒”，不作为唯一发
 2. 大批小文件走批次调度，减少控制流抖动。
 3. 失败重试优先文件级，而非整任务重发。
 4. 1:N 模式下设置全局并发上限 + 单目标并发上限，避免网络拥塞。
+5. 非 LAN 直连模式下增加链路建立超时与快速回退阈值。
 
 ---
 
@@ -283,6 +329,7 @@ BLE 的角色定义：仅做“近距快速发现/唤醒”，不作为唯一发
 4. 失败原因分布（timeout/handshake/connect/protocol）
 5. 平台分布与版本分布
 6. BLE 可用率与降级率（按平台/硬件）
+7. 链路分布与切换率（lan/p2p/softap）
 
 ---
 
@@ -298,6 +345,7 @@ BLE 的角色定义：仅做“近距快速发现/唤醒”，不作为唯一发
 1. UI 关闭后发现与接收能力仍在线。
 2. 重开 UI 可秒级恢复完整状态。
 3. 输出 BLE 能力探测结果并可见于 diagnostics。
+4. 输出 Wi‑Fi 直连能力探测结果并可见于 diagnostics。
 
 ### Phase B（系统入口与通知闭环）
 
@@ -339,6 +387,16 @@ BLE 的角色定义：仅做“近距快速发现/唤醒”，不作为唯一发
 1. 5 目标批量发送中单目标失败不影响其余目标完成。
 2. 用户可一键重试失败目标，不重复成功目标。
 
+### Phase F（Wi‑Fi 直连扩展）
+
+1. Link Manager：LAN/P2P/SoftAP 三模式抽象。
+2. 平台能力探测与链路切换策略落地。
+3. 链路级诊断字段、错误码与用户提示补齐。
+
+验收：
+1. 在“同 LAN 不可达但直连可用”场景下，自动切换链路并完成传输。
+2. 链路切换失败时有明确 fallback 与提示，不出现静默卡死。
+
 ---
 
 ## 12. 风险与边界
@@ -349,12 +407,13 @@ BLE 的角色定义：仅做“近距快速发现/唤醒”，不作为唯一发
 4. 带外配对需兼顾易用与安全，避免把流程做重。
 5. BLE 在不同硬件/驱动上的稳定性差异大，必须做能力探测与降级。
 6. 1:N 在弱网络下易造成拥塞，需要精细化调度与并发控制。
+7. Wi‑Fi P2P/SoftAP 在不同平台 API 与驱动差异大，适配成本高。
 
 ---
 
 ## 13. 非目标（本设计不覆盖）
 
-1. 跨公网中继/NAT 穿透。
+1. 跨公网中继/NAT 穿透（本设计仅覆盖近场本地链路：LAN/P2P/SoftAP）。
 2. 云账号体系与远程同步。
 3. 移动端完整生态（可后续扩展）。
 
