@@ -4,6 +4,7 @@
 > Blazing-fast, encrypted, zero-config local file sharing — for macOS, Windows, and Linux.
 
 Current project status (single source of truth): [STATUS.md](./STATUS.md)
+Seamless experience target design (AirDrop-like): [docs/AIRDROP_SEAMLESS_EXPERIENCE_DESIGN.md](./docs/AIRDROP_SEAMLESS_EXPERIENCE_DESIGN.md)
 
 ---
 
