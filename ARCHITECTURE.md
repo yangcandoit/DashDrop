@@ -5,7 +5,7 @@
 > **文档版本**：v0.4（2026-03）
 > **主要修订**：五区 IA 与非阻塞接收模型、TransferStatus 与终态事件映射统一、接收方 Cancel 语义对齐、TransferHistoryEntry 与持久化约束、TrustedPeer/AppConfig 结构补全、Reachable Probe 归属与线协议约束
 
-> **实现状态快照（2026-03-09）**：
+> **实现状态快照（2026-03-10）**：
 > - 已实现：DTO 边界（`DeviceView/SessionView/TransferView`）、`transfer_accepted`、终态事件统一映射、`revision` 仅状态跃迁递增。
 > - 已实现：CI 门禁（`cargo check`、`cargo clippy --all-targets --all-features`、`cargo test`、`npm run build`、`npm run test:e2e`）。
 > - 已实现：GitHub 安全与发布自动化（`security-audit`、Code Scanning default setup、`Dependabot`、installers + checksums 上传）。
@@ -26,7 +26,7 @@
 ```
 +---------------------------------------------------------+
 |                    UI Layer（前端）                      |
-|         Vue 3 + TypeScript + TailwindCSS v4            |
+|         Vue 3 + TypeScript + CSS Design Tokens         |
 |     设备卡片 · 拖拽投递 · 请求队列卡片 · 进度反馈        |
 +-------------------------+-------------------------------+
                           | Tauri IPC (invoke / listen)
@@ -34,17 +34,17 @@
 |                 Backend Core（Rust）                    |
 |  +-------------+  +--------------+  +---------------+  |
 |  |  Discovery  |  |  Transport   |  |  Crypto       |  |
-|  |  (mDNS-sd) |  |  (QUIC/quinn)|  |  (Ed25519)    |  |
+|  |(mDNS+beacon)| |  (QUIC/quinn)|  |  (Ed25519)    |  |
 |  +-------------+  +--------------+  +---------------+  |
 |                   +--------------+                      |
 |                   |  AppState    |                      |
 |                   | (Arc<RwLock>)|                      |
 |                   +--------------+                      |
 +---------------------------------------------------------+
-        | UDP/5353              | QUIC/UDP (随机端口)
+        | UDP/5353 + UDP/53318  | QUIC/UDP (随机端口)
   +-----v------+          +-----v------+
-  | LAN mDNS   |          | QUIC 传输  |
-  | 广播/组播  |          | TLS 1.3   |
+  | LAN发现双通道|         | QUIC 传输  |
+  | mDNS+beacon |         | TLS 1.3   |
   +------------+          +------------+
 ```
 
@@ -66,9 +66,9 @@ DashDrop 是一个**单进程 Tauri 应用**。后端逻辑运行在 Rust 异步
 
 ## 二、Discovery 模块（`src-tauri/src/discovery/`）
 
-### 2.1 mDNS 广播规范
+### 2.1 Discovery 通道规范（mDNS + beacon）
 
-服务名：`_dashdrop._udp.local`
+主发现服务名：`_dashdrop._udp.local`
 
 **TXT Record 内容：**
 ```
@@ -82,7 +82,12 @@ caps=file                    # MVP 能力集
 
 > **无 `v=` 字段**：版本协商在 QUIC 连接后的 `Hello` 消息中进行，不在 mDNS 层。
 
-> **启动顺序约束**：transport server **必须先**绑定端口，获得实际端口号后，再注册 mDNS 服务。
+UDP beacon 兜底通道：
+1. 端口：`53318/udp`
+2. 作用：在 mDNS 组播被网络策略限制时提供同网段广播发现
+3. 状态：beacon session 与 mDNS session 统一汇聚进同一个 `DeviceInfo.sessions`
+
+> **启动顺序约束**：transport server **必须先**绑定端口，获得实际端口号后，再注册 mDNS 服务并启动 browse；随后启动 beacon fallback。
 
 ### 2.2 设备身份双层模型
 
@@ -105,16 +110,18 @@ pub struct DeviceInfo {
     pub fingerprint: String,              // 稳定设备主键
     pub name: String,
     pub platform: Platform,
+    pub trusted: bool,                    // 由 trust 列表投影并回写到设备视图
     pub sessions: HashMap<String, SessionInfo>,  // session_id -> 会话信息
-    pub reachability_status: ReachabilityStatus, // discovered/reachable/offline_candidate/offline
-    pub probe_fail_count: u8,                     // 连续探活失败次数
-    pub last_probe_at: Option<Instant>,           // 最近一次探活时间
+    pub reachability: ReachabilityStatus,         // discovered/reachable/offline_candidate/offline
+    pub probe_fail_count: u32,                    // 连续探活失败次数
+    pub last_probe_at: Option<u64>,               // 最近一次探活时间（unix）
 }
 
 pub struct SessionInfo {
     pub session_id: String,
-    pub addr: SocketAddr,                 // 该接口可达地址
-    pub last_seen: Instant,
+    pub addrs: Vec<SocketAddr>,           // 同一 session 的地址集合（IPv4/IPv6）
+    pub last_seen_unix: u64,
+    pub last_seen_instant: Instant,
 }
 
 pub enum ReachabilityStatus {
@@ -134,18 +141,18 @@ pub enum Platform {
 }
 ```
 
-**上线逻辑**：`ServiceDiscovered(session_id, fp, addr, ...)` -> 若 `devices[fp]` 存在则插入/更新 `.sessions[session_id]`，否则新建 `DeviceInfo`（`reachability_status=Discovered`，`probe_fail_count=0`）。
+**上线逻辑**：`ServiceResolved/BeaconReceived(session_id, fp, addrs, ...)` -> 若 `devices[fp]` 存在则插入/更新 `.sessions[session_id]`，否则新建 `DeviceInfo`（`reachability=Discovered`，`probe_fail_count=0`）。
 
 **下线逻辑**：`ServiceRemoved(session_id)` -> 通过反向索引 `session_index[session_id]` 取得 `fp`，再从 `devices[fp].sessions` 移除该 session。仅当 `sessions` 变为空时才清理 `devices[fp]` 并 emit `device_lost`。若没有反向索引，实现方需全表扫描 `devices`，状态机会变脆弱。
 
-**连接地址选取（启发式，非正确性规则）**：发起连接时，从 `sessions` 中选取 `last_seen` 最新的 `SessionInfo.addr`。
+**连接地址选取（启发式，非正确性规则）**：发起连接时聚合全部 session 地址并去重，按最近 session 优先，默认 IPv4 优先，IPv6 作为后备。
 
 **探活写回规则**：
 1. Probe 成功：`reachability_status=Reachable`，`probe_fail_count=0`。
 2. Probe 失败：`probe_fail_count += 1`；达到阈值后置 `reachability_status=OfflineCandidate`。
 3. 会话全丢失且超过宽限期：`reachability_status=Offline`。
 
-**Trust 关联规则**：`trusted` 不存放在 Discovery 的 `DeviceInfo` 中。展示层按 `fingerprint` 与 Trust 记录做 Join，生成 `DeviceViewModel.identity_label`（`Trusted/Untrusted/TrustSuspended`）。
+**Trust 关联规则**：`trusted` 在 `DeviceInfo` 中作为展示字段维护，并在配对/取消配对时同步回写。
 
 > 已知局限：mDNS 最近活跃的接口未必是最优路径 — 高延迟、单向可达、临时断开的接口同样可能刚刚广播过。MVP 阶段接受此启发式；v0.2 可引入主动探活（ICMP/TCP probe）辅助选路。
 
@@ -154,7 +161,7 @@ pub enum Platform {
 过滤规则：
 1. 排除 `flags` 中不含 `UP` 或不含 `MULTICAST` 的接口
 2. 排除 Loopback（`lo0`, `lo` 等）
-3. 排除接口名匹配 `utun*`、`tun*`、`tap*`、`ppp*` 的 VPN 接口（**不按 IP 段排除**）
+3. 排除已知虚拟/隧道接口（`utun*`、`awdl*`、`llw*`、`docker*`、`vmnet*`、`vEthernet*`、`tun/tap` 等）
 4. 满足条件的接口**全部**注册广播
 
 ### 2.5 生命周期与事件推送
@@ -164,10 +171,16 @@ AppStart
   -> transport::server::start()   // 先绑端口，返回实际 port
   -> discovery::register(port)    // 再注册 mDNS
   -> discovery::browse()          // 持续发现
+  -> discovery::beacon()          // UDP 广播兜底发现
 
-SessionDiscovered(session_id, fp, name, addr, ...)
+SessionResolved(session_id, fp, name, addrs, ...)
   -> session_index.insert(session_id, fp)          // 维护反向索引 session_id -> fp
   -> devices[fp].sessions.insert(session_id, ...)
+  -> Tauri Event: "device_discovered" | "device_updated"
+
+BeaconReceived(instance_id, fp, addr, ...)
+  -> session_id = "beacon:<instance_id>"
+  -> 写入同一 devices/session_index
   -> Tauri Event: "device_discovered" | "device_updated"
 
 SessionRemoved(session_id)
@@ -190,7 +203,7 @@ Probe 采用“Discovery 调度 + Transport 执行”的分层：
 2. Probe 失败只影响可达性状态，不直接修改信任状态。
 
 线协议行为（强制）：
-1. Probe 连接使用独立 ALPN：`dashdrop-probe/1`（普通传输为 `dashdrop/1`）。
+1. Probe 连接使用独立 ALPN：`dashdrop-probe/1`（普通传输为 `dashdrop-transfer/1`）。
 2. Probe 只建立 QUIC + TLS，并执行身份绑定校验；不发送 `Hello/Offer`。
 3. 接收端识别到 `dashdrop-probe/1` 后立即回 `CONNECTION_CLOSE(code=0xD0)` 并释放资源，不进入“等待 Offer”流程。
 4. Probe 连接不占用业务传输并发槽位，不计入 `PendingAccept` 超时计时。
@@ -404,16 +417,20 @@ quinn 使用 rustls，默认不接受自签证书。需实现自定义 `ServerCe
 - 接受任意自签证书（跳过 CA 链校验）
 - 提取对端 cert fingerprint，供后续 fp 绑定校验使用
 
-### 4.3 发现层与连接层身份绑定（强制）
+### 4.3 发现层与连接层身份绑定（当前实现）
 
 TLS 握手完成后立即执行：
 
 ```
 cert_fp = SHA256(peer_tls_cert.public_key_der)
 
-[A] 若连接来自 mDNS 发现的设备:
-    要求 cert_fp == mDNS_advertised_fp
-    不匹配 -> 关闭连接，emit "identity_mismatch"（广播身份与 TLS 证书不一致）
+[A] 发送端（已选择目标 fingerprint）:
+    要求 cert_fp == selected_peer_fp
+    不匹配 -> 关闭连接，emit "identity_mismatch"
+
+[A2] 接收端（按来源 IP 匹配 discovery 设备）:
+    若发现 mdns_fp != cert_fp -> emit "identity_mismatch" + security_events 审计
+    注：接收端该路径当前用于告警与审计，不作为握手硬拒绝条件
 
 [B] 查询信任列表:
     若 cert_fp in trusted_peers -> 已配对设备，正常继续
@@ -428,7 +445,7 @@ cert_fp = SHA256(peer_tls_cert.public_key_der)
 某个已配对的 fingerprint A 明确被同一个会话/连接上下文替换为 fingerprint B
 ```
 
-MVP 阶段，实现上能可靠判断的场景仅有：同一 mDNS session_id 下，上一次记录的 mDNS fp 与本次握手的 cert_fp 不同。**不得**用"同名设备的不同 fp"作为 `fingerprint_changed` 的判断依据，以下情形均应视为"新未配对设备"而非"证书更换告警"：
+当前实现中，`fingerprint_changed` 告警依赖“同一会话上下文”与历史配对关系：同一 session 上一次记录 fp 与本次 cert fp 不同，且旧 fp 已在 trusted 列表中。**不得**用"同名设备的不同 fp"作为 `fingerprint_changed` 的判断依据，以下情形均应视为"新未配对设备"而非"证书更换告警"：
 - 设备名重复的不同机器
 - 用户修改了设备名
 - 攻击者故意使用相同名字

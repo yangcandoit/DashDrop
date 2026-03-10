@@ -5,10 +5,10 @@
 > **v0.3 修订摘要**（在 v0.2 基础上）：
 > - **传输成功语义闭环**：接收端落盘+校验成功后发 `Ack`，发送端以此为唯一成功判据
 > - **版本协商前移**：QUIC 连接后先交换 `Hello` 消息，再发 `Offer`，避免跨版本 Offer 结构无法安全解析
-> - **发现层与连接层身份绑定**：TLS 握手后强制校验 `cert_fp == mDNS fp`，两套身份不允许分歧
+> - **发现层与连接层身份关联**：发送端对目标 fp 做证书强绑定；接收端对 mDNS/TLS 不一致进行告警与审计
 > - **速率限制改为基于 fingerprint**，IP 在多网卡/IPv6 场景下不可靠
 
-> **实现状态快照（2026-03-09）**：
+> **实现状态快照（2026-03-10）**：
 > - 已落地：`transfer_started / transfer_incoming / transfer_accepted / transfer_progress` 进行中事件。
 > - 已落地：`transfer_complete / transfer_partial / transfer_rejected / transfer_cancelled_by_sender / transfer_cancelled_by_receiver / transfer_failed` 终态事件。
 > - 已落地：`transfer_progress` 不递增 revision，revision 仅在状态跃迁递增。
@@ -70,10 +70,8 @@ Sender                                  Receiver
   |---- QUIC Connect (TLS 握手) ----------->|
   |<--- TLS Cert Exchange ------------------|
   |                                         |
-  |  ★ 双方执行身份绑定校验（强制）：          |
-  |    cert_fp = SHA256(peer_tls_cert.pubkey)|
-  |    IF 来自 mDNS: ASSERT cert_fp == mDNS fp |
-  |    ELSE: 关闭连接，UI 告警              |
+  |  ★ 身份校验：发送端强绑定 selected_fp；      |
+  |    接收端对 mDNS/cert 不一致做告警审计      |
   |                                         |
   |---- Hello { supported_versions } ------>|
   |<--- Hello { supported_versions } -------|
@@ -104,7 +102,7 @@ Sender                                  Receiver
 ### 3.1a Probe 连接识别（Reachable 探活）
 
 为避免 Probe 与真实传输连接混淆，Probe 使用独立 ALPN：
-1. 传输连接：`dashdrop/1`
+1. 传输连接：`dashdrop-transfer/1`
 2. Probe 连接：`dashdrop-probe/1`
 
 Probe 行为：
@@ -273,15 +271,19 @@ Sender                              Receiver
 - 传输内容 TLS 1.3 加密，被动嗅探者无法读取
 - 已配对关系内发生 fp 演进时触发告警（触发条件见下）
 
-**发现层与连接层身份绑定规则（强制执行）**：
+**发现层与连接层身份规则（当前实现）**：
 
 TLS 握手完成后立即校验：
 ```
 cert_fp = SHA256(peer_tls_cert.public_key_der)
 
-[A] 若本次连接来自 mDNS 发现的设备:
-    要求 cert_fp == mDNS_advertised_fp
+[A] 发送端（用户选择的目标设备）:
+    要求 cert_fp == selected_peer_fp
     不匹配 -> 关闭连接，emit "identity_mismatch"，UI 告警
+
+[A2] 接收端（由 remote IP 关联 discovery 设备）:
+    若 mdns_fp != cert_fp -> emit "identity_mismatch" + security_events 审计
+    注：该路径当前用于风险提示，不作为接收侧硬拒绝条件
 
 [B] 查信任列表:
     cert_fp in trusted_peers -> 已配对，正常继续
@@ -335,14 +337,13 @@ cert_fp = SHA256(peer_tls_cert.public_key_der)
 速率限制需要**两层叠加**：
 
 **精细层（按 fingerprint）**：
-- 已配对设备：每 fingerprint 每分钟最多 **10 次** Offer
-- 未配对设备：每 fingerprint 每分钟最多 **3 次** Offer
+- 已配对设备：每 fingerprint 每分钟最多 **60 次** Offer
+- 未配对设备：每 fingerprint 每分钟最多 **20 次** Offer
 - 作用：约束诚实客户端的重复请求
 
-**粗粒度兜底层（按来源地址 / 并发连接数）**：
-- 每来源 /24 子网（IPv4）或 /48（IPv6）每分钟最多 **20 次**入站连接（含握手）
-- 全局同时在握手中的未配对连接数不超过 **10 个**（超出直接拒绝 QUIC 握手）
-- 作用：阻止攻击者通过换 fingerprint（生成新自签证书）绕过精细层限制，因为 fingerprint 是可自由生成的，纯 fingerprint 限流对恶意客户端无效
+**粗粒度兜底层（按来源地址）**：
+- 每来源 IP 每分钟最多 **120 次**入站连接（含握手）
+- 作用：阻止恶意端通过快速新建连接放大握手开销
 
 超限时精细层返回 `E_RATE_LIMITED`；粗粒度层在 QUIC 握手阶段直接拒绝，不进入协议层。速率计数内存维护，重启后重置。
 

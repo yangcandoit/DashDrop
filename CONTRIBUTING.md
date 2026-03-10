@@ -46,7 +46,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features
 - 目标：`cargo clippy` 无 warning（当前 warning 清单见 `STATUS.md`）
 - 所有公共函数需有文档注释 `/// ...`
 - 异步代码统一使用 `tokio`，禁止 `std::thread::sleep`
-- 错误处理使用 `thiserror` 定义自定义异常类型
+- 错误处理以 `anyhow` + 明确上下文为主；对外错误码与事件载荷需保持协议一致
 
 ### Vue 前端
 - TypeScript strict 模式，禁止 `any`
@@ -59,10 +59,9 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features
 
 | 分支 | 用途 |
 |------|------|
-| `main` | 稳定版本，受保护 |
-| `dev` | 日常开发集成 |
-| `feat/*` | 新功能开发 |
-| `fix/*` | Bug 修复 |
+| `main` | 当前默认集成分支 |
+| `feat/*` | 新功能开发分支（合并到 `main`） |
+| `fix/*` | Bug 修复分支（合并到 `main`） |
 
 提交 PR 前请确保：
 - [ ] `cargo test` 通过

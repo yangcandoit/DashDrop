@@ -37,10 +37,11 @@ Estimated completion:
 - Added secure-store posture command (`get_security_posture`) and startup degraded-storage warning path.
 - Added probe subsystem (`dashdrop-probe/1`) with discovery-driven probe update and server-side probe short-circuit.
 - Reachability state now includes `Offline`, with 15s grace from `OfflineCandidate`.
+- Discovery now includes UDP beacon fallback (`53318/udp`) alongside mDNS for constrained multicast networks.
 - Sender now applies `Accept/Reject` wait timeout and emits `E_TIMEOUT` on offer-stage timeout.
 - Transfer `reason_code` now uses protocol-style `E_*` mapping instead of Rust `Debug` names.
 - Sender directory items now emit directory `Complete` and await receiver `Ack` (no silent directory bypass).
-- Incoming offer rate limiting now includes fingerprint-level policy (trusted=10/min, untrusted=3/min).
+- Incoming offer rate limiting now includes fingerprint-level policy (trusted=60/min, untrusted=20/min).
 - Incoming connection rate limiting now includes fingerprint-level windows in addition to IP windows.
 - Probe close code now uses `0xD0` to match architecture/protocol docs.
 - `set_app_config` mDNS rename re-register failure now emits user-visible `system_error` and rolls back config.
