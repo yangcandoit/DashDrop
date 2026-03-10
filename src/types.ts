@@ -2,6 +2,10 @@ export type Platform = "Mac" | "Windows" | "Linux" | "Android" | "Ios" | "Unknow
 
 export type ReachabilityStatus = "discovered" | "reachable" | "offline_candidate" | "offline";
 
+export type ListenerPortMode = "fixed" | "fallback_random";
+
+export type FirewallRuleState = "managed" | "user_scope_unmanaged" | "unknown";
+
 export type PowerProfile = "ac" | "battery" | "low_power";
 
 export interface DeviceView {
@@ -209,6 +213,8 @@ export interface RuntimeStatus {
   mdns_registered: boolean;
   discovered_devices: number;
   trusted_devices: number;
+  listener_port_mode?: ListenerPortMode;
+  firewall_rule_state?: FirewallRuleState;
 }
 
 export interface DiscoveryDiagnostics {
@@ -226,6 +232,8 @@ export interface DiscoveryDiagnostics {
   mdns_last_search_started?: string | null;
   local_instance_name?: string | null;
   listener_mode?: string;
+  listener_port_mode?: ListenerPortMode;
+  firewall_rule_state?: FirewallRuleState;
   listener_addrs?: string[];
   network_interfaces?: Array<{
     name: string;

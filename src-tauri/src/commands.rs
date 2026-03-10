@@ -1182,7 +1182,7 @@ mod diagnostics_tests {
         let diagnostics = build_discovery_diagnostics(
             &state,
             BeaconCadence {
-                power_profile: PowerProfile::Balanced,
+                power_profile: PowerProfile::Battery,
                 interval_secs: 3,
             },
         )

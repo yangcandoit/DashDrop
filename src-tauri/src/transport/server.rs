@@ -12,6 +12,13 @@ use crate::crypto::Identity;
 
 const INCOMING_IP_RATE_LIMIT_WINDOW_SECS: u64 = 60;
 const INCOMING_IP_RATE_LIMIT_MAX_PER_WINDOW: u32 = 120;
+const PREFERRED_QUIC_PORT: u16 = 53319;
+
+struct ListenerBinding {
+    socket: UdpSocket,
+    listener_mode: String,
+    listener_port_mode: String,
+}
 
 fn ip_rate_limited(
     limiter: &mut HashMap<IpAddr, (u32, Instant)>,
@@ -52,32 +59,40 @@ pub async fn start_server(
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
     server_config.transport_config(Arc::new(transport));
 
-    let (socket, listener_mode) = bind_server_socket()?;
+    let binding = bind_server_socket()?;
     let runtime = quinn::default_runtime()
         .ok_or_else(|| anyhow::anyhow!("no async runtime found for QUIC endpoint"))?;
     let endpoint = Endpoint::new(
         EndpointConfig::default(),
         Some(server_config),
-        socket,
+        binding.socket,
         runtime,
     )
     .context("bind QUIC endpoint")?;
     let port = endpoint.local_addr()?.port();
-    let listener_addrs = listener_addrs_for_mode(&listener_mode, port);
+    let listener_addrs = listener_addrs_for_mode(&binding.listener_mode, port);
+    let firewall_rule_state = ensure_firewall_rule_state();
 
     tracing::info!(
-        "QUIC server listening on port {port}, mode={listener_mode}, addrs={}",
+        "QUIC server listening on port {port}, mode={}, port_mode={}, firewall_rule_state={}, addrs={}",
+        binding.listener_mode,
+        binding.listener_port_mode,
+        firewall_rule_state,
         listener_addrs.join(", ")
     );
     *state.local_port.write().await = port;
-    *state.listener_mode.write().await = listener_mode;
+    *state.listener_mode.write().await = binding.listener_mode;
+    *state.listener_port_mode.write().await = binding.listener_port_mode;
+    *state.firewall_rule_state.write().await = firewall_rule_state;
     *state.listener_addrs.write().await = listener_addrs;
     state
         .endpoint
         .set(endpoint.clone())
         .map_err(|_| anyhow::anyhow!("endpoint already set"))?;
 
-    let rate_limiter = Arc::new(tokio::sync::Mutex::new(HashMap::<IpAddr, (u32, Instant)>::new()));
+    let rate_limiter = Arc::new(tokio::sync::Mutex::new(
+        HashMap::<IpAddr, (u32, Instant)>::new(),
+    ));
 
     // Accept connections in background
     tokio::spawn(async move {
@@ -148,41 +163,103 @@ pub async fn start_server(
     Ok(port)
 }
 
-fn bind_server_socket() -> Result<(UdpSocket, String)> {
-    if let Ok(socket_v6) = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)) {
-        if let Err(e) = socket_v6.set_only_v6(false) {
-            tracing::warn!(
-                "Failed to configure IPv6 UDP socket for dual-stack, falling back to IPv4-only: {e}"
-            );
-        } else {
-            let bind_v6 = SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, 0, 0, 0);
-            if let Err(e) = socket_v6.bind(&bind_v6.into()) {
-                tracing::warn!(
-                    "Failed to bind IPv6 wildcard UDP listener, falling back to IPv4-only: {e}"
-                );
-            } else {
-                socket_v6
-                    .set_nonblocking(true)
-                    .context("set dual-stack UDP socket nonblocking")?;
-                let std_socket: UdpSocket = socket_v6.into();
-                return Ok((std_socket, "dual_stack".to_string()));
-            }
+fn bind_server_socket() -> Result<ListenerBinding> {
+    bind_server_socket_with_preferred_port(PREFERRED_QUIC_PORT)
+}
+
+fn bind_server_socket_with_preferred_port(preferred_port: u16) -> Result<ListenerBinding> {
+    let mut errors = Vec::new();
+
+    match bind_dual_stack_socket(preferred_port) {
+        Ok(socket) => {
+            return Ok(ListenerBinding {
+                socket,
+                listener_mode: "dual_stack".to_string(),
+                listener_port_mode: "fixed".to_string(),
+            });
         }
-    } else {
-        tracing::warn!("Failed to create IPv6 UDP socket, falling back to IPv4-only");
+        Err(error) => {
+            tracing::warn!(
+                "Failed to bind dual-stack UDP listener on fixed port {preferred_port}: {error:#}"
+            );
+            errors.push(error);
+        }
     }
 
+    match bind_ipv4_socket(preferred_port) {
+        Ok(socket) => {
+            return Ok(ListenerBinding {
+                socket,
+                listener_mode: "ipv4_only_fallback".to_string(),
+                listener_port_mode: "fixed".to_string(),
+            });
+        }
+        Err(error) => {
+            tracing::warn!(
+                "Failed to bind IPv4 UDP listener on fixed port {preferred_port}: {error:#}"
+            );
+            errors.push(error);
+        }
+    }
+
+    match bind_dual_stack_socket(0) {
+        Ok(socket) => {
+            return Ok(ListenerBinding {
+                socket,
+                listener_mode: "dual_stack".to_string(),
+                listener_port_mode: "fallback_random".to_string(),
+            });
+        }
+        Err(error) => {
+            tracing::warn!("Failed to bind dual-stack UDP listener on fallback port: {error:#}");
+            errors.push(error);
+        }
+    }
+
+    match bind_ipv4_socket(0) {
+        Ok(socket) => Ok(ListenerBinding {
+            socket,
+            listener_mode: "ipv4_only_fallback".to_string(),
+            listener_port_mode: "fallback_random".to_string(),
+        }),
+        Err(error) => {
+            tracing::warn!("Failed to bind IPv4 UDP listener on fallback port: {error:#}");
+            errors.push(error);
+            Err(errors
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| anyhow::anyhow!("failed to bind QUIC UDP listener")))
+        }
+    }
+}
+
+fn bind_dual_stack_socket(port: u16) -> Result<UdpSocket> {
+    let socket_v6 = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))
+        .context("create IPv6 UDP socket")?;
+    socket_v6
+        .set_only_v6(false)
+        .context("configure IPv6 socket for dual-stack")?;
+    let bind_v6 = SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, port, 0, 0);
+    socket_v6
+        .bind(&bind_v6.into())
+        .with_context(|| format!("bind dual-stack UDP listener on port {port}"))?;
+    socket_v6
+        .set_nonblocking(true)
+        .context("set dual-stack UDP socket nonblocking")?;
+    Ok(socket_v6.into())
+}
+
+fn bind_ipv4_socket(port: u16) -> Result<UdpSocket> {
     let socket_v4 = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
         .context("create IPv4 fallback UDP socket")?;
-    let bind_v4 = SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0);
+    let bind_v4 = SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port);
     socket_v4
         .bind(&bind_v4.into())
-        .context("bind IPv4 fallback UDP listener")?;
+        .with_context(|| format!("bind IPv4 fallback UDP listener on port {port}"))?;
     socket_v4
         .set_nonblocking(true)
         .context("set IPv4 fallback UDP socket nonblocking")?;
-    let std_socket: UdpSocket = socket_v4.into();
-    Ok((std_socket, "ipv4_only_fallback".to_string()))
+    Ok(socket_v4.into())
 }
 
 fn listener_addrs_for_mode(mode: &str, port: u16) -> Vec<String> {
@@ -192,12 +269,118 @@ fn listener_addrs_for_mode(mode: &str, port: u16) -> Vec<String> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn ensure_firewall_rule_state() -> String {
+    match windows_is_elevated() {
+        Ok(false) => "user_scope_unmanaged".to_string(),
+        Ok(true) => match windows_ensure_firewall_rules() {
+            Ok(()) => "managed".to_string(),
+            Err(error) => {
+                tracing::warn!("Failed to ensure Windows firewall rules: {error:#}");
+                "unknown".to_string()
+            }
+        },
+        Err(error) => {
+            tracing::warn!("Failed to determine Windows elevation state: {error:#}");
+            "unknown".to_string()
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn ensure_firewall_rule_state() -> String {
+    "unknown".to_string()
+}
+
+#[cfg(target_os = "windows")]
+fn windows_is_elevated() -> Result<bool> {
+    let output = run_powershell(
+        "[bool]([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)",
+    )
+    .context("query Windows elevation state")?;
+    let stdout = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_ascii_lowercase();
+    match stdout.as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(anyhow::anyhow!(
+            "unexpected elevation probe output: {stdout}"
+        )),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_ensure_firewall_rules() -> Result<()> {
+    const APP_RULE_NAME: &str = "DashDrop UDP App";
+    const FIXED_PORT_RULE_NAME: &str = "DashDrop UDP Fixed Port 53319";
+
+    let exe_path = std::env::current_exe().context("resolve current executable path")?;
+    let exe_path = exe_path.display().to_string().replace('\'', "''");
+
+    ensure_named_firewall_rule(
+        APP_RULE_NAME,
+        &format!(
+            "New-NetFirewallRule -DisplayName '{APP_RULE_NAME}' -Direction Inbound -Action Allow -Protocol UDP -Program '{exe_path}' -Profile Any | Out-Null"
+        ),
+    )?;
+    ensure_named_firewall_rule(
+        FIXED_PORT_RULE_NAME,
+        &format!(
+            "New-NetFirewallRule -DisplayName '{FIXED_PORT_RULE_NAME}' -Direction Inbound -Action Allow -Protocol UDP -LocalPort {PREFERRED_QUIC_PORT} -Profile Any | Out-Null"
+        ),
+    )?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_named_firewall_rule(rule_name: &str, create_script: &str) -> Result<()> {
+    let lookup_script = format!(
+        "$rule = Get-NetFirewallRule -DisplayName '{rule_name}' -ErrorAction SilentlyContinue | Select-Object -First 1; if ($null -eq $rule) {{ 'false' }} else {{ 'true' }}"
+    );
+    let output = run_powershell(&lookup_script)
+        .with_context(|| format!("lookup Windows firewall rule {rule_name}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_ascii_lowercase();
+    if stdout == "true" {
+        return Ok(());
+    }
+    if stdout != "false" {
+        return Err(anyhow::anyhow!(
+            "unexpected firewall lookup output for {rule_name}: {stdout}"
+        ));
+    }
+    run_powershell(create_script)
+        .with_context(|| format!("create Windows firewall rule {rule_name}"))?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn run_powershell(script: &str) -> Result<std::process::Output> {
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .context("spawn powershell")?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(anyhow::anyhow!("powershell failed: {stderr}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::net::UdpSocket;
+
     #[test]
     fn listener_addrs_reflect_dual_stack_mode() {
         let addrs = super::listener_addrs_for_mode("dual_stack", 7001);
-        assert_eq!(addrs, vec!["[::]:7001".to_string(), "0.0.0.0:7001".to_string()]);
+        assert_eq!(
+            addrs,
+            vec!["[::]:7001".to_string(), "0.0.0.0:7001".to_string()]
+        );
     }
 
     #[test]
@@ -215,5 +398,32 @@ mod tests {
             assert!(!super::ip_rate_limited(&mut limiter, ip, now));
         }
         assert!(super::ip_rate_limited(&mut limiter, ip, now));
+    }
+
+    #[test]
+    fn bind_server_prefers_fixed_port_when_available() {
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("reserve probe port");
+        let preferred_port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+
+        let binding = super::bind_server_socket_with_preferred_port(preferred_port)
+            .expect("bind preferred port");
+        let bound_port = binding.socket.local_addr().expect("listener addr").port();
+
+        assert_eq!(binding.listener_port_mode, "fixed");
+        assert_eq!(bound_port, preferred_port);
+    }
+
+    #[test]
+    fn bind_server_falls_back_to_random_port_when_fixed_is_occupied() {
+        let blocker = UdpSocket::bind("127.0.0.1:0").expect("occupy UDP port");
+        let preferred_port = blocker.local_addr().expect("blocker addr").port();
+
+        let binding = super::bind_server_socket_with_preferred_port(preferred_port)
+            .expect("bind fallback port");
+        let bound_port = binding.socket.local_addr().expect("listener addr").port();
+
+        assert_eq!(binding.listener_port_mode, "fallback_random");
+        assert_ne!(bound_port, preferred_port);
     }
 }
