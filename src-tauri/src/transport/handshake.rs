@@ -10,6 +10,11 @@ use crate::transport::protocol::{
     SUPPORTED_VERSIONS, WIRE_VERSION,
 };
 
+const OFFER_RATE_LIMIT_TRUSTED_PER_MIN: u32 = 60;
+const OFFER_RATE_LIMIT_UNTRUSTED_PER_MIN: u32 = 20;
+const CONNECTION_RATE_LIMIT_TRUSTED_PER_MIN: u32 = 400;
+const CONNECTION_RATE_LIMIT_UNTRUSTED_PER_MIN: u32 = 120;
+
 async fn reject_control_stream(
     send: &mut quinn::SendStream,
     reason: ErrorCode,
@@ -262,10 +267,11 @@ pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppSta
 }
 
 async fn check_offer_rate_limit(state: &Arc<AppState>, peer_fp: &str) -> Option<ErrorCode> {
-    let limit = if state.is_trusted(peer_fp).await {
-        10
+    let trusted = state.is_trusted(peer_fp).await;
+    let limit = if trusted {
+        OFFER_RATE_LIMIT_TRUSTED_PER_MIN
     } else {
-        3
+        OFFER_RATE_LIMIT_UNTRUSTED_PER_MIN
     };
     let mut limiter = state.offer_rate_limits.lock().await;
     let (count, window_start) = limiter
@@ -277,6 +283,13 @@ async fn check_offer_rate_limit(state: &Arc<AppState>, peer_fp: &str) -> Option<
     }
     *count += 1;
     if *count > limit {
+        tracing::warn!(
+            peer_fp = %peer_fp,
+            trusted,
+            count = *count,
+            limit,
+            "offer rate limited"
+        );
         Some(ErrorCode::RateLimited)
     } else {
         None
@@ -284,10 +297,11 @@ async fn check_offer_rate_limit(state: &Arc<AppState>, peer_fp: &str) -> Option<
 }
 
 async fn check_connection_rate_limit(state: &Arc<AppState>, peer_fp: &str) -> Option<ErrorCode> {
-    let limit = if state.is_trusted(peer_fp).await {
-        40
+    let trusted = state.is_trusted(peer_fp).await;
+    let limit = if trusted {
+        CONNECTION_RATE_LIMIT_TRUSTED_PER_MIN
     } else {
-        12
+        CONNECTION_RATE_LIMIT_UNTRUSTED_PER_MIN
     };
     let mut limiter = state.incoming_conn_rate_limits.lock().await;
     let (count, window_start) = limiter
@@ -299,6 +313,13 @@ async fn check_connection_rate_limit(state: &Arc<AppState>, peer_fp: &str) -> Op
     }
     *count += 1;
     if *count > limit {
+        tracing::warn!(
+            peer_fp = %peer_fp,
+            trusted,
+            count = *count,
+            limit,
+            "connection rate limited"
+        );
         Some(ErrorCode::RateLimited)
     } else {
         None

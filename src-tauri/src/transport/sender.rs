@@ -190,7 +190,15 @@ pub async fn send_files(
             return Ok(TransferOutcome::Failed(r.reason));
         }
         Ok(Ok(other)) => bail!("expected Accept/Reject, got {:?}", other),
-        Ok(Err(e)) => return Err(e),
+        Ok(Err(e)) => {
+            let close_reason = conn
+                .close_reason()
+                .map(|r| format!("{r:?}"))
+                .unwrap_or_else(|| "unknown".to_string());
+            return Err(anyhow::anyhow!(
+                "read Accept/Reject failed: {e:#}; connection close reason: {close_reason}"
+            ));
+        }
         Err(_) => {
             let mut metrics_snapshot: Option<(
                 crate::state::TransferDirection,
