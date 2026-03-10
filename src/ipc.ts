@@ -161,6 +161,10 @@ export async function getRuntimeStatus(): Promise<RuntimeStatus> {
   return invokeCommand("get_runtime_status");
 }
 
+export async function copyTextToClipboard(text: string): Promise<void> {
+  return invokeCommand("copy_to_clipboard", { text });
+}
+
 export async function getDiscoveryDiagnostics(): Promise<DiscoveryDiagnostics> {
   return invokeCommand("get_discovery_diagnostics");
 }

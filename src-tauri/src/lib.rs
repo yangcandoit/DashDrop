@@ -255,6 +255,7 @@ pub fn run() {
             commands::get_security_events,
             commands::get_security_posture,
             commands::get_runtime_status,
+            commands::copy_to_clipboard,
             commands::get_discovery_diagnostics,
             commands::get_transfer_metrics,
         ])

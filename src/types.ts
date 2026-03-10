@@ -233,6 +233,7 @@ export interface DiscoveryDiagnostics {
     last_search_started?: string | null;
   };
   session_index_count?: number;
+  session_stale_ttl_secs?: number;
   discovery_event_counts?: Record<string, number>;
   discovery_failure_counts?: Record<string, number>;
   quick_hints?: string[];

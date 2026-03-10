@@ -14,6 +14,7 @@ use crate::state::{AppState, DeviceInfo, Platform, SessionIndexEntry, SessionInf
 
 const OFFLINE_GRACE_SECS: u64 = 15;
 const DEVICE_LOST_RETENTION_SECS: u64 = 45;
+const SESSION_STALE_SECS: u64 = 90;
 const HOSTNAME_RESOLVE_TIMEOUT_MS: u64 = 1500;
 
 enum BrowserReceiveAction {
@@ -72,6 +73,10 @@ fn should_apply_deferred_remove(
 ) -> bool {
     current_last_seen <= observed_last_seen
         && now_unix.saturating_sub(current_last_seen) >= OFFLINE_GRACE_SECS
+}
+
+fn is_session_stale(elapsed: Duration) -> bool {
+    elapsed >= Duration::from_secs(SESSION_STALE_SECS)
 }
 
 fn browser_receive_action(err: &RecvTimeoutError) -> BrowserReceiveAction {
@@ -350,9 +355,30 @@ pub async fn start_browser(
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let mut updates = Vec::new();
+            let mut stale_sessions_removed = 0u64;
+            let mut pruned_session_pairs: Vec<(String, String)> = Vec::new();
             let lost = {
                 let mut devices = state_for_offline.devices.write().await;
                 for device in devices.values_mut() {
+                    let stale_session_ids: Vec<String> = device
+                        .sessions
+                        .iter()
+                        .filter(|(_, s)| is_session_stale(s.last_seen_instant.elapsed()))
+                        .map(|(sid, _)| sid.clone())
+                        .collect();
+                    if !stale_session_ids.is_empty() {
+                        for sid in stale_session_ids {
+                            if device.sessions.remove(&sid).is_some() {
+                                stale_sessions_removed = stale_sessions_removed.saturating_add(1);
+                                pruned_session_pairs
+                                    .push((device.fingerprint.clone(), sid.clone()));
+                            }
+                        }
+                        if device.sessions.is_empty() {
+                            device.reachability = crate::state::ReachabilityStatus::OfflineCandidate;
+                        }
+                        updates.push(DeviceView::from(&*device));
+                    }
                     if should_mark_offline(device, now) {
                         device.reachability = crate::state::ReachabilityStatus::Offline;
                         updates.push(DeviceView::from(&*device));
@@ -368,6 +394,15 @@ pub async fn start_browser(
                 }
                 evicted
             };
+            if !pruned_session_pairs.is_empty() || !lost.is_empty() {
+                let mut session_index = state_for_offline.session_index.write().await;
+                session_index.retain(|_, e| {
+                    !lost.contains(&e.fingerprint)
+                        && !pruned_session_pairs
+                            .iter()
+                            .any(|(fp, sid)| e.fingerprint == *fp && e.session_id == *sid)
+                });
+            }
             for payload in updates {
                 app_for_offline.emit("device_updated", payload).ok();
             }
@@ -375,6 +410,11 @@ pub async fn start_browser(
                 app_for_offline
                     .emit("device_lost", serde_json::json!({ "fingerprint": fp }))
                     .ok();
+            }
+            if stale_sessions_removed > 0 {
+                state_for_offline
+                    .bump_discovery_event("stale_session_pruned")
+                    .await;
             }
         }
     });
@@ -742,7 +782,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::net::SocketAddr;
     use std::str::FromStr;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use crate::state::{DeviceInfo, Platform, SessionIndexEntry, SessionInfo};
 
@@ -818,6 +858,12 @@ mod tests {
     fn deferred_remove_requires_grace_window() {
         assert!(!super::should_apply_deferred_remove(100, 100, 114));
         assert!(super::should_apply_deferred_remove(100, 100, 115));
+    }
+
+    #[test]
+    fn stale_session_threshold_is_applied() {
+        assert!(!super::is_session_stale(Duration::from_secs(89)));
+        assert!(super::is_session_stale(Duration::from_secs(90)));
     }
 
     #[test]

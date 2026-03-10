@@ -940,6 +940,20 @@ pub async fn get_runtime_status(
 }
 
 #[tauri::command]
+pub async fn copy_to_clipboard(text: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        let mut clipboard = arboard::Clipboard::new()
+            .map_err(|e| format!("native clipboard unavailable: {e}"))?;
+        clipboard
+            .set_text(text)
+            .map_err(|e| format!("native clipboard write failed: {e}"))?;
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| format!("clipboard worker failed: {e}"))?
+}
+
+#[tauri::command]
 pub async fn get_discovery_diagnostics(
     state: AppStateRef<'_>,
 ) -> Result<serde_json::Value, String> {
@@ -1055,6 +1069,17 @@ pub async fn get_discovery_diagnostics(
                 .to_string(),
         );
     }
+    if discovery_event_counts
+        .get("stale_session_pruned")
+        .copied()
+        .unwrap_or_default()
+        > 0
+    {
+        quick_hints.push(
+            "Stale discovery sessions were pruned locally; if peers keep flapping, compare diagnostics from both ends for mDNS remove/resolved parity."
+                .to_string(),
+        );
+    }
 
     Ok(serde_json::json!({
         "runtime": runtime,
@@ -1075,6 +1100,7 @@ pub async fn get_discovery_diagnostics(
             "last_search_started": mdns_last_search_started,
         }),
         "session_index_count": session_index_count,
+        "session_stale_ttl_secs": 90,
         "discovery_event_counts": discovery_event_counts,
         "discovery_failure_counts": discovery_failure_counts,
         "quick_hints": quick_hints,

@@ -2,6 +2,7 @@
 import { ref, onMounted } from 'vue';
 import {
   getAppConfig,
+  copyTextToClipboard,
   getDiscoveryDiagnostics,
   getLocalIdentity,
   getRuntimeStatus,
@@ -76,10 +77,12 @@ async function copyFingerprint() {
 }
 
 async function copyToClipboard(text: string) {
+  let lastError: unknown = null;
   try {
     await navigator.clipboard.writeText(text);
     return;
   } catch (clipboardErr) {
+    lastError = clipboardErr;
     const textarea = document.createElement('textarea');
     textarea.value = text;
     textarea.setAttribute('readonly', 'true');
@@ -92,10 +95,18 @@ async function copyToClipboard(text: string) {
     textarea.select();
     const copied = document.execCommand('copy');
     document.body.removeChild(textarea);
-    if (!copied) {
-      throw clipboardErr;
+    if (copied) {
+      return;
     }
+    lastError = clipboardErr;
   }
+  try {
+    await copyTextToClipboard(text);
+    return;
+  } catch (nativeErr) {
+    lastError = nativeErr;
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 async function copyDiscoveryDiagnostics() {
