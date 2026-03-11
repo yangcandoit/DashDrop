@@ -2,6 +2,8 @@ use anyhow::{bail, Context, Result};
 use blake3::Hasher;
 use quinn::Connection;
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -19,13 +21,17 @@ use crate::transport::events::{
 };
 use crate::transport::protocol::{
     read_message, write_message, ChunkPayload, CompletePayload, DashMessage, ErrorCode, FailedFile,
-    FileItem, FileType, OfferPayload, SourceSnapshot, TransferOutcome, CHUNK_SIZE,
+    FileItem, FileType, OfferPayload, RiskClass, SourceSnapshot, TransferOutcome, CHUNK_SIZE,
     USER_RESPONSE_TIMEOUT_SECS,
 };
 
 type AckResult = (u32, bool, Option<ErrorCode>);
 type AckWaiters = Arc<Mutex<HashMap<u32, oneshot::Sender<(bool, Option<ErrorCode>)>>>>;
 const SOURCE_SNAPSHOT_HEAD_BYTES: usize = 1024 * 1024;
+const SHEBANG_PROBE_BYTES: usize = 256;
+const HIGH_RISK_SUFFIXES: &[&str] = &[
+    ".app", ".bat", ".bash", ".cmd", ".deb", ".exe", ".msi", ".pkg", ".ps1", ".rpm", ".sh", ".zsh",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ResumeSourcePolicy {
@@ -35,6 +41,75 @@ enum ResumeSourcePolicy {
 
 fn error_code_key(code: &ErrorCode) -> String {
     code.reason_code().to_string()
+}
+
+fn infer_risk_class_from_name(name: &str, file_type: &FileType) -> RiskClass {
+    if matches!(file_type, FileType::Directory) {
+        let lowered = name.to_ascii_lowercase();
+        if HIGH_RISK_SUFFIXES
+            .iter()
+            .any(|suffix| lowered.ends_with(suffix))
+        {
+            return RiskClass::High;
+        }
+        return RiskClass::Normal;
+    }
+
+    let lowered = name.to_ascii_lowercase();
+    if HIGH_RISK_SUFFIXES
+        .iter()
+        .any(|suffix| lowered.ends_with(suffix))
+    {
+        RiskClass::High
+    } else {
+        RiskClass::Normal
+    }
+}
+
+#[cfg(unix)]
+fn has_executable_bit(meta: &std::fs::Metadata) -> bool {
+    meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn has_executable_bit(_meta: &std::fs::Metadata) -> bool {
+    false
+}
+
+async fn has_shebang(path: &PathBuf) -> Result<bool> {
+    let file = File::open(path)
+        .await
+        .with_context(|| format!("open risk probe file {}", path.display()))?;
+    let mut limited = file.take(SHEBANG_PROBE_BYTES as u64);
+    let mut buf = vec![0u8; SHEBANG_PROBE_BYTES];
+    let n = limited
+        .read(&mut buf)
+        .await
+        .with_context(|| format!("read risk probe head {}", path.display()))?;
+    Ok(n >= 2 && &buf[..2] == b"#!")
+}
+
+async fn detect_risk_class(
+    path: &PathBuf,
+    meta: &std::fs::Metadata,
+    file_type: &FileType,
+) -> Result<RiskClass> {
+    let inferred = infer_risk_class_from_name(
+        &path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        file_type,
+    );
+    if inferred == RiskClass::High || matches!(file_type, FileType::Directory) {
+        return Ok(inferred);
+    }
+
+    if has_executable_bit(meta) || has_shebang(path).await? {
+        Ok(RiskClass::High)
+    } else {
+        Ok(RiskClass::Normal)
+    }
 }
 
 /// Send files to a remote peer.
@@ -115,6 +190,7 @@ pub async fn send_files(
                         name: f.name.clone(),
                         rel_path: f.rel_path.clone(),
                         size: f.size,
+                        risk_class: f.risk_class.clone(),
                     })
                     .collect(),
                 status: TransferStatus::PendingAccept,
@@ -950,6 +1026,7 @@ async fn collect_items(
         .unwrap_or(0);
 
     if meta.is_dir() {
+        let risk_class = infer_risk_class_from_name(&name, &FileType::Directory);
         items.push((
             FileItem {
                 file_id: *next_id,
@@ -958,6 +1035,7 @@ async fn collect_items(
                 size: 0,
                 file_type: FileType::Directory,
                 modified,
+                risk_class: Some(risk_class),
                 source_snapshot: None,
             },
             path.clone(),
@@ -972,6 +1050,7 @@ async fn collect_items(
     } else if meta.is_file() {
         let source_snapshot =
             Some(build_source_snapshot(path, meta.len(), meta.modified().ok()).await?);
+        let risk_class = detect_risk_class(path, &meta, &FileType::RegularFile).await?;
         // Only regular files; symlinks already skipped above
         items.push((
             FileItem {
@@ -981,6 +1060,7 @@ async fn collect_items(
                 size: meta.len(),
                 file_type: FileType::RegularFile,
                 modified,
+                risk_class: Some(risk_class),
                 source_snapshot,
             },
             path.clone(),
@@ -1030,10 +1110,10 @@ async fn build_source_snapshot(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_source_snapshot, determine_outcome, validate_resume_source_snapshots,
-        ResumeSourcePolicy, SOURCE_SNAPSHOT_HEAD_BYTES,
+        build_source_snapshot, detect_risk_class, determine_outcome, infer_risk_class_from_name,
+        validate_resume_source_snapshots, ResumeSourcePolicy, SOURCE_SNAPSHOT_HEAD_BYTES,
     };
-    use crate::transport::protocol::{ErrorCode, FileItem, FileType, TransferOutcome};
+    use crate::transport::protocol::{ErrorCode, FileItem, FileType, RiskClass, TransferOutcome};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -1047,8 +1127,21 @@ mod tests {
             size: 1,
             file_type: FileType::RegularFile,
             modified: 0,
+            risk_class: Some(RiskClass::Normal),
             source_snapshot: None,
         }
+    }
+
+    #[test]
+    fn executable_suffix_is_high_risk() {
+        assert_eq!(
+            infer_risk_class_from_name("installer.pkg", &FileType::RegularFile),
+            RiskClass::High
+        );
+        assert_eq!(
+            infer_risk_class_from_name("notes.txt", &FileType::RegularFile),
+            RiskClass::Normal
+        );
     }
 
     fn temp_file_path(name: &str) -> PathBuf {
@@ -1239,6 +1332,7 @@ mod tests {
             size: metadata.len(),
             file_type: FileType::RegularFile,
             modified: 0,
+            risk_class: Some(RiskClass::Normal),
             source_snapshot: Some(current_snapshot),
         }];
 
@@ -1255,6 +1349,23 @@ mod tests {
                 panic!("modified source must force a full restart")
             }
         }
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn shebang_without_extension_is_high_risk() {
+        let path = temp_file_path("script-no-ext");
+        tokio::fs::write(&path, b"#!/bin/sh\necho hi\n")
+            .await
+            .expect("write script");
+        let meta = tokio::fs::metadata(&path).await.expect("metadata");
+
+        let risk = detect_risk_class(&path, &meta, &FileType::RegularFile)
+            .await
+            .expect("risk");
+
+        assert_eq!(risk, RiskClass::High);
 
         let _ = tokio::fs::remove_file(&path).await;
     }

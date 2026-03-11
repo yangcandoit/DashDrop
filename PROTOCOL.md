@@ -19,7 +19,9 @@
 > - 已落地：通知过期动作返回 `E_REQUEST_EXPIRED`，恢复前执行 `source_snapshot(size/mtime/head_hash)` 一致性校验，固定端口优先与防火墙状态诊断接线，以及可选 `batch_id` 扩展字段。
 > - 已落地：工程门禁与发布自动化（CI + clippy、security audit、Code Scanning default setup、installers/release checksum）；协议行为不变，仅增强交付质量。
 > - 部分待补：协议文档中的“真实端到端集成测试要求”尚未完全达成（当前为单测+契约测试增强）。
-> - 目标态预留：AirDrop-like 设计中的 `risk_class`、`E_SIZE_POLICY`、daemon/system share/BLE assist 等能力，当前仍未启用。
+> - 已落地：`FileItem.risk_class` 可选字段、trusted auto-accept 500MB 阈值、以及高风险文件自动降级为人工确认。
+> - 已明确：当前实现保留 `E_SIZE_POLICY` 码位，但默认大小策略超限只降级为人工确认；若人工确认超时，统一保持 `E_TIMEOUT` 语义。
+> - 目标态预留：daemon/system share/BLE assist 等能力，当前仍未启用。
 
 ---
 
@@ -194,12 +196,12 @@ Sender                              Receiver
 | `E_PATH_CONFLICT` | 同一传输内多个文件规范化后落盘路径相同 |
 | `E_UNSUPPORTED_FILE_TYPE` | 文件类型不在 MVP 允许范围（如符号链接、设备文件）|
 | `E_REQUEST_EXPIRED` | 接收侧通知已过期后触发的无效操作 |
-| `E_SIZE_POLICY` | （预留）超出自动接收体积策略阈值 |
+| `E_SIZE_POLICY` | 自动接收策略体积阈值命中的策略码（当前默认仅保留码位，不作为超时分支默认出站） |
 
 错误码发射规则（强制）：
 1. 发送新事件时，必须优先使用新码：`E_REJECTED_BY_PEER`、`E_CANCELLED_BY_SENDER`、`E_CANCELLED_BY_RECEIVER`。
 2. 旧码 `E_REJECTED`、`E_CANCELLED` 仅用于**入站兼容解析**，不得作为新实现默认出站码。
-3. 预留码当前仅包括 `E_SIZE_POLICY` 等未启用能力；已落地功能可正常出站 `E_REQUEST_EXPIRED`。
+3. 当前大小策略已启用，但实现选择“超限降级为人工确认，超时仍出站 `E_TIMEOUT`”；`E_SIZE_POLICY` 保留给未来显式策略拒绝分支。
 
 ### 5.1 rel_path 安全规则（接收端强制执行）
 
@@ -372,7 +374,7 @@ cert_fp = SHA256(peer_tls_cert.public_key_der)
 | 中继模式 | 新增 `relay` 连接类型，数据仍 E2E 加密 |
 
 补充（目标态预留，默认实现未启用）：
-1. `FileItem` 可新增可选字段 `risk_class`（`high|normal`），用于接收策略决策；老版本可忽略。
+1. `FileItem` 已新增可选字段 `risk_class`（`high|normal`），用于接收策略决策；老版本可忽略。
 2. daemon/system share 路径上的通知动作仍需沿用 `transfer_id + notification_id` 绑定约束。
 3. 后续若补块级恢复，仍需以 `source_snapshot` 通过后才允许复用旧进度。
 
