@@ -7,6 +7,7 @@ use rusqlite::types::Type;
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 use tauri::{AppHandle, Manager};
 
 fn parse_direction(raw: String) -> rusqlite::Result<TransferDirection> {
@@ -37,6 +38,7 @@ pub fn init_db(app: &AppHandle) -> Result<Connection> {
     let db_path = config_dir.join("history.db");
 
     let conn = Connection::open(&db_path)?;
+    configure_sqlite_connection(&conn)?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS transfers_history (
@@ -109,6 +111,13 @@ pub fn init_db(app: &AppHandle) -> Result<Connection> {
     Ok(conn)
 }
 
+fn configure_sqlite_connection(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(Duration::from_secs(5))?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    Ok(())
+}
+
 pub fn load_app_config(conn: &Connection) -> Result<Option<AppConfig>> {
     let mut stmt = conn.prepare("SELECT config_json FROM app_config_store WHERE id = 1")?;
     let mut rows = stmt.query([])?;
@@ -176,6 +185,10 @@ pub fn replace_trusted_peers(
 }
 
 pub fn save_transfer(conn: &Connection, t: &TransferTask) -> Result<()> {
+    if !should_persist_transfer(conn, t)? {
+        return Ok(());
+    }
+
     let items_json = serde_json::to_string(&t.items)?;
     let ended_sys = t.ended_at_unix.unwrap_or_else(|| {
         std::time::SystemTime::now()
@@ -185,10 +198,23 @@ pub fn save_transfer(conn: &Connection, t: &TransferTask) -> Result<()> {
     });
 
     conn.execute(
-        "INSERT OR REPLACE INTO transfers_history (
+        "INSERT INTO transfers_history (
             id, direction, peer_fingerprint, peer_name, items, status,
             bytes_transferred, total_bytes, revision, started_at, ended_at, reason_code, error
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        ON CONFLICT(id) DO UPDATE SET
+            direction = excluded.direction,
+            peer_fingerprint = excluded.peer_fingerprint,
+            peer_name = excluded.peer_name,
+            items = excluded.items,
+            status = excluded.status,
+            bytes_transferred = excluded.bytes_transferred,
+            total_bytes = excluded.total_bytes,
+            revision = excluded.revision,
+            started_at = excluded.started_at,
+            ended_at = excluded.ended_at,
+            reason_code = excluded.reason_code,
+            error = excluded.error",
         params![
             t.id,
             match t.direction {
@@ -209,6 +235,65 @@ pub fn save_transfer(conn: &Connection, t: &TransferTask) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+fn should_persist_transfer(conn: &Connection, task: &TransferTask) -> Result<bool> {
+    let existing = conn.query_row(
+        "SELECT status, bytes_transferred, revision
+         FROM transfers_history
+         WHERE id = ?1",
+        params![task.id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, u64>(2)?,
+            ))
+        },
+    );
+
+    let Ok((existing_status, existing_bytes, existing_revision)) = existing else {
+        return Ok(true);
+    };
+
+    if task.revision > existing_revision {
+        return Ok(true);
+    }
+    if task.revision < existing_revision {
+        return Ok(false);
+    }
+
+    let incoming_terminal = is_terminal_status(&task.status);
+    let existing_terminal = is_terminal_status_str(&existing_status);
+    if existing_terminal && !incoming_terminal {
+        return Ok(false);
+    }
+
+    Ok(task.bytes_transferred >= existing_bytes)
+}
+
+fn is_terminal_status(status: &crate::state::TransferStatus) -> bool {
+    matches!(
+        status,
+        crate::state::TransferStatus::Completed
+            | crate::state::TransferStatus::PartialCompleted
+            | crate::state::TransferStatus::Rejected
+            | crate::state::TransferStatus::CancelledBySender
+            | crate::state::TransferStatus::CancelledByReceiver
+            | crate::state::TransferStatus::Failed
+    )
+}
+
+fn is_terminal_status_str(status: &str) -> bool {
+    matches!(
+        status,
+        "Completed"
+            | "PartialCompleted"
+            | "Rejected"
+            | "CancelledBySender"
+            | "CancelledByReceiver"
+            | "Failed"
+    )
 }
 
 pub fn get_history(conn: &Connection, limit: u32, offset: u32) -> Result<Vec<TransferTask>> {
@@ -398,11 +483,15 @@ pub fn get_security_events(
 
 #[cfg(test)]
 mod tests {
-    use super::{load_transfer_source_snapshots, parse_direction, save_transfer_source_snapshots};
-    use crate::state::TransferDirection;
+    use super::{
+        configure_sqlite_connection, load_transfer_source_snapshots, parse_direction,
+        save_transfer, save_transfer_source_snapshots,
+    };
+    use crate::state::{FileItemMeta, TransferDirection, TransferStatus, TransferTask};
     use crate::transport::protocol::SourceSnapshot;
     use rusqlite::Connection;
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     fn setup_test_db() -> Connection {
         let conn = Connection::open_in_memory().expect("in-memory db");
@@ -434,6 +523,39 @@ mod tests {
         )
         .expect("snapshot table");
         conn
+    }
+
+    fn test_transfer(id: &str, status: TransferStatus, bytes: u64, revision: u64) -> TransferTask {
+        TransferTask {
+            id: id.to_string(),
+            batch_id: None,
+            direction: TransferDirection::Send,
+            peer_fingerprint: "peer-fp".to_string(),
+            peer_name: "Peer".to_string(),
+            items: vec![FileItemMeta {
+                file_id: 1,
+                name: "file.bin".to_string(),
+                rel_path: "file.bin".to_string(),
+                size: 64,
+            }],
+            status,
+            bytes_transferred: bytes,
+            total_bytes: 64,
+            revision,
+            started_at_unix: 1,
+            ended_at_unix: None,
+            terminal_reason_code: None,
+            error: None,
+            source_paths: None,
+            source_path_by_file_id: None,
+            failed_file_ids: None,
+            conn: None,
+            ended_at: None,
+        }
+    }
+
+    fn temp_db_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("dashdrop-{name}-{}.db", uuid::Uuid::new_v4()))
     }
 
     #[test]
@@ -472,5 +594,48 @@ mod tests {
         let loaded = load_transfer_source_snapshots(&conn, "transfer-1").expect("load snapshots");
 
         assert_eq!(loaded, Some(snapshots));
+    }
+
+    #[test]
+    fn sqlite_connection_uses_wal_and_busy_timeout() {
+        let path = temp_db_path("sqlite-config");
+        let conn = Connection::open(&path).expect("open sqlite file");
+        configure_sqlite_connection(&conn).expect("configure sqlite");
+
+        let journal_mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("journal mode");
+        let busy_timeout_ms: u64 = conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .expect("busy timeout");
+
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert_eq!(busy_timeout_ms, 5_000);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn stale_progress_snapshot_cannot_overwrite_terminal_row() {
+        let conn = setup_test_db();
+        let terminal = test_transfer("transfer-1", TransferStatus::Completed, 64, 2);
+        let stale_progress = test_transfer("transfer-1", TransferStatus::Transferring, 32, 1);
+
+        save_transfer(&conn, &terminal).expect("save terminal");
+        save_transfer(&conn, &stale_progress).expect("save stale progress");
+
+        let (status, bytes, revision): (String, u64, u64) = conn
+            .query_row(
+                "SELECT status, bytes_transferred, revision
+                 FROM transfers_history
+                 WHERE id = ?1",
+                ["transfer-1"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("load transfer row");
+
+        assert_eq!(status, "Completed");
+        assert_eq!(bytes, 64);
+        assert_eq!(revision, 2);
     }
 }

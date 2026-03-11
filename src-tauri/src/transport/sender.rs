@@ -481,6 +481,7 @@ pub async fn send_files(
         crate::state::TransferStatus,
         u64,
     )> = None;
+    let mut terminal_snapshot: Option<crate::state::TransferTask> = None;
     {
         let mut transfers = state.transfers.write().await;
         if let Some(t) = transfers.get_mut(&transfer_id) {
@@ -523,6 +524,7 @@ pub async fn send_files(
             if let Ok(guard) = state.db.lock() {
                 let _ = crate::db::save_transfer(&guard, t);
             }
+            terminal_snapshot = Some(crate::persistence_progress::progress_snapshot(t));
             match &outcome {
                 TransferOutcome::Success => {
                     emit_transfer_complete(&app, &transfer_id, t.revision);
@@ -590,6 +592,9 @@ pub async fn send_files(
         state
             .record_transfer_terminal(&direction, &status, bytes)
             .await;
+    }
+    if let Some(task) = terminal_snapshot.as_ref() {
+        state.flush_progress_persist_now(task).await;
     }
 
     ack_dispatch.abort();
@@ -769,15 +774,23 @@ async fn send_one_file(
         offset += n as u64;
         chunk_id += 1;
 
-        let (overall_transferred, total_bytes, revision) = {
+        let (progress_snapshot, overall_transferred, total_bytes, revision) = {
             let mut transfers = state.transfers.write().await;
             if let Some(t) = transfers.get_mut(&transfer_id) {
                 t.bytes_transferred += n as u64;
-                (t.bytes_transferred, t.total_bytes, t.revision)
+                (
+                    Some(crate::persistence_progress::progress_snapshot(t)),
+                    t.bytes_transferred,
+                    t.total_bytes,
+                    t.revision,
+                )
             } else {
                 continue;
             }
         };
+        if let Some(task) = progress_snapshot.as_ref() {
+            state.schedule_progress_persist(task).await;
+        }
 
         emit_transfer_progress(
             &app,

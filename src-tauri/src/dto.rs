@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::state::{
     DeviceInfo, FileItemMeta, LocalIdentityView, Platform, ReachabilityStatus, SessionInfo,
     TransferDirection, TransferStatus, TransferTask, TrustedPeer,
 };
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionView {
     pub session_id: String,
     pub addrs: Vec<String>,
@@ -24,7 +24,7 @@ impl From<&SessionInfo> for SessionView {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceView {
     pub fingerprint: String,
     pub name: String,
@@ -57,7 +57,7 @@ impl From<&DeviceInfo> for DeviceView {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferView {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -97,7 +97,7 @@ impl From<&TransferTask> for TransferView {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrustedPeerView {
     pub fingerprint: String,
     pub name: String,

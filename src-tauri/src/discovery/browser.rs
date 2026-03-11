@@ -183,16 +183,14 @@ async fn resolve_hostname_with_mdns(
 async fn resolve_hostname_with_system_dns(hostname: &str, port: u16) -> Vec<SocketAddr> {
     let resolve_target = format!("{}:{port}", hostname.trim_end_matches('.'));
     let mut addrs = Vec::new();
-    if let Ok(resolved) = tokio::task::spawn_blocking(move || {
+    if let Ok(Ok(extra)) = tokio::task::spawn_blocking(move || {
         resolve_target
             .to_socket_addrs()
             .map(|iter| iter.collect::<Vec<SocketAddr>>())
     })
     .await
     {
-        if let Ok(extra) = resolved {
-            addrs.extend(extra.into_iter().filter(is_usable_peer_addr));
-        }
+        addrs.extend(extra.into_iter().filter(is_usable_peer_addr));
     }
     sort_dedupe_addrs(&mut addrs);
     addrs
@@ -375,7 +373,8 @@ pub async fn start_browser(
                             }
                         }
                         if device.sessions.is_empty() {
-                            device.reachability = crate::state::ReachabilityStatus::OfflineCandidate;
+                            device.reachability =
+                                crate::state::ReachabilityStatus::OfflineCandidate;
                         }
                         updates.push(DeviceView::from(&*device));
                     }
@@ -439,9 +438,7 @@ async fn handle_resolved(
     };
     let fp = fp_prop.val_str().to_string();
     if fp.is_empty() {
-        state
-            .bump_discovery_failure("resolved_empty_fp_txt")
-            .await;
+        state.bump_discovery_failure("resolved_empty_fp_txt").await;
         return;
     }
     if fp == own_fp {
@@ -586,6 +583,8 @@ async fn handle_resolved(
         idx.insert(service_fullname, entry);
     }
 
+    state.record_device_visibility(&fp).await;
+
     let payload = DeviceView::from(&device_model);
 
     if is_new {
@@ -721,7 +720,10 @@ pub(crate) async fn run_probe_update(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let addrs = select_probe_addrs(addrs);
-    let attempted_addrs = addrs.iter().map(|addr| addr.to_string()).collect::<Vec<_>>();
+    let attempted_addrs = addrs
+        .iter()
+        .map(|addr| addr.to_string())
+        .collect::<Vec<_>>();
     let mut ok = false;
     let mut success_addr: Option<String> = None;
     let mut last_error_reason: Option<String> = None;
@@ -907,7 +909,10 @@ mod tests {
             SocketAddr::from_str("192.168.1.9:9443").expect("addr"),
         ];
         let selected = super::select_probe_addrs(input);
-        assert_eq!(selected, vec![SocketAddr::from_str("192.168.1.9:9443").expect("addr")]);
+        assert_eq!(
+            selected,
+            vec![SocketAddr::from_str("192.168.1.9:9443").expect("addr")]
+        );
     }
 
     #[test]

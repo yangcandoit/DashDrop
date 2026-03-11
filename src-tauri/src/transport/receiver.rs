@@ -245,35 +245,42 @@ pub async fn handle_offer(
         offer.total_size,
         transfer_revision(&state, &transfer_id).await,
     );
+    state
+        .record_receiver_fallback_prompted(&transfer_id, &peer_fp)
+        .await;
 
     let auto_accept_enabled = state.config.read().await.auto_accept_trusted_only;
-    let (user_accepted, is_timeout) = if should_auto_accept(
-        trusted && peer_authenticated,
-        auto_accept_enabled,
-    ) {
-        (true, false)
-    } else {
-        // Wait for user accept/reject
-        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-        {
+    let (user_accepted, is_timeout) =
+        if should_auto_accept(trusted && peer_authenticated, auto_accept_enabled) {
+            (true, false)
+        } else {
             state
-                .pending_accepts
-                .write()
-                .await
-                .insert(transfer_id.clone(), tx);
-        }
+                .ensure_incoming_request_notification(&transfer_id)
+                .await;
 
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(crate::transport::protocol::USER_RESPONSE_TIMEOUT_SECS),
-            rx,
-        )
-        .await
-        {
-            Ok(Ok(v)) => (v, false),
-            Ok(Err(_)) => (false, false),
-            Err(_) => (false, true),
-        }
-    };
+            // Wait for user accept/reject
+            let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+            {
+                state
+                    .pending_accepts
+                    .write()
+                    .await
+                    .insert(transfer_id.clone(), tx);
+            }
+
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(
+                    crate::transport::protocol::USER_RESPONSE_TIMEOUT_SECS,
+                ),
+                rx,
+            )
+            .await
+            {
+                Ok(Ok(v)) => (v, false),
+                Ok(Err(_)) => (false, false),
+                Err(_) => (false, true),
+            }
+        };
 
     if !user_accepted {
         // Reject
@@ -859,15 +866,23 @@ async fn receive_one_file(
                     return Ok((file_id, false, Some(io_error_code(&e))));
                 }
 
-                let (overall_transferred, total_bytes, revision) = {
+                let (progress_snapshot, overall_transferred, total_bytes, revision) = {
                     let mut transfers = state.transfers.write().await;
                     if let Some(t) = transfers.get_mut(&transfer_id) {
                         t.bytes_transferred += chunk.data.len() as u64;
-                        (t.bytes_transferred, t.total_bytes, t.revision)
+                        (
+                            Some(crate::persistence_progress::progress_snapshot(t)),
+                            t.bytes_transferred,
+                            t.total_bytes,
+                            t.revision,
+                        )
                     } else {
                         continue;
                     }
                 };
+                if let Some(task) = progress_snapshot.as_ref() {
+                    state.schedule_progress_persist(task).await;
+                }
 
                 emit_transfer_progress(
                     &app,
@@ -944,6 +959,7 @@ async fn update_transfer_status(
     reason_code: Option<&str>,
 ) -> Option<u64> {
     let mut metrics_snapshot: Option<(TransferDirection, TransferStatus, u64)> = None;
+    let mut terminal_snapshot: Option<crate::state::TransferTask> = None;
     let mut transfers = state.transfers.write().await;
     if let Some(t) = transfers.get_mut(&id) {
         let previous_status = t.status.clone();
@@ -971,6 +987,7 @@ async fn update_transfer_status(
                 if let Ok(guard) = state.db.lock() {
                     let _ = crate::db::save_transfer(&guard, t);
                 }
+                terminal_snapshot = Some(crate::persistence_progress::progress_snapshot(t));
                 let was_terminal = matches!(
                     previous_status,
                     TransferStatus::Completed
@@ -993,6 +1010,9 @@ async fn update_transfer_status(
             state
                 .record_transfer_terminal(&direction, &terminal_status, bytes)
                 .await;
+        }
+        if let Some(task) = terminal_snapshot.as_ref() {
+            state.flush_progress_persist_now(task).await;
         }
         return Some(revision);
     }

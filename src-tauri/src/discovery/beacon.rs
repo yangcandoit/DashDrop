@@ -1,13 +1,16 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter};
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use std::fs;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use std::path::Path;
 
 use crate::dto::DeviceView;
 use crate::state::{AppState, DeviceInfo, Platform, SessionIndexEntry, SessionInfo};
@@ -90,17 +93,17 @@ fn current_power_profile() -> PowerProfile {
 fn detect_power_profile() -> Option<PowerProfile> {
     #[cfg(target_os = "macos")]
     {
-        return detect_macos_power_profile();
+        detect_macos_power_profile()
     }
 
     #[cfg(target_os = "linux")]
     {
-        return detect_linux_power_profile();
+        detect_linux_power_profile()
     }
 
     #[cfg(target_os = "windows")]
     {
-        return detect_windows_power_profile();
+        detect_windows_power_profile()
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -251,6 +254,7 @@ fn parse_windows_power_profile(
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
     Some(fs::read_to_string(path).ok()?.trim().to_string())
 }
@@ -480,6 +484,8 @@ async fn upsert_from_beacon(
             },
         );
     }
+
+    state.record_device_visibility(&fp).await;
 
     let payload = DeviceView::from(&device_model);
     if is_new {

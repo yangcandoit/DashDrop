@@ -1,13 +1,19 @@
 mod commands;
+#[allow(dead_code)]
+mod core_service;
 mod crypto;
+#[allow(dead_code)]
+mod daemon;
 pub mod db;
 pub mod discovery;
 mod dto;
+mod local_ipc;
 mod persistence;
+mod persistence_progress;
 pub mod state;
 pub mod transport;
 
-use crypto::Identity;
+pub use crypto::Identity;
 use state::{AppConfig, AppState, TransferStatus};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -155,6 +161,29 @@ pub fn run() {
 
             // Manage state with Tauri
             app.manage(Arc::clone(&state));
+
+            match daemon::server::spawn(Arc::clone(&state), Some(handle.clone()), &config_dir) {
+                Ok(ipc_server) => {
+                    tracing::info!(
+                        "Local IPC server listening on {}",
+                        ipc_server.endpoint().describe()
+                    );
+                    app.manage(ipc_server);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to start local IPC server: {e:#}");
+                    handle
+                        .emit(
+                            "system_error",
+                            serde_json::json!({
+                                "code": "LOCAL_IPC_START_FAILED",
+                                "subsystem": "local_ipc",
+                                "message": format!("Local control-plane IPC unavailable: {e:#}")
+                            }),
+                        )
+                        .ok();
+                }
+            }
 
             // Start async subsystems
             let state2 = Arc::clone(&state);
