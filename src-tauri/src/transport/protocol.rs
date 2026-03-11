@@ -23,6 +23,7 @@ pub enum ErrorCode {
     Cancelled,
     PermissionDenied,
     IdentityMismatch,
+    SizePolicy,
     InvalidPath,
     PathConflict,
     UnsupportedFileType,
@@ -41,6 +42,7 @@ impl std::fmt::Display for ErrorCode {
             ErrorCode::Cancelled => write!(f, "Cancelled"),
             ErrorCode::PermissionDenied => write!(f, "Permission denied"),
             ErrorCode::IdentityMismatch => write!(f, "Identity mismatch"),
+            ErrorCode::SizePolicy => write!(f, "Size policy requires manual review"),
             ErrorCode::InvalidPath => write!(f, "Invalid path"),
             ErrorCode::PathConflict => write!(f, "Path conflict"),
             ErrorCode::UnsupportedFileType => write!(f, "Unsupported file type"),
@@ -61,6 +63,7 @@ impl ErrorCode {
             ErrorCode::Cancelled => "E_CANCELLED",
             ErrorCode::PermissionDenied => "E_PERMISSION_DENIED",
             ErrorCode::IdentityMismatch => "E_IDENTITY_MISMATCH",
+            ErrorCode::SizePolicy => "E_SIZE_POLICY",
             ErrorCode::InvalidPath => "E_INVALID_PATH",
             ErrorCode::PathConflict => "E_PATH_CONFLICT",
             ErrorCode::UnsupportedFileType => "E_UNSUPPORTED_FILE_TYPE",
@@ -78,6 +81,13 @@ pub enum FileType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskClass {
+    High,
+    Normal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourceSnapshot {
     pub size: u64,
     pub mtime_unix_ms: u64,
@@ -92,6 +102,8 @@ pub struct FileItem {
     pub size: u64,
     pub file_type: FileType,
     pub modified: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_class: Option<RiskClass>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_snapshot: Option<SourceSnapshot>,
 }
@@ -227,18 +239,19 @@ pub async fn read_message(recv: &mut quinn::RecvStream) -> Result<DashMessage> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ErrorCode, FileItem, FileType, SourceSnapshot};
+    use super::{ErrorCode, FileItem, FileType, RiskClass, SourceSnapshot};
 
     #[test]
     fn reason_codes_match_protocol_shape() {
         assert_eq!(ErrorCode::HashMismatch.reason_code(), "E_HASH_MISMATCH");
         assert_eq!(ErrorCode::Timeout.reason_code(), "E_TIMEOUT");
         assert_eq!(ErrorCode::RateLimited.reason_code(), "E_RATE_LIMITED");
+        assert_eq!(ErrorCode::SizePolicy.reason_code(), "E_SIZE_POLICY");
         assert_eq!(ErrorCode::Protocol("x".into()).reason_code(), "E_PROTOCOL");
     }
 
     #[test]
-    fn file_item_deserializes_without_optional_source_snapshot() {
+    fn file_item_deserializes_without_optional_security_fields() {
         let json = serde_json::json!({
             "file_id": 7,
             "name": "demo.txt",
@@ -249,11 +262,12 @@ mod tests {
         });
 
         let item: FileItem = serde_json::from_value(json).expect("file item");
+        assert!(item.risk_class.is_none());
         assert!(item.source_snapshot.is_none());
     }
 
     #[test]
-    fn file_item_serializes_with_source_snapshot_when_present() {
+    fn file_item_serializes_with_optional_security_fields_when_present() {
         let item = FileItem {
             file_id: 1,
             name: "demo.txt".into(),
@@ -261,6 +275,7 @@ mod tests {
             size: 3,
             file_type: FileType::RegularFile,
             modified: 99,
+            risk_class: Some(RiskClass::High),
             source_snapshot: Some(SourceSnapshot {
                 size: 3,
                 mtime_unix_ms: 1234,
@@ -269,6 +284,7 @@ mod tests {
         };
 
         let value = serde_json::to_value(item).expect("serialize");
+        assert_eq!(value.get("risk_class"), Some(&serde_json::json!("high")));
         assert!(value.get("source_snapshot").is_some());
     }
 }

@@ -10,12 +10,15 @@ use crate::state::{AppConfig, LocalIdentityView, RuntimeStatus};
 
 pub const LOCAL_IPC_PROTO_VERSION: u16 = 1;
 pub const LOCAL_IPC_MAX_FRAME_LEN: usize = 1024 * 1024;
-pub const RESERVED_PHASE_A_COMMANDS: &[&str] = &[
-    "discover/diagnostics",
-    "transfer/send",
-    "transfer/cancel",
-    "transfer/retry",
-];
+pub const RESERVED_PHASE_A_COMMANDS: &[&str] = &["discover/diagnostics"];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConnectByAddressResult {
+    pub fingerprint: String,
+    pub name: String,
+    pub trusted: bool,
+    pub address: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalAuthContext {
@@ -110,6 +113,9 @@ impl LocalResponseEnvelope {
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum LocalIpcCommand {
     DiscoverList,
+    DiscoverConnectByAddress {
+        address: String,
+    },
     TrustList,
     TrustPair {
         fingerprint: String,
@@ -125,6 +131,25 @@ pub enum LocalIpcCommand {
     ConfigSet {
         config: AppConfig,
     },
+    TransferSend {
+        peer_fingerprint: String,
+        paths: Vec<String>,
+    },
+    TransferAccept {
+        transfer_id: String,
+        notification_id: String,
+    },
+    TransferReject {
+        transfer_id: String,
+        notification_id: String,
+    },
+    TransferCancel {
+        transfer_id: String,
+    },
+    TransferCancelAll,
+    TransferRetry {
+        transfer_id: String,
+    },
     AppGetLocalIdentity,
     AppGetRuntimeStatus,
     SecurityGetPosture,
@@ -134,12 +159,19 @@ impl LocalIpcCommand {
     pub fn name(&self) -> &'static str {
         match self {
             Self::DiscoverList => "discover/list",
+            Self::DiscoverConnectByAddress { .. } => "discover/connect_by_address",
             Self::TrustList => "trust/list",
             Self::TrustPair { .. } => "trust/pair",
             Self::TrustUnpair { .. } => "trust/unpair",
             Self::TrustSetAlias { .. } => "trust/set_alias",
             Self::ConfigGet => "config/get",
             Self::ConfigSet { .. } => "config/set",
+            Self::TransferSend { .. } => "transfer/send",
+            Self::TransferAccept { .. } => "transfer/accept",
+            Self::TransferReject { .. } => "transfer/reject",
+            Self::TransferCancel { .. } => "transfer/cancel",
+            Self::TransferCancelAll => "transfer/cancel_all",
+            Self::TransferRetry { .. } => "transfer/retry",
             Self::AppGetLocalIdentity => "app/get_local_identity",
             Self::AppGetRuntimeStatus => "app/get_runtime_status",
             Self::SecurityGetPosture => "security/get_posture",
@@ -176,9 +208,11 @@ impl LocalIpcCommand {
             Self::DiscoverList
             | Self::TrustList
             | Self::ConfigGet
+            | Self::TransferCancelAll
             | Self::AppGetLocalIdentity
             | Self::AppGetRuntimeStatus
             | Self::SecurityGetPosture => None,
+            Self::DiscoverConnectByAddress { address } => Some(json!({ "address": address })),
             Self::TrustPair { fingerprint } | Self::TrustUnpair { fingerprint } => {
                 Some(json!({ "fingerprint": fingerprint }))
             }
@@ -187,6 +221,26 @@ impl LocalIpcCommand {
                 "alias": alias,
             })),
             Self::ConfigSet { config } => Some(json!({ "config": config })),
+            Self::TransferSend {
+                peer_fingerprint,
+                paths,
+            } => Some(json!({
+                "peer_fingerprint": peer_fingerprint,
+                "paths": paths,
+            })),
+            Self::TransferAccept {
+                transfer_id,
+                notification_id,
+            }
+            | Self::TransferReject {
+                transfer_id,
+                notification_id,
+            } => Some(json!({
+                "transfer_id": transfer_id,
+                "notification_id": notification_id,
+            })),
+            Self::TransferCancel { transfer_id }
+            | Self::TransferRetry { transfer_id } => Some(json!({ "transfer_id": transfer_id })),
         }
     }
 
@@ -196,6 +250,9 @@ impl LocalIpcCommand {
     ) -> Result<Self, LocalIpcError> {
         match command {
             "discover/list" => Ok(Self::DiscoverList),
+            "discover/connect_by_address" => Ok(Self::DiscoverConnectByAddress {
+                address: required_string(payload, "address")?,
+            }),
             "trust/list" => Ok(Self::TrustList),
             "trust/pair" => Ok(Self::TrustPair {
                 fingerprint: required_string(payload, "fingerprint")?,
@@ -210,6 +267,25 @@ impl LocalIpcCommand {
             "config/get" => Ok(Self::ConfigGet),
             "config/set" => Ok(Self::ConfigSet {
                 config: required_value(payload, "config")?,
+            }),
+            "transfer/send" => Ok(Self::TransferSend {
+                peer_fingerprint: required_string(payload, "peer_fingerprint")?,
+                paths: required_string_vec(payload, "paths")?,
+            }),
+            "transfer/accept" => Ok(Self::TransferAccept {
+                transfer_id: required_string(payload, "transfer_id")?,
+                notification_id: required_string(payload, "notification_id")?,
+            }),
+            "transfer/reject" => Ok(Self::TransferReject {
+                transfer_id: required_string(payload, "transfer_id")?,
+                notification_id: required_string(payload, "notification_id")?,
+            }),
+            "transfer/cancel" => Ok(Self::TransferCancel {
+                transfer_id: required_string(payload, "transfer_id")?,
+            }),
+            "transfer/cancel_all" => Ok(Self::TransferCancelAll),
+            "transfer/retry" => Ok(Self::TransferRetry {
+                transfer_id: required_string(payload, "transfer_id")?,
             }),
             "app/get_local_identity" => Ok(Self::AppGetLocalIdentity),
             "app/get_runtime_status" => Ok(Self::AppGetRuntimeStatus),
@@ -231,8 +307,10 @@ impl LocalIpcCommand {
 pub enum LocalIpcResponse {
     Ack,
     Devices { devices: Vec<DeviceView> },
+    ConnectByAddress { result: ConnectByAddressResult },
     TrustedPeers { trusted_peers: Vec<TrustedPeerView> },
     AppConfig { config: AppConfig },
+    CancelledTransfers { count: u32 },
     LocalIdentity { identity: LocalIdentityView },
     RuntimeStatus { runtime_status: RuntimeStatus },
     SecurityPosture { posture: serde_json::Value },
@@ -256,8 +334,10 @@ impl LocalIpcResponse {
         match self {
             Self::Ack => None,
             Self::Devices { devices } => Some(json!({ "devices": devices })),
+            Self::ConnectByAddress { result } => Some(json!({ "result": result })),
             Self::TrustedPeers { trusted_peers } => Some(json!({ "trusted_peers": trusted_peers })),
             Self::AppConfig { config } => Some(json!({ "config": config })),
+            Self::CancelledTransfers { count } => Some(json!({ "count": count })),
             Self::LocalIdentity { identity } => Some(json!({ "identity": identity })),
             Self::RuntimeStatus { runtime_status } => {
                 Some(json!({ "runtime_status": runtime_status }))
@@ -356,6 +436,27 @@ fn optional_string(payload: Option<&Value>, field: &str) -> Result<Option<String
             "payload.{field} must be a string or null"
         ))),
     }
+}
+
+fn required_string_vec(payload: Option<&Value>, field: &str) -> Result<Vec<String>, LocalIpcError> {
+    let value = payload_object(payload)?
+        .get(field)
+        .ok_or_else(|| LocalIpcError::invalid_request(format!("payload.{field} is required")))?;
+    let Some(items) = value.as_array() else {
+        return Err(LocalIpcError::invalid_request(format!(
+            "payload.{field} must be an array of strings"
+        )));
+    };
+    items
+        .iter()
+        .map(|item| {
+            item.as_str().map(str::to_string).ok_or_else(|| {
+                LocalIpcError::invalid_request(format!(
+                    "payload.{field} must be an array of strings"
+                ))
+            })
+        })
+        .collect()
 }
 
 fn required_value<T>(payload: Option<&Value>, field: &str) -> Result<T, LocalIpcError>
@@ -514,8 +615,23 @@ mod tests {
     #[test]
     fn local_command_names_match_target_shape() {
         assert_eq!(LocalIpcCommand::DiscoverList.name(), "discover/list");
+        assert_eq!(
+            LocalIpcCommand::DiscoverConnectByAddress {
+                address: "127.0.0.1:9443".into(),
+            }
+            .name(),
+            "discover/connect_by_address"
+        );
         assert_eq!(LocalIpcCommand::TrustList.name(), "trust/list");
         assert_eq!(LocalIpcCommand::ConfigGet.name(), "config/get");
+        assert_eq!(
+            LocalIpcCommand::TransferSend {
+                peer_fingerprint: "fp-1".into(),
+                paths: vec!["/tmp/a.txt".into()],
+            }
+            .name(),
+            "transfer/send"
+        );
         assert_eq!(
             LocalIpcCommand::AppGetRuntimeStatus.name(),
             "app/get_runtime_status"
@@ -576,18 +692,40 @@ mod tests {
     }
 
     #[test]
+    fn transfer_send_wire_request_parses_paths_and_fingerprint() {
+        let request = super::LocalIpcWireRequest {
+            proto_version: LOCAL_IPC_PROTO_VERSION,
+            request_id: "req-transfer".into(),
+            command: "transfer/send".into(),
+            payload: Some(json!({
+                "peer_fingerprint": "fp-1",
+                "paths": ["/tmp/a.txt", "/tmp/b.txt"],
+            })),
+            auth_context: None,
+        };
+
+        let decoded = LocalIpcCommand::from_wire_request(&request).expect("parse request");
+        assert!(matches!(
+            decoded,
+            LocalIpcCommand::TransferSend { peer_fingerprint, paths }
+                if peer_fingerprint == "fp-1"
+                    && paths == vec!["/tmp/a.txt".to_string(), "/tmp/b.txt".to_string()]
+        ));
+    }
+
+    #[test]
     fn reserved_phase_a_command_name_is_rejected_until_implemented() {
         let err = LocalIpcCommand::from_wire_request(&super::LocalIpcWireRequest {
             proto_version: LOCAL_IPC_PROTO_VERSION,
             request_id: "req-transfer".into(),
-            command: "transfer/send".into(),
+            command: "discover/diagnostics".into(),
             payload: Some(json!({})),
             auth_context: None,
         })
         .expect_err("reserved command should fail before implementation");
 
         assert_eq!(err.code, "invalid_request");
-        assert!(err.message.contains("transfer/send"));
+        assert!(err.message.contains("discover/diagnostics"));
     }
 
     #[test]
@@ -629,6 +767,27 @@ mod tests {
         );
         assert!(value.get("status").is_none());
         assert!(value.get("type").is_none());
+    }
+
+    #[test]
+    fn connect_by_address_response_uses_stable_payload_shape() {
+        let response = LocalIpcResponse::ConnectByAddress {
+            result: super::ConnectByAddressResult {
+                fingerprint: "fp-1".into(),
+                name: "Peer".into(),
+                trusted: true,
+                address: "127.0.0.1:9443".into(),
+            },
+        }
+        .into_wire_response("req-connect", LOCAL_IPC_PROTO_VERSION);
+        let value = serde_json::to_value(&response).expect("serialize response");
+
+        assert_eq!(value["ok"], json!(true));
+        assert_eq!(value["payload"]["result"]["fingerprint"], json!("fp-1"));
+        assert_eq!(
+            value["payload"]["result"]["address"],
+            json!("127.0.0.1:9443")
+        );
     }
 
     #[test]

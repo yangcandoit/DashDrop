@@ -329,6 +329,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_devices,
             commands::get_trusted_peers,
+            commands::get_pending_incoming_requests,
             commands::pair_device,
             commands::unpair_device,
             commands::set_trusted_alias,

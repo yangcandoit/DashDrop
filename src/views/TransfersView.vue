@@ -29,16 +29,16 @@ const connectError = ref<string | null>(null);
 const connectResult = ref<ConnectByAddressResult | null>(null);
 const rememberDevice = ref(true);
 
-const handleAccept = async (id: string) => {
-  await acceptTransfer(id);
+const handleAccept = async (id: string, notificationId: string) => {
+  await acceptTransfer(id, notificationId);
 };
 
-const handleAcceptAndPair = async (id: string, senderFp: string) => {
-  await acceptAndPairTransfer(id, senderFp);
+const handleAcceptAndPair = async (id: string, notificationId: string, senderFp: string) => {
+  await acceptAndPairTransfer(id, notificationId, senderFp);
 };
 
-const handleReject = async (id: string) => {
-  await rejectTransfer(id);
+const handleReject = async (id: string, notificationId: string) => {
+  await rejectTransfer(id, notificationId);
 };
 
 const formatSize = (bytes: number) => {
@@ -196,11 +196,11 @@ const handleCancelAll = async () => {
               </div>
             </div>
             <div class="incoming-actions">
-              <button class="btn btn-secondary" @click="handleReject(request.transfer_id)">Reject</button>
-              <button class="btn btn-secondary" v-if="!request.trusted" @click="handleAcceptAndPair(request.transfer_id, request.sender_fp)">
+              <button class="btn btn-secondary" @click="handleReject(request.transfer_id, request.notification_id)">Reject</button>
+              <button class="btn btn-secondary" v-if="!request.trusted" @click="handleAcceptAndPair(request.transfer_id, request.notification_id, request.sender_fp)">
                 Accept & Pair
               </button>
-              <button class="btn btn-primary" @click="handleAccept(request.transfer_id)">Accept</button>
+              <button class="btn btn-primary" @click="handleAccept(request.transfer_id, request.notification_id)">Accept</button>
             </div>
           </article>
         </div>

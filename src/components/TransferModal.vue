@@ -9,6 +9,7 @@ import type { FileItemMeta } from '../types';
 
 const props = defineProps<{
   transferId: string;
+  notificationId: string;
   senderName: string;
   senderFp: string;
   trusted: boolean;
@@ -33,7 +34,7 @@ const formatBytes = (bytes: number) => {
 const handleAccept = async () => {
   isProcessing.value = true;
   try {
-    await acceptTransfer(props.transferId);
+    await acceptTransfer(props.transferId, props.notificationId);
   } catch (error) {
     console.error('Failed to accept transfer:', error);
   } finally {
@@ -45,7 +46,7 @@ const handleAccept = async () => {
 const handleAcceptAndPair = async () => {
   isProcessing.value = true;
   try {
-    await acceptAndPairTransfer(props.transferId, props.senderFp);
+    await acceptAndPairTransfer(props.transferId, props.notificationId, props.senderFp);
   } catch (error) {
     console.error('Failed to accept & pair:', error);
   } finally {
@@ -57,7 +58,7 @@ const handleAcceptAndPair = async () => {
 const handleReject = async () => {
   isProcessing.value = true;
   try {
-    await rejectTransfer(props.transferId);
+    await rejectTransfer(props.transferId, props.notificationId);
   } catch (error) {
     console.error('Failed to reject transfer:', error);
   } finally {

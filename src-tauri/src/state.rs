@@ -1,4 +1,5 @@
 use crate::persistence_progress::TransferProgressPersistence;
+use crate::transport::protocol::RiskClass;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -153,6 +154,8 @@ pub struct FileItemMeta {
     pub name: String,
     pub rel_path: String,
     pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_class: Option<RiskClass>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

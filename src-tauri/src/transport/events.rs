@@ -59,6 +59,7 @@ pub fn emit_transfer_started(
 pub fn emit_transfer_incoming(
     app: &AppHandle,
     transfer_id: &str,
+    notification_id: &str,
     sender_name: &str,
     sender_fp: &str,
     trusted: bool,
@@ -73,6 +74,7 @@ pub fn emit_transfer_incoming(
         with_optional_batch_id(
             serde_json::json!({
                 "transfer_id": transfer_id,
+                "notification_id": notification_id,
                 "sender_name": sender_name,
                 "sender_fp": sender_fp,
                 "trusted": trusted,

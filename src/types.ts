@@ -35,6 +35,8 @@ export interface TrustedPeer {
 }
 
 export type FileConflictStrategy = "rename" | "overwrite" | "skip";
+export type RiskClass = "high" | "normal";
+export type ProtocolFileType = "RegularFile" | "Directory";
 
 export interface AppConfig {
   device_name: string;
@@ -69,6 +71,19 @@ export interface FileItemMeta {
   name: string;
   rel_path: string;
   size: number;
+  risk_class?: RiskClass;
+}
+
+export interface SourceSnapshot {
+  size: number;
+  mtime_unix_ms: number;
+  head_hash: number[];
+}
+
+export interface TransferFileItem extends FileItemMeta {
+  file_type: ProtocolFileType;
+  modified: number;
+  source_snapshot?: SourceSnapshot | null;
 }
 
 export interface TransferView {
@@ -99,7 +114,7 @@ export interface TransferStartedPayload {
   batch_id?: string | null;
   peer_fp: string;
   peer_name: string;
-  items: FileItemMeta[];
+  items: TransferFileItem[];
   total_size: number;
   revision: number;
 }
@@ -107,10 +122,11 @@ export interface TransferStartedPayload {
 export interface TransferIncomingPayload {
   transfer_id: string;
   batch_id?: string | null;
+  notification_id: string;
   sender_name: string;
   sender_fp: string;
   trusted: boolean;
-  items: FileItemMeta[];
+  items: TransferFileItem[];
   total_size: number;
   revision: number;
 }

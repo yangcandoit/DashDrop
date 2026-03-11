@@ -90,16 +90,20 @@ export async function connectByAddress(address: string): Promise<ConnectByAddres
   return invokeCommand<ConnectByAddressResult>("connect_by_address", { address });
 }
 
-export async function acceptTransfer(transferId: string): Promise<void> {
-  return invokeCommand("accept_transfer", { transferId });
+export async function acceptTransfer(transferId: string, notificationId: string): Promise<void> {
+  return invokeCommand("accept_transfer", { transferId, notificationId });
 }
 
-export async function acceptAndPairTransfer(transferId: string, senderFp: string): Promise<void> {
-  return invokeCommand("accept_and_pair_transfer", { transferId, senderFp });
+export async function acceptAndPairTransfer(
+  transferId: string,
+  notificationId: string,
+  senderFp: string,
+): Promise<void> {
+  return invokeCommand("accept_and_pair_transfer", { transferId, notificationId, senderFp });
 }
 
-export async function rejectTransfer(transferId: string): Promise<void> {
-  return invokeCommand("reject_transfer", { transferId });
+export async function rejectTransfer(transferId: string, notificationId: string): Promise<void> {
+  return invokeCommand("reject_transfer", { transferId, notificationId });
 }
 
 export async function cancelTransfer(transferId: string): Promise<void> {
@@ -139,6 +143,10 @@ export async function getLocalIdentity(): Promise<LocalIdentity> {
 
 export async function getTransfers(): Promise<TransferView[]> {
   return invokeCommand<TransferView[]>("get_transfers");
+}
+
+export async function getPendingIncomingRequests(): Promise<TransferIncomingPayload[]> {
+  return invokeCommand<TransferIncomingPayload[]>("get_pending_incoming_requests");
 }
 
 export async function getTransfer(transferId: string): Promise<TransferView | null> {

@@ -21,7 +21,7 @@ use crate::transport::events::{
 use crate::transport::path_validation::validate_rel_path;
 use crate::transport::protocol::{
     read_message, write_message, AcceptPayload, DashMessage, ErrorCode, FailedFile, FileItem,
-    FileType, OfferPayload, RejectPayload, TransferOutcome,
+    FileType, OfferPayload, RejectPayload, RiskClass, TransferOutcome,
 };
 
 struct RoutedIncomingFile {
@@ -31,6 +31,24 @@ struct RoutedIncomingFile {
 
 type ReceiveTaskResult = anyhow::Result<(u32, bool, Option<crate::transport::protocol::ErrorCode>)>;
 type ReceiveTaskHandle = tokio::task::JoinHandle<ReceiveTaskResult>;
+const TRUSTED_AUTO_ACCEPT_MAX_BYTES: u64 = 500 * 1024 * 1024;
+const HIGH_RISK_SUFFIXES: &[&str] = &[
+    ".app", ".bat", ".bash", ".cmd", ".deb", ".exe", ".msi", ".pkg", ".ps1", ".rpm", ".sh", ".zsh",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualReviewReason {
+    UntrustedOrUnauthenticated,
+    AutoAcceptDisabled,
+    SizeThreshold,
+    HighRisk,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoAcceptDecision {
+    AutoAccept,
+    RequireManual(ManualReviewReason),
+}
 
 fn routed_file_id(msg: &DashMessage) -> Option<u32> {
     match msg {
@@ -116,6 +134,51 @@ pub fn should_auto_accept(trusted: bool, auto_accept_trusted_only: bool) -> bool
     trusted && auto_accept_trusted_only
 }
 
+fn infer_offer_risk_class(item: &FileItem) -> RiskClass {
+    if let Some(risk_class) = item.risk_class.clone() {
+        return risk_class;
+    }
+
+    let candidate_name = Path::new(&item.rel_path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| item.name.clone())
+        .to_ascii_lowercase();
+
+    if HIGH_RISK_SUFFIXES
+        .iter()
+        .any(|suffix| candidate_name.ends_with(suffix))
+    {
+        RiskClass::High
+    } else {
+        RiskClass::Normal
+    }
+}
+
+fn determine_auto_accept_decision(
+    trusted_and_authenticated: bool,
+    auto_accept_trusted_only: bool,
+    total_size: u64,
+    items: &[FileItem],
+) -> AutoAcceptDecision {
+    if !trusted_and_authenticated {
+        return AutoAcceptDecision::RequireManual(ManualReviewReason::UntrustedOrUnauthenticated);
+    }
+    if !auto_accept_trusted_only {
+        return AutoAcceptDecision::RequireManual(ManualReviewReason::AutoAcceptDisabled);
+    }
+    if total_size > TRUSTED_AUTO_ACCEPT_MAX_BYTES {
+        return AutoAcceptDecision::RequireManual(ManualReviewReason::SizeThreshold);
+    }
+    if items
+        .iter()
+        .any(|item| infer_offer_risk_class(item) == RiskClass::High)
+    {
+        return AutoAcceptDecision::RequireManual(ManualReviewReason::HighRisk);
+    }
+    AutoAcceptDecision::AutoAccept
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_offer(
     offer: OfferPayload,
@@ -143,6 +206,7 @@ pub async fn handle_offer(
             name: f.name.clone(),
             rel_path: f.rel_path.clone(),
             size: f.size,
+            risk_class: f.risk_class.clone(),
         })
         .collect();
 
@@ -235,9 +299,13 @@ pub async fn handle_offer(
 
     // Emit incoming transfer event to frontend
     let trusted = state.is_trusted(&peer_fp).await;
+    let notification_id = state
+        .ensure_incoming_request_notification(&transfer_id)
+        .await;
     emit_transfer_incoming(
         &app,
         &transfer_id,
+        &notification_id,
         &offer.sender_name,
         &peer_fp,
         trusted,
@@ -250,37 +318,40 @@ pub async fn handle_offer(
         .await;
 
     let auto_accept_enabled = state.config.read().await.auto_accept_trusted_only;
-    let (user_accepted, is_timeout) =
-        if should_auto_accept(trusted && peer_authenticated, auto_accept_enabled) {
-            (true, false)
-        } else {
+    let auto_accept_decision = determine_auto_accept_decision(
+        trusted && peer_authenticated,
+        auto_accept_enabled,
+        offer.total_size,
+        &offer.items,
+    );
+    let (user_accepted, is_timeout) = if auto_accept_decision == AutoAcceptDecision::AutoAccept {
+        (true, false)
+    } else {
+        state
+            .ensure_incoming_request_notification(&transfer_id)
+            .await;
+
+        // Size/risk policy downgrades to manual review; timeout keeps existing E_TIMEOUT semantics.
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        {
             state
-                .ensure_incoming_request_notification(&transfer_id)
-                .await;
+                .pending_accepts
+                .write()
+                .await
+                .insert(transfer_id.clone(), tx);
+        }
 
-            // Wait for user accept/reject
-            let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-            {
-                state
-                    .pending_accepts
-                    .write()
-                    .await
-                    .insert(transfer_id.clone(), tx);
-            }
-
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(
-                    crate::transport::protocol::USER_RESPONSE_TIMEOUT_SECS,
-                ),
-                rx,
-            )
-            .await
-            {
-                Ok(Ok(v)) => (v, false),
-                Ok(Err(_)) => (false, false),
-                Err(_) => (false, true),
-            }
-        };
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(crate::transport::protocol::USER_RESPONSE_TIMEOUT_SECS),
+            rx,
+        )
+        .await
+        {
+            Ok(Ok(v)) => (v, false),
+            Ok(Err(_)) => (false, false),
+            Err(_) => (false, true),
+        }
+    };
 
     if !user_accepted {
         // Reject
@@ -960,6 +1031,7 @@ async fn update_transfer_status(
 ) -> Option<u64> {
     let mut metrics_snapshot: Option<(TransferDirection, TransferStatus, u64)> = None;
     let mut terminal_snapshot: Option<crate::state::TransferTask> = None;
+    let mut notification_reason_code: Option<String> = None;
     let mut transfers = state.transfers.write().await;
     if let Some(t) = transfers.get_mut(&id) {
         let previous_status = t.status.clone();
@@ -1001,11 +1073,28 @@ async fn update_transfer_status(
                     metrics_snapshot =
                         Some((t.direction.clone(), t.status.clone(), t.bytes_transferred));
                 }
+                notification_reason_code = t.terminal_reason_code.clone();
             }
             _ => {}
         }
         let revision = t.revision;
         drop(transfers);
+        if matches!(
+            status,
+            TransferStatus::Completed
+                | TransferStatus::PartialCompleted
+                | TransferStatus::Failed
+                | TransferStatus::CancelledBySender
+                | TransferStatus::CancelledByReceiver
+                | TransferStatus::Rejected
+        ) {
+            state
+                .mark_incoming_request_notification_inactive(
+                    &id,
+                    notification_reason_code.as_deref(),
+                )
+                .await;
+        }
         if let Some((direction, terminal_status, bytes)) = metrics_snapshot {
             state
                 .record_transfer_terminal(&direction, &terminal_status, bytes)
@@ -1065,8 +1154,11 @@ async fn send_cancel(conn: &quinn::Connection, reason: ErrorCode) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
-    use super::{io_error_code, reject_reason, should_auto_accept};
-    use crate::transport::protocol::ErrorCode;
+    use super::{
+        determine_auto_accept_decision, infer_offer_risk_class, io_error_code, reject_reason,
+        should_auto_accept, AutoAcceptDecision, ManualReviewReason, TRUSTED_AUTO_ACCEPT_MAX_BYTES,
+    };
+    use crate::transport::protocol::{ErrorCode, FileItem, FileType, RiskClass};
 
     #[test]
     fn maps_storage_full_error_to_disk_full() {
@@ -1099,5 +1191,72 @@ mod tests {
         assert!(should_auto_accept(true, true));
         assert!(!should_auto_accept(false, true));
         assert!(!should_auto_accept(true, false));
+    }
+
+    fn file(name: &str, risk_class: Option<RiskClass>) -> FileItem {
+        FileItem {
+            file_id: 1,
+            name: name.into(),
+            rel_path: name.into(),
+            size: 1,
+            file_type: FileType::RegularFile,
+            modified: 0,
+            risk_class,
+            source_snapshot: None,
+        }
+    }
+
+    #[test]
+    fn trusted_auto_accept_requires_manual_review_above_size_threshold() {
+        let decision = determine_auto_accept_decision(
+            true,
+            true,
+            TRUSTED_AUTO_ACCEPT_MAX_BYTES + 1,
+            &[file("photo.jpg", Some(RiskClass::Normal))],
+        );
+
+        assert_eq!(
+            decision,
+            AutoAcceptDecision::RequireManual(ManualReviewReason::SizeThreshold)
+        );
+    }
+
+    #[test]
+    fn trusted_auto_accept_requires_manual_review_for_high_risk_items() {
+        let decision = determine_auto_accept_decision(
+            true,
+            true,
+            128,
+            &[file("script.sh", Some(RiskClass::High))],
+        );
+
+        assert_eq!(
+            decision,
+            AutoAcceptDecision::RequireManual(ManualReviewReason::HighRisk)
+        );
+    }
+
+    #[test]
+    fn trusted_auto_accept_accepts_normal_items_under_size_threshold() {
+        let decision = determine_auto_accept_decision(
+            true,
+            true,
+            TRUSTED_AUTO_ACCEPT_MAX_BYTES,
+            &[file("photo.jpg", Some(RiskClass::Normal))],
+        );
+
+        assert_eq!(decision, AutoAcceptDecision::AutoAccept);
+    }
+
+    #[test]
+    fn missing_risk_class_falls_back_to_filename_policy() {
+        assert_eq!(
+            infer_offer_risk_class(&file("Installer.PKG", None)),
+            RiskClass::High
+        );
+        assert_eq!(
+            infer_offer_risk_class(&file("notes.txt", None)),
+            RiskClass::Normal
+        );
     }
 }
