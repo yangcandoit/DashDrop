@@ -23,6 +23,7 @@ const REQUEST_EXPIRED_PHASE: &str = "notification_action";
 enum IncomingRequestActionState {
     Pending,
     Expired,
+    StaleNotification,
     Missing,
 }
 
@@ -151,12 +152,18 @@ impl AppCoreService {
                 self.send_files(peer_fingerprint, paths).await?;
                 Ok(LocalIpcResponse::Ack)
             }
-            LocalIpcCommand::TransferAccept { transfer_id } => {
-                self.accept_transfer(&transfer_id).await?;
+            LocalIpcCommand::TransferAccept {
+                transfer_id,
+                notification_id,
+            } => {
+                self.accept_transfer(&transfer_id, &notification_id).await?;
                 Ok(LocalIpcResponse::Ack)
             }
-            LocalIpcCommand::TransferReject { transfer_id } => {
-                self.reject_transfer(&transfer_id).await?;
+            LocalIpcCommand::TransferReject {
+                transfer_id,
+                notification_id,
+            } => {
+                self.reject_transfer(&transfer_id, &notification_id).await?;
                 Ok(LocalIpcResponse::Ack)
             }
             LocalIpcCommand::TransferCancel { transfer_id } => {
@@ -656,8 +663,12 @@ impl AppCoreService {
         Ok(())
     }
 
-    pub async fn accept_transfer(&self, transfer_id: &str) -> Result<(), String> {
-        let result = accept_pending_transfer(&self.state, transfer_id).await;
+    pub async fn accept_transfer(
+        &self,
+        transfer_id: &str,
+        notification_id: &str,
+    ) -> Result<(), String> {
+        let result = accept_pending_transfer(&self.state, transfer_id, notification_id).await;
         if matches!(result.as_ref(), Err(err) if err == REQUEST_EXPIRED_CODE) {
             if let Some(app) = &self.app {
                 emit_request_expired(app, &self.state, transfer_id).await;
@@ -666,8 +677,12 @@ impl AppCoreService {
         result
     }
 
-    pub async fn reject_transfer(&self, transfer_id: &str) -> Result<(), String> {
-        let result = reject_pending_transfer(&self.state, transfer_id).await;
+    pub async fn reject_transfer(
+        &self,
+        transfer_id: &str,
+        notification_id: &str,
+    ) -> Result<(), String> {
+        let result = reject_pending_transfer(&self.state, transfer_id, notification_id).await;
         if matches!(result.as_ref(), Err(err) if err == REQUEST_EXPIRED_CODE) {
             if let Some(app) = &self.app {
                 emit_request_expired(app, &self.state, transfer_id).await;
@@ -750,8 +765,12 @@ impl AppCoreService {
     }
 }
 
-async fn accept_pending_transfer(state: &Arc<AppState>, transfer_id: &str) -> Result<(), String> {
-    match incoming_request_action_state(state, transfer_id).await {
+async fn accept_pending_transfer(
+    state: &Arc<AppState>,
+    transfer_id: &str,
+    notification_id: &str,
+) -> Result<(), String> {
+    match incoming_request_action_state(state, transfer_id, notification_id).await {
         IncomingRequestActionState::Expired => {
             let _ = state.pending_accepts.write().await.remove(transfer_id);
             state
@@ -760,6 +779,9 @@ async fn accept_pending_transfer(state: &Arc<AppState>, transfer_id: &str) -> Re
                     Some(REQUEST_EXPIRED_CODE),
                 )
                 .await;
+            return Err(REQUEST_EXPIRED_CODE.to_string());
+        }
+        IncomingRequestActionState::StaleNotification => {
             return Err(REQUEST_EXPIRED_CODE.to_string());
         }
         IncomingRequestActionState::Missing => {
@@ -778,7 +800,7 @@ async fn accept_pending_transfer(state: &Arc<AppState>, transfer_id: &str) -> Re
         let _ = sender.send(true);
         Ok(())
     } else {
-        match incoming_request_action_state(state, transfer_id).await {
+        match incoming_request_action_state(state, transfer_id, notification_id).await {
             IncomingRequestActionState::Expired => {
                 state
                     .mark_incoming_request_notification_inactive(
@@ -788,6 +810,7 @@ async fn accept_pending_transfer(state: &Arc<AppState>, transfer_id: &str) -> Re
                     .await;
                 Err(REQUEST_EXPIRED_CODE.to_string())
             }
+            IncomingRequestActionState::StaleNotification => Err(REQUEST_EXPIRED_CODE.to_string()),
             IncomingRequestActionState::Pending | IncomingRequestActionState::Missing => Err(
                 format!("transfer {transfer_id} not found or already handled"),
             ),
@@ -795,8 +818,12 @@ async fn accept_pending_transfer(state: &Arc<AppState>, transfer_id: &str) -> Re
     }
 }
 
-async fn reject_pending_transfer(state: &Arc<AppState>, transfer_id: &str) -> Result<(), String> {
-    match incoming_request_action_state(state, transfer_id).await {
+async fn reject_pending_transfer(
+    state: &Arc<AppState>,
+    transfer_id: &str,
+    notification_id: &str,
+) -> Result<(), String> {
+    match incoming_request_action_state(state, transfer_id, notification_id).await {
         IncomingRequestActionState::Expired => {
             let _ = state.pending_accepts.write().await.remove(transfer_id);
             state
@@ -804,7 +831,10 @@ async fn reject_pending_transfer(state: &Arc<AppState>, transfer_id: &str) -> Re
                     transfer_id,
                     Some(REQUEST_EXPIRED_CODE),
                 )
-                .await;
+                    .await;
+            return Err(REQUEST_EXPIRED_CODE.to_string());
+        }
+        IncomingRequestActionState::StaleNotification => {
             return Err(REQUEST_EXPIRED_CODE.to_string());
         }
         IncomingRequestActionState::Missing => return Ok(()),
@@ -819,7 +849,7 @@ async fn reject_pending_transfer(state: &Arc<AppState>, transfer_id: &str) -> Re
         let _ = sender.send(false);
         Ok(())
     } else {
-        match incoming_request_action_state(state, transfer_id).await {
+        match incoming_request_action_state(state, transfer_id, notification_id).await {
             IncomingRequestActionState::Expired => {
                 state
                     .mark_incoming_request_notification_inactive(
@@ -829,6 +859,7 @@ async fn reject_pending_transfer(state: &Arc<AppState>, transfer_id: &str) -> Re
                     .await;
                 Err(REQUEST_EXPIRED_CODE.to_string())
             }
+            IncomingRequestActionState::StaleNotification => Err(REQUEST_EXPIRED_CODE.to_string()),
             IncomingRequestActionState::Pending | IncomingRequestActionState::Missing => Ok(()),
         }
     }
@@ -837,6 +868,7 @@ async fn reject_pending_transfer(state: &Arc<AppState>, transfer_id: &str) -> Re
 async fn incoming_request_action_state(
     state: &Arc<AppState>,
     transfer_id: &str,
+    notification_id: &str,
 ) -> IncomingRequestActionState {
     let notification = state.incoming_request_notification(transfer_id).await;
     let transfer_status = {
@@ -845,17 +877,14 @@ async fn incoming_request_action_state(
     };
 
     match transfer_status {
-        Some(crate::state::TransferStatus::PendingAccept) => {
-            if notification
-                .as_ref()
-                .map(|entry| !entry.active)
-                .unwrap_or(false)
-            {
-                IncomingRequestActionState::Expired
-            } else {
-                IncomingRequestActionState::Pending
+        Some(crate::state::TransferStatus::PendingAccept) => match notification {
+            Some(entry) if !entry.active => IncomingRequestActionState::Expired,
+            Some(entry) if entry.notification_id != notification_id => {
+                IncomingRequestActionState::StaleNotification
             }
-        }
+            Some(_) => IncomingRequestActionState::Pending,
+            None => IncomingRequestActionState::Missing,
+        },
         Some(_) => IncomingRequestActionState::Expired,
         None => {
             if notification
@@ -864,6 +893,12 @@ async fn incoming_request_action_state(
                 .unwrap_or(false)
             {
                 IncomingRequestActionState::Expired
+            } else if notification
+                .as_ref()
+                .map(|entry| entry.notification_id != notification_id)
+                .unwrap_or(false)
+            {
+                IncomingRequestActionState::StaleNotification
             } else if state.pending_accepts.read().await.contains_key(transfer_id) {
                 IncomingRequestActionState::Pending
             } else {
@@ -1163,7 +1198,7 @@ mod tests {
                 TransferStatus::PendingAccept,
             ),
         );
-        state
+        let notification_id = state
             .ensure_incoming_request_notification(&transfer_id)
             .await;
 
@@ -1171,6 +1206,7 @@ mod tests {
         let response = service
             .dispatch(LocalIpcCommand::TransferAccept {
                 transfer_id: transfer_id.clone(),
+                notification_id,
             })
             .await
             .expect("dispatch");
@@ -1197,7 +1233,7 @@ mod tests {
                 TransferStatus::PendingAccept,
             ),
         );
-        state
+        let notification_id = state
             .ensure_incoming_request_notification(&transfer_id)
             .await;
 
@@ -1205,6 +1241,7 @@ mod tests {
         let response = service
             .dispatch(LocalIpcCommand::TransferReject {
                 transfer_id: transfer_id.clone(),
+                notification_id,
             })
             .await
             .expect("dispatch");
@@ -1225,7 +1262,7 @@ mod tests {
                 TransferStatus::Rejected,
             ),
         );
-        state
+        let notification_id = state
             .ensure_incoming_request_notification(&transfer_id)
             .await;
         state
@@ -1236,6 +1273,7 @@ mod tests {
         let err = service
             .dispatch(LocalIpcCommand::TransferAccept {
                 transfer_id: transfer_id.clone(),
+                notification_id,
             })
             .await
             .expect_err("expired request should fail");

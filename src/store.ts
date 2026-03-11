@@ -21,6 +21,7 @@ import {
   getLocalIdentity,
   getDevices,
   getTransfers,
+  getPendingIncomingRequests,
   getTransfer,
 } from "./ipc";
 import { sendNotification, isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
@@ -269,6 +270,7 @@ export async function fetchSnapshot() {
       next[t.id] = t;
     }
     activeTransfers.value = next;
+    incomingQueue.value = await getPendingIncomingRequests();
   } catch (e) {
     console.error("Failed to fetch snapshot:", e);
   }

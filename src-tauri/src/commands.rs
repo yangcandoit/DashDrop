@@ -1,13 +1,30 @@
 use crate::core_service::AppCoreService;
 use crate::dto::{DeviceView, TransferView, TrustedPeerView};
 use crate::local_ipc::ConnectByAddressResult;
-use crate::state::{AppState, DeviceInfo, Platform, ReachabilityStatus};
+use crate::state::{
+    AppState, DeviceInfo, FileItemMeta, Platform, ReachabilityStatus, TransferDirection,
+    TransferStatus,
+};
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 
 type AppStateRef<'a> = State<'a, Arc<AppState>>;
 
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingIncomingRequestPayload {
+    pub transfer_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
+    pub notification_id: String,
+    pub sender_name: String,
+    pub sender_fp: String,
+    pub trusted: bool,
+    pub items: Vec<FileItemMeta>,
+    pub total_size: u64,
+    pub revision: u64,
+}
 async fn persist_runtime_state(state: &Arc<AppState>) -> Result<(), String> {
     let config = state.config.read().await.clone();
     let trusted = state.trusted_peers.read().await.clone();
@@ -20,6 +37,40 @@ async fn persist_runtime_state(state: &Arc<AppState>) -> Result<(), String> {
     Ok(())
 }
 
+async fn pending_incoming_requests(state: &Arc<AppState>) -> Vec<PendingIncomingRequestPayload> {
+    let notifications = state.incoming_request_notifications.read().await.clone();
+    let trusted = state.trusted_peers.read().await.clone();
+    let transfers = state.transfers.read().await;
+
+    let mut requests = transfers
+        .values()
+        .filter(|task| {
+            task.direction == TransferDirection::Receive
+                && task.status == TransferStatus::PendingAccept
+        })
+        .filter_map(|task| {
+            let notification = notifications.get(&task.id)?;
+            if !notification.active {
+                return None;
+            }
+
+            Some(PendingIncomingRequestPayload {
+                transfer_id: task.id.clone(),
+                batch_id: task.batch_id.clone(),
+                notification_id: notification.notification_id.clone(),
+                sender_name: task.peer_name.clone(),
+                sender_fp: task.peer_fingerprint.clone(),
+                trusted: trusted.contains_key(&task.peer_fingerprint),
+                items: task.items.clone(),
+                total_size: task.total_bytes,
+                revision: task.revision,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    requests.sort_by(|left, right| left.transfer_id.cmp(&right.transfer_id));
+    requests
+}
 // ─── Device commands ────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -32,6 +83,13 @@ pub async fn get_devices(state: AppStateRef<'_>) -> Result<Vec<DeviceView>, Stri
 pub async fn get_trusted_peers(state: AppStateRef<'_>) -> Result<Vec<TrustedPeerView>, String> {
     let trusted = state.trusted_peers.read().await;
     Ok(trusted.values().map(TrustedPeerView::from).collect())
+}
+
+#[tauri::command]
+pub async fn get_pending_incoming_requests(
+    state: AppStateRef<'_>,
+) -> Result<Vec<PendingIncomingRequestPayload>, String> {
+    Ok(pending_incoming_requests(&state).await)
 }
 
 #[tauri::command]
@@ -129,32 +187,41 @@ pub async fn connect_by_address(
 #[tauri::command]
 pub async fn accept_transfer(
     transfer_id: String,
+    notification_id: String,
     app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<(), String> {
     let service = AppCoreService::with_app(Arc::clone(&state), app);
-    service.accept_transfer(&transfer_id).await
+    service.accept_transfer(&transfer_id, &notification_id).await
 }
 
 #[tauri::command]
 pub async fn accept_and_pair_transfer(
     transfer_id: String,
+    notification_id: String,
     sender_fp: String,
     app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<(), String> {
-    accept_transfer(transfer_id, app.clone(), State::clone(&state)).await?;
+    accept_transfer(
+        transfer_id,
+        notification_id,
+        app.clone(),
+        State::clone(&state),
+    )
+    .await?;
     pair_device(sender_fp, app, State::clone(&state)).await
 }
 
 #[tauri::command]
 pub async fn reject_transfer(
     transfer_id: String,
+    notification_id: String,
     app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<(), String> {
     let service = AppCoreService::with_app(Arc::clone(&state), app);
-    service.reject_transfer(&transfer_id).await
+    service.reject_transfer(&transfer_id, &notification_id).await
 }
 
 #[tauri::command]

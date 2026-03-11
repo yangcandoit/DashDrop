@@ -137,9 +137,11 @@ pub enum LocalIpcCommand {
     },
     TransferAccept {
         transfer_id: String,
+        notification_id: String,
     },
     TransferReject {
         transfer_id: String,
+        notification_id: String,
     },
     TransferCancel {
         transfer_id: String,
@@ -226,9 +228,18 @@ impl LocalIpcCommand {
                 "peer_fingerprint": peer_fingerprint,
                 "paths": paths,
             })),
-            Self::TransferAccept { transfer_id }
-            | Self::TransferReject { transfer_id }
-            | Self::TransferCancel { transfer_id }
+            Self::TransferAccept {
+                transfer_id,
+                notification_id,
+            }
+            | Self::TransferReject {
+                transfer_id,
+                notification_id,
+            } => Some(json!({
+                "transfer_id": transfer_id,
+                "notification_id": notification_id,
+            })),
+            Self::TransferCancel { transfer_id }
             | Self::TransferRetry { transfer_id } => Some(json!({ "transfer_id": transfer_id })),
         }
     }
@@ -263,9 +274,11 @@ impl LocalIpcCommand {
             }),
             "transfer/accept" => Ok(Self::TransferAccept {
                 transfer_id: required_string(payload, "transfer_id")?,
+                notification_id: required_string(payload, "notification_id")?,
             }),
             "transfer/reject" => Ok(Self::TransferReject {
                 transfer_id: required_string(payload, "transfer_id")?,
+                notification_id: required_string(payload, "notification_id")?,
             }),
             "transfer/cancel" => Ok(Self::TransferCancel {
                 transfer_id: required_string(payload, "transfer_id")?,
