@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue';
-import { initAppStore, destroyAppStore, systemError } from './store';
+import { ref, onMounted, onUnmounted, watch } from 'vue';
+import { initAppStore, destroyAppStore, systemError, externalSharePaths } from './store';
 import NearbyView from './views/NearbyView.vue';
 import TransfersView from './views/TransfersView.vue';
 import HistoryView from './views/HistoryView.vue';
@@ -21,8 +21,14 @@ const navItems = [
   { id: 'Settings', label: 'Settings' },
 ];
 
-onMounted(() => {
-  initAppStore();
+onMounted(async () => {
+  try {
+    await initAppStore();
+  } catch (e) {
+    console.error('Failed to initialize app store', e);
+    systemError.value =
+      'Failed to initialize DashDrop. Next: Relaunch the app. If this keeps happening, open Settings diagnostics after restart and check backend/runtime status.';
+  }
   if (typeof window !== 'undefined') {
     if ((window as Window & { __DASHDROP_TEST_MOCK__?: unknown }).__DASHDROP_TEST_MOCK__) {
       showOnboarding.value = false;
@@ -37,6 +43,16 @@ onMounted(() => {
 onUnmounted(() => {
   destroyAppStore();
 });
+
+watch(
+  externalSharePaths,
+  (paths) => {
+    if (paths.length > 0) {
+      currentView.value = 'Nearby';
+    }
+  },
+  { deep: true },
+);
 
 const dismissOnboarding = () => {
   showOnboarding.value = false;
@@ -88,7 +104,7 @@ const dismissSystemError = () => {
     <div v-if="showOnboarding" class="onboarding-backdrop">
       <section class="onboarding-card">
         <h3>Before You Start</h3>
-        <p class="text-muted">Verify fingerprint before sending to a new device.</p>
+        <p class="text-muted">Verify the shared short code matches on both devices before trusting a new peer.</p>
         <button class="btn btn-primary" @click="dismissOnboarding">Continue</button>
       </section>
     </div>
@@ -103,10 +119,12 @@ const dismissSystemError = () => {
   width: 100vw;
   height: 100vh;
   box-sizing: border-box;
+  overflow: hidden;
 }
 
 .app-rail {
   width: 200px;
+  flex-shrink: 0;
   border-radius: 16px;
   background: var(--surface);
   border: 1px solid var(--border-subtle);
@@ -134,6 +152,10 @@ const dismissSystemError = () => {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+.rail-nav li {
+  min-width: 0;
 }
 
 .rail-btn {
@@ -202,15 +224,68 @@ const dismissSystemError = () => {
   .app-shell {
     padding: 8px;
     gap: 8px;
+    flex-direction: column;
   }
 
   .app-rail {
-    width: 170px;
+    width: 100%;
     padding: 10px;
+    gap: 10px;
   }
 
   .brand-title {
     font-size: 1.2rem;
+  }
+
+  .brand-block {
+    margin-bottom: 0;
+    padding-bottom: 0;
+    border-bottom: 0;
+  }
+
+  .rail-nav {
+    flex-direction: row;
+    gap: 8px;
+    overflow-x: auto;
+    padding-bottom: 2px;
+  }
+
+  .rail-btn {
+    white-space: nowrap;
+  }
+}
+
+@media (max-width: 640px) {
+  .app-shell {
+    padding: 0;
+    gap: 0;
+  }
+
+  .app-rail,
+  .app-workspace {
+    border-radius: 0;
+    border-left: 0;
+    border-right: 0;
+  }
+
+  .app-rail {
+    border-top: 0;
+    padding: 10px 12px 8px;
+  }
+
+  .app-workspace {
+    border-bottom: 0;
+  }
+
+  .rail-nav {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    overflow-x: visible;
+  }
+
+  .rail-btn {
+    text-align: center;
+    padding: 9px 10px;
   }
 }
 </style>

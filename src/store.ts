@@ -1,5 +1,11 @@
 import { computed, ref } from "vue";
-import type { TransferView, DeviceView, TransferIncomingPayload, LocalIdentity } from "./types";
+import type {
+  TransferView,
+  DeviceView,
+  TransferIncomingPayload,
+  LocalIdentity,
+  ExternalSharePayload,
+} from "./types";
 import {
   onDeviceDiscovered,
   onDeviceUpdated,
@@ -18,6 +24,7 @@ import {
   onSystemError,
   onIdentityMismatch,
   onFingerprintChanged,
+  onExternalShareReceived,
   getLocalIdentity,
   getDevices,
   getTransfers,
@@ -31,6 +38,8 @@ export const devices = ref<DeviceView[]>([]);
 export const activeTransfers = ref<Record<string, TransferView>>({});
 export const incomingQueue = ref<TransferIncomingPayload[]>([]);
 export const systemError = ref<string | null>(null);
+export const externalSharePaths = ref<string[]>([]);
+export const externalShareSource = ref<string | null>(null);
 export const sendingPeerFingerprints = computed(() => {
   const sending = new Set<string>();
   for (const task of Object.values(activeTransfers.value)) {
@@ -51,6 +60,29 @@ const handledExpiredRequestErrors = new Set<string>();
 function actionableMessage(summary: string, nextSteps: string[]): string {
   if (nextSteps.length === 0) return summary;
   return `${summary} Next: ${nextSteps.join(" ")}`;
+}
+
+function queueExternalShare(payload: ExternalSharePayload) {
+  const paths = Array.isArray(payload.paths)
+    ? payload.paths.filter((value): value is string => typeof value === "string" && value.length > 0)
+    : [];
+  if (paths.length === 0) {
+    return;
+  }
+  externalSharePaths.value = paths;
+  externalShareSource.value = payload.source ?? null;
+  setSystemError(
+    actionableMessage(
+      `Received ${paths.length} shared item${paths.length > 1 ? "s" : ""}.`,
+      ["Open Nearby and choose a device to send them."],
+    ),
+    12_000,
+  );
+}
+
+export function clearExternalShare() {
+  externalSharePaths.value = [];
+  externalShareSource.value = null;
 }
 
 function transferErrorNextSteps(reasonCode: string): string[] {
@@ -152,12 +184,13 @@ async function notifyUser(title: string, body: string) {
 }
 
 function removeIncoming(transferId: string) {
-  incomingQueue.value = incomingQueue.value.filter((entry) => entry.transfer_id !== transferId);
+  const queue = Array.isArray(incomingQueue.value) ? incomingQueue.value : [];
+  incomingQueue.value = queue.filter((entry) => entry.transfer_id !== transferId);
 }
 
 function upsertIncoming(payload: TransferIncomingPayload) {
   removeIncoming(payload.transfer_id);
-  incomingQueue.value.push(payload);
+  incomingQueue.value = [...incomingQueue.value, payload];
 }
 
 function applyBatchId(task: TransferView, batchId?: string | null) {
@@ -273,6 +306,12 @@ export async function fetchSnapshot() {
     incomingQueue.value = await getPendingIncomingRequests();
   } catch (e) {
     console.error("Failed to fetch snapshot:", e);
+    setSystemError(
+      actionableMessage(
+        "Failed to refresh transfer state.",
+        ["Relaunch the app or open Settings diagnostics if the issue persists."],
+      ),
+    );
   }
 }
 
@@ -533,6 +572,12 @@ export async function initAppStore() {
       );
     }),
   );
+
+  unlistens.push(
+    await onExternalShareReceived((payload) => {
+      queueExternalShare(payload);
+    }),
+  );
 }
 
 export function destroyAppStore() {
@@ -545,4 +590,11 @@ export function destroyAppStore() {
     clearSystemErrorTimer = null;
   }
   handledExpiredRequestErrors.clear();
+  myIdentity.value = null;
+  devices.value = [];
+  activeTransfers.value = {};
+  incomingQueue.value = [];
+  systemError.value = null;
+  externalSharePaths.value = [];
+  externalShareSource.value = null;
 }

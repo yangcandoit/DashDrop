@@ -3,21 +3,23 @@
 > **极速、加密、无需配置的跨平台近场文件传输工具**
 > Blazing-fast, encrypted, zero-config local file sharing — for macOS, Windows, and Linux.
 
-Current project status (single source of truth): [STATUS.md](./STATUS.md)
+Canonical detailed project status: [STATUS.md](./STATUS.md)
 Seamless experience target design (AirDrop-like): [docs/AIRDROP_SEAMLESS_EXPERIENCE_DESIGN.md](./docs/AIRDROP_SEAMLESS_EXPERIENCE_DESIGN.md)
+Network troubleshooting: [docs/NETWORK_TROUBLESHOOTING.md](./docs/NETWORK_TROUBLESHOOTING.md)
 Architecture note: current releases are single-process Tauri; daemon + local IPC is a target-state design, not shipped yet.
 
 ---
 
-## 📌 当前状态（截至 2026-03-10）
+## 📌 当前状态摘要（截至 2026-03-11）
 
 - 构建与测试：
-  - `cargo check` 已接入 CI 并通过
+  - `cargo check` 已接入 CI；当前工作区于 2026-03-11 本地复核通过
   - `cargo clippy --all-targets --all-features -- -D warnings` 已接入 CI
-  - `cargo test` 已接入 CI 并通过
-  - `npm run build` 已接入 CI 并通过
-  - `npm run test:e2e`（Playwright UI E2E）已接入 CI 并通过
-  - `npm run test:e2e:contract`（契约脚本级 E2E）已接入 CI 并通过
+  - `cargo test` 已接入 CI；当前工作区于 2026-03-11 本地复核通过
+  - `npm run build` 已接入 CI；当前工作区于 2026-03-11 本地复核通过
+  - `npm run test:e2e`（Playwright UI E2E）当前工作区于 2026-03-11 本地复核通过
+  - `npm run test:e2e:contract`（契约脚本级 E2E）已接入 CI
+  - `npm run test:tauri:smoke` 真实运行时启动烟测已于 2026-03-11 本地复核通过（覆盖 `tauri dev` 拉起链路，不再在启动阶段因 local IPC listener 绑定而 panic）
   - 已新增安全扫描：`security-audit.yml`（cargo audit + npm audit）+ GitHub Code Scanning default setup
   - 已新增 `dependabot.yml`（Actions/npm/cargo 依赖周更）
   - 已新增安装包发布流水线增强：标准化产物命名、烟测、可选签名/公证钩子、发布校验和
@@ -40,6 +42,15 @@ Architecture note: current releases are single-process Tauri; daemon + local IPC
   - PartialCompleted 场景已支持“失败文件级重试”（不是整任务重发）
   - Trusted Devices 已支持配对时间、最近使用时间与别名编辑
   - Settings 已支持冲突策略（重命名/覆盖/跳过）与并发流配置
+  - 前端状态读取已补齐契约兜底，Transfers/History 对空载荷更稳健
+  - Transfers / History / Security Events 已补关键失败路径的用户可见错误反馈
+  - 后端配置入口已拒绝空设备名，trust/config 写路径已统一委托到核心服务层
+  - 本地 IPC Unix socket 启动链路已改为先用 `std` 绑定再进入 Tokio 监听，Tauri `setup` 阶段不再要求预先存在 reactor
+  - Windows 本地 IPC 已补 named pipe server/client 基线实现，和 Unix socket 共用同一套 framed wire 协议
+  - 主壳层已支持窄窗口导航重排，避免固定侧栏压缩内容区
+  - Settings、Nearby、Transfers 与接收确认弹窗已补短验证码；未信任发送/接收/按地址确认现在要求显式比对双方一致的 shared verification code
+  - 启动参数与本地 IPC 现在都能把外部分享路径排队到 Nearby，直接选设备发送，作为 system share / daemon 方向的基础能力
+  - 第二实例启动时会优先通过本地 IPC 把激活/分享路径交给已运行实例，作为 single-instance handoff 基础
   - 指标已持久化聚合（平均耗时/失败分布/终态计数/收发字节）
   - 持久化已收口为 SQLite（`state.json` 仅用于一次性迁移读取）
 - 安全闭环：
@@ -52,7 +63,8 @@ Architecture note: current releases are single-process Tauri; daemon + local IPC
   - 已提供首启 Onboarding（本地持久化关闭）
 - 仍在进行：
   - 双端 QUIC 多机编排压测扩展（当前已有跨模块合同测试）
-  - 真实 Tauri runtime 级 E2E 编排（当前 Playwright 为 mock IPC 驱动）
+  - 原生窗口级 Tauri runtime E2E 编排（当前已补 local IPC 启动回归测试与 `tauri dev` 启动烟测，UI 自动化仍以 mock IPC 为主）
+  - 更强的首次信任方案（二维码/短码交换流程）；当前已提供双方一致的 shared verification code，但仍属于 TOFU + 人工带外核对
 
 ---
 
@@ -256,6 +268,8 @@ dashdrop/
 ```bash
 npm install
 npm run tauri dev
+# 真实运行时启动烟测
+npm run test:tauri:smoke
 ```
 
 ### 构建生产包

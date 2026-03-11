@@ -14,10 +14,16 @@
 > - 已实现：sender accept 超时、60s 用户响应时限、目录 complete/ack 生命周期、fingerprint 级 offer 限流、Probe `0xD0` close code。
 > - 已实现：配置驱动的文件冲突策略（overwrite/rename/skip）与并发流上限（`max_parallel_streams`）。
 > - 已实现：前端任务管理增强（批量取消、发送任务重试）、配对别名与最近使用时间展示。
+> - 已实现：前端状态读接口兜底、动作失败可见化与窄窗口导航重排，避免 UI 因空载荷或小窗口布局退化。
+> - 已实现：设置页/发送确认/接收确认/按地址连接等 trust 入口统一显示 shared verification code，并在未信任流程中要求显式确认。
 > - 已实现：partial 终态失败项按文件级重试（基于 `failed_file_ids` 与源路径映射）。
 > - 已实现：配置/信任持久化收口 SQLite（legacy `state.json` 仅迁移读取）。
 > - 已实现：固定 QUIC 端口优先（`53319/udp`）+ fallback 随机端口，运行时暴露 `listener_port_mode` 与 `firewall_rule_state`。
 > - 已实现：通知过期撤回与 `E_REQUEST_EXPIRED` 闭环、恢复前 `source_snapshot` 一致性校验、可选 `batch_id` 分组字段，以及电源状态驱动的 beacon 节流诊断。
+> - 已实现：本地 IPC Unix listener 启动链路不再依赖预先存在的 Tokio reactor；真实 `npm run test:tauri:smoke` 启动烟测已通过。
+> - 已实现：Windows 本地 IPC named pipe baseline（server/client）以对齐 Unix socket 本地控制平面。
+> - 已实现：外部文件分享路径可经启动参数或本地 IPC 排队到前端 Nearby 视图，作为 system share / single-instance 接管的基础。
+> - 已实现：第二实例启动时优先通过 `app/activate` 本地 IPC 激活已运行实例并转交分享路径，避免并行前台会话争用。
 > - 未完成：真实双端 QUIC 多机编排压测（当前仍以合同测试+UI mock E2E 为主）。
 > - 说明：本文中若出现与代码细节不一致的结构定义，以 `src-tauri/src/*.rs` 与 `src/*.ts` 的当前实现为准。
 

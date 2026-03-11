@@ -12,12 +12,15 @@
   - [~] 多文件并发传输（100 次以上压力回归）*（已补 120 轮语义压力回归；真实双端吞吐压测未完成）*
   - [ ] **跨平台大文件双向互传** (Mac <-> Win, Linux <-> Win 等混合平台，含 5GB 以上文件)
   - [x] Cancel 语义（已确认保留、未确认删除）*（契约/单测覆盖）*
+  - [x] 本地 IPC 服务在无预先 Tokio runtime 的 GUI 启动阶段可正常拉起 *（回归测试 + 2026-03-11 `npm run test:tauri:smoke`）*
 - [~] 补齐前端 E2E（Playwright）最小闭环（**已完成核心流程，当前为 mock IPC 的真实 UI 自动化**）：
   - [x] incoming -> accept -> history 可见
   - [x] incoming -> reject -> history 可见
+  - [x] expired incoming action -> `E_REQUEST_EXPIRED` 可见且不残留活动任务
   - [x] connect by address 输入/确认流程
   - [x] 终态触发 History 自动刷新
   - [x] `identity_mismatch` 告警展示
+  - [x] 批量取消与发送任务重试入口
 
 ### 2. 安全底线
 - [~] 验证三平台密钥存储行为（**部分实现**）：
@@ -28,6 +31,7 @@
 - [x] 建立安全事件审计最小集（`identity_mismatch` / `handshake_failed` 已落地 SQLite）。
 - [x] `fingerprint_changed` 告警链路与审计落地（事件 emit + UI 消费 + SQLite 记录）。
 - [x] 未信任设备发送前强制指纹确认（Nearby 首次发送确认弹窗，可选立即配对）。
+- [x] 首次信任 UI 提供双方一致的 shared verification code，并要求未信任发送/接收/按地址确认前显式核对。
 
 ### 3. 传输一致性
 - [x] 校验所有失败事件 payload 统一为：`transfer_id + reason + phase`（已通过统一 emit 函数收口）。
@@ -87,7 +91,11 @@
 - [x] 首次使用引导（权限、配对、安全说明）（**已实现首启 Onboarding，可本地持久化关闭**）。
 - [x] 设置页增强（网络状态、服务状态、重注册状态反馈）（**已显示端口、mDNS 注册状态、发现/信任设备数量与运行指标**）。
 - [x] 错误提示可操作化（给出下一步建议）（**已统一为 “问题 + Next steps” 模板并覆盖传输/安全/系统关键告警路径**）。
-- [ ] 完善关于 Windows 防火墙（UDP 5353、UDP 53318、固定 `53319/udp` + fallback 随机端口）和 Linux Avahi/ufw 冲突的官方文档及弹窗引导。
+- [x] Transfers / History / Security Events 关键失败路径用户可见（**已补错误横幅、弹窗或重试入口，避免仅 console log**）。
+- [x] 完善关于 Windows 防火墙（UDP 5353、UDP 53318、固定 `53319/udp` + fallback 随机端口）和 Linux Avahi/ufw 冲突的官方文档引导（见 `docs/NETWORK_TROUBLESHOOTING.md`）；更细的弹窗引导可继续增强。
+- [x] Windows 本地 IPC baseline（named pipe server/client）已实现；更细的认证/权限策略仍见 P1 规范项。
+- [x] 外部文件分享/打开入口基础链路已实现（启动参数 + 本地 IPC -> Nearby 队列）；完整系统级 share integration 仍可继续增强。
+- [x] second-instance handoff 基础已实现（`app/activate` 经本地 IPC 把激活/分享路径转交给已运行实例）；完整 daemon/system share 仍未完成。
 
 ### 2. 架构与长期维护
 - [x] 持久化方案统一评估（JSON vs tauri store vs sqlite）并固化（**已收口为 SQLite 作为唯一运行时持久化，`state.json` 仅保留一次性迁移读取**）。

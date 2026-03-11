@@ -8,7 +8,7 @@ use crate::state::{
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
 type AppStateRef<'a> = State<'a, Arc<AppState>>;
 
@@ -25,18 +25,6 @@ pub struct PendingIncomingRequestPayload {
     pub total_size: u64,
     pub revision: u64,
 }
-async fn persist_runtime_state(state: &Arc<AppState>) -> Result<(), String> {
-    let config = state.config.read().await.clone();
-    let trusted = state.trusted_peers.read().await.clone();
-    let guard = state
-        .db
-        .lock()
-        .map_err(|_| "DB lock poisoned".to_string())?;
-    crate::db::save_app_config(&guard, &config).map_err(|e| e.to_string())?;
-    crate::db::replace_trusted_peers(&guard, &trusted).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 async fn pending_incoming_requests(state: &Arc<AppState>) -> Vec<PendingIncomingRequestPayload> {
     let notifications = state.incoming_request_notifications.read().await.clone();
     let trusted = state.trusted_peers.read().await.clone();
@@ -94,20 +82,8 @@ pub async fn get_pending_incoming_requests(
 
 #[tauri::command]
 pub async fn pair_device(fp: String, app: AppHandle, state: AppStateRef<'_>) -> Result<(), String> {
-    let name = {
-        let mut devices = state.devices.write().await;
-        if let Some(device) = devices.get_mut(&fp) {
-            device.trusted = true;
-            let payload = DeviceView::from(&*device);
-            app.emit("device_updated", &payload).ok();
-            device.name.clone()
-        } else {
-            "Unknown".into()
-        }
-    };
-    state.add_trust(fp, name).await;
-    persist_runtime_state(&state).await?;
-    Ok(())
+    let service = AppCoreService::with_app(Arc::clone(&state), app);
+    service.pair_device(&fp).await
 }
 
 #[tauri::command]
@@ -116,20 +92,8 @@ pub async fn unpair_device(
     app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<(), String> {
-    let removed = state.trusted_peers.write().await.remove(&fp);
-    if removed.is_none() {
-        return Err(format!("trusted device {fp} not found"));
-    }
-    {
-        let mut devices = state.devices.write().await;
-        if let Some(device) = devices.get_mut(&fp) {
-            device.trusted = false;
-            let payload = DeviceView::from(&*device);
-            app.emit("device_updated", &payload).ok();
-        }
-    }
-    persist_runtime_state(&state).await?;
-    Ok(())
+    let service = AppCoreService::with_app(Arc::clone(&state), app);
+    service.unpair_device(&fp).await
 }
 
 #[tauri::command]
@@ -139,26 +103,8 @@ pub async fn set_trusted_alias(
     _app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<(), String> {
-    let normalized = alias.and_then(|a| {
-        let trimmed = a.trim().to_string();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    });
-    let changed = {
-        let mut trusted = state.trusted_peers.write().await;
-        let Some(peer) = trusted.get_mut(&fp) else {
-            return Err(format!("trusted device {fp} not found"));
-        };
-        peer.alias = normalized;
-        true
-    };
-    if changed {
-        persist_runtime_state(&state).await?;
-    }
-    Ok(())
+    let service = AppCoreService::with_app(Arc::clone(&state), _app);
+    service.set_trusted_alias(&fp, alias).await
 }
 
 // ─── Transfer commands ───────────────────────────────────────────────────────
@@ -427,44 +373,8 @@ pub async fn set_app_config(
     app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<(), String> {
-    if config.max_parallel_streams == 0 || config.max_parallel_streams > 32 {
-        return Err("max_parallel_streams must be between 1 and 32".to_string());
-    }
-    let attempted_device_name = config.device_name.clone();
-    let old_name = state.config.read().await.device_name.clone();
-    if let Some(download_dir) = &config.download_dir {
-        let dir = std::path::PathBuf::from(download_dir);
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("download directory is not usable: {e}"))?;
-        let probe = dir.join(".dashdrop-write-test");
-        std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&probe)
-            .map_err(|e| format!("download directory is not writable: {e}"))?;
-        let _ = std::fs::remove_file(probe);
-    }
-
-    let previous_config = state.config.read().await.clone();
-    *state.config.write().await = config;
-    if old_name != state.config.read().await.device_name {
-        if let Err(e) = crate::discovery::service::reregister_service(Arc::clone(&state)).await {
-            *state.config.write().await = previous_config;
-            app.emit("system_error", serde_json::json!({
-                "code": "MDNS_REREGISTER_FAILED",
-                "subsystem": "mdns",
-                "message": format!("Device name update rolled back because mDNS refresh failed: {e:#}"),
-                "attempted_device_name": attempted_device_name,
-                "rollback_device_name": state.config.read().await.device_name.clone(),
-            })).ok();
-            return Err(format!(
-                "device name update rolled back because mDNS refresh failed: {e:#}"
-            ));
-        }
-    }
-    persist_runtime_state(&state).await?;
-    Ok(())
+    let service = AppCoreService::with_app(Arc::clone(&state), app);
+    service.set_app_config(config).await
 }
 
 // ─── App info commands ───────────────────────────────────────────────────────

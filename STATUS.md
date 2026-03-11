@@ -8,7 +8,7 @@ Project is stable on the current single-process Tauri architecture, with discove
 
 Estimated completion:
 - Core product hardening (state contract + reliability): 95%+
-- Release readiness (current gate scope): complete
+- Release readiness (current gate scope): near-complete
 - Release readiness (strict protocol compliance + long-run behavior): mostly complete
 - AirDrop-like target architecture (daemon/system share/P2P-SoftAP): not started as a shipped feature line
 
@@ -47,6 +47,12 @@ Estimated completion:
 - Probe close code now uses `0xD0` to match architecture/protocol docs.
 - `set_app_config` mDNS rename re-register failure now emits user-visible `system_error` and rolls back config.
 - `set_app_config` rollback error now carries structured `code/context` payload for precise frontend rendering.
+- Trust/config write commands are now funneled through `AppCoreService`, reducing duplicate mutation paths between Tauri commands and local IPC dispatch.
+- `device_name` is now hard-rejected when blank at the backend boundary (not only in frontend form validation).
+- Local IPC Unix socket startup now binds through `std::os::unix::net::UnixListener` before handing off to Tokio, so Tauri `setup` no longer panics when no Tokio reactor is already running.
+- Windows local IPC now has named pipe server/client baseline implementation, using the same framed wire protocol as Unix local IPC.
+- Local IPC now also supports queueing external share paths into the running app (`app/queue_external_share`), which the frontend consumes as a Nearby send queue.
+- Startup now attempts single-instance handoff via local IPC (`app/activate`): a second launch forwards activation/share paths to the running instance instead of standing up a parallel app session.
 - Discovery updates no longer use production `unwrap()` on system time conversion.
 - Startup config directory resolution is now strict and fails fast if path resolution is unavailable.
 - macOS bundle now declares Local Network / Bonjour usage (`Info.plist`) for reliable discovery permission prompts.
@@ -65,6 +71,7 @@ Estimated completion:
 
 ### Frontend (Vue/TS)
 - Store event projection refactored for strict incoming/active-transfer handoff.
+- IPC read-side array responses now use defensive fallback normalization to avoid null/undefined payload crashes.
 - `transfer_accepted` processing now:
   1. removes from `incomingQueue`
   2. moves/updates active transfer to `Transferring`
@@ -74,7 +81,11 @@ Estimated completion:
 - Transfers page supports connect-by-address entry (with fingerprint confirmation prompt).
 - Connect-by-address now supports confirm -> optional remember/pair flow (`pair_device`).
 - Nearby first-send to untrusted device now requires explicit fingerprint confirmation before transfer.
+- Nearby first-send confirmation no longer dismisses on send failure; users keep context and can retry after the error.
+- Settings / Nearby / Transfers / incoming receive prompt now expose short verification codes, and untrusted send/receive/connect flows require explicit confirmation against a shared code visible on both devices.
+- Nearby now consumes queued external share/file-open paths and lets the user pick a target device directly instead of re-selecting files manually.
 - Transfers page supports active-task batch cancel and outgoing transfer retry.
+- Transfers, History, and Security Events now surface user-visible action/load failures instead of relying on console logs only.
 - PartialCompleted transfer retry now performs failed-file-only retry (uses stored `failed_file_ids` + source map).
 - Incoming request total size is now human-formatted.
 - History now auto-refreshes on transfer terminal events.
@@ -87,6 +98,7 @@ Estimated completion:
 - `identity_mismatch` warning now auto-clears; `fingerprint_changed` warning is now consumed and shown.
 - mDNS startup failures (`MDNS_REGISTER_FAILED` / `MDNS_BROWSER_FAILED`) are now surfaced as persistent actionable errors.
 - Added first-use onboarding modal (local persisted dismissal, test mode auto-skip).
+- App shell now adapts better to narrow windows with top-nav and compact-grid navigation breakpoints instead of a permanently narrow side rail.
 
 ### CI and tests
 - CI workflow exists and runs:
@@ -110,9 +122,12 @@ Estimated completion:
 - Added release/upgrade documentation templates:
   - `docs/RELEASE_NOTES_TEMPLATE.md`
   - `docs/UPGRADE_MIGRATION_TEMPLATE.md`
+- Added platform network troubleshooting guide:
+  - `docs/NETWORK_TROUBLESHOOTING.md`
 - Rust unit/contract tests currently passing.
 - Frontend script-level E2E contract test exists and passing.
 - Frontend Playwright UI E2E exists and passing (`tests/playwright/transfer-ui.spec.ts`).
+- Added Rust regression test covering local IPC server startup outside a Tokio runtime.
 - Added Playwright case for `identity_mismatch` warning visibility.
 - Added Playwright case for History filter behavior.
 - Additional unit tests added for:
@@ -147,21 +162,23 @@ Estimated completion:
 ## In progress / not fully complete
 
 ### Remaining release tails
-- Playwright E2E currently uses injected mock IPC backend (real UI + mocked backend contract), not a full Tauri runtime orchestration test.
+- Full native-window Tauri runtime E2E orchestration is still pending; current non-mock coverage now includes a local IPC startup regression test plus a verified `npm run test:tauri:smoke` startup smoke on 2026-03-11.
 - Backend新增 `src-tauri/tests/phase_d_contract.rs` 为跨模块合同集成测试；真实多进程/多主机 QUIC 编排压测仍可继续扩展。
 - Code-signing / notarization currently remains optional hooks; production certificates and notarization credentials still need to be configured in repository secrets.
-- First-contact trust model remains TOFU; UI now enforces fingerprint confirmation for untrusted targets, but QR/out-of-band cryptographic verification is still planned for v0.2.
+- First-contact trust model remains TOFU; UI now exposes both full fingerprint and a shared short verification code for out-of-band comparison, but QR / richer out-of-band cryptographic verification is still planned for v0.2.
 - Linux GUI stack still includes GTK3/WebKit2GTK transitively via Tauri runtime; long-term mitigation is upgrading runtime dependency chain.
-- AirDrop-like implementation phases are not started: daemon IPC, system share entry, BLE assist, P2P/SoftAP scheduler, and 1:N fan-out reader/writer split remain design-only.
+- AirDrop-like implementation phases are only partially started: local IPC groundwork, single-instance handoff, and external share intake now exist in the single-process baseline, but daemon split, system-native share integrations, BLE assist, P2P/SoftAP scheduler, and 1:N fan-out reader/writer split remain incomplete.
 
 ## Validation snapshot
 
 Latest local validations (2026-03-11):
 - `cargo check` passed
 - `cargo test` passed
+- `cargo clippy --all-targets --all-features -- -D warnings` passed
 - `npm run build` passed
 - `npm run test:e2e` passed
 - `npm run test:e2e:contract` passed
+- `npm run test:tauri:smoke` passed
 
 ## Notes
 

@@ -19,6 +19,7 @@ import type {
   IdentityMismatchPayload,
   FingerprintChangedPayload,
   SystemErrorPayload,
+  ExternalSharePayload,
   SecurityEvent,
   AppConfig,
   RuntimeStatus,
@@ -45,6 +46,10 @@ function getTestMock(): DashdropTestMock | undefined {
   return window.__DASHDROP_TEST_MOCK__;
 }
 
+function asArray<T>(value: unknown): T[] {
+  return Array.isArray(value) ? (value as T[]) : [];
+}
+
 async function invokeCommand<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   const mock = getTestMock();
   if (mock?.invoke) {
@@ -63,11 +68,11 @@ async function listenEvent<T>(event: string, callback: (payload: T) => void): Pr
 }
 
 export async function getDevices(): Promise<DeviceView[]> {
-  return invokeCommand<DeviceView[]>("get_devices");
+  return asArray<DeviceView>(await invokeCommand<unknown>("get_devices"));
 }
 
 export async function getTrustedPeers(): Promise<TrustedPeer[]> {
-  return invokeCommand<TrustedPeer[]>("get_trusted_peers");
+  return asArray<TrustedPeer>(await invokeCommand<unknown>("get_trusted_peers"));
 }
 
 export async function pairDevice(fp: string): Promise<void> {
@@ -142,11 +147,13 @@ export async function getLocalIdentity(): Promise<LocalIdentity> {
 }
 
 export async function getTransfers(): Promise<TransferView[]> {
-  return invokeCommand<TransferView[]>("get_transfers");
+  return asArray<TransferView>(await invokeCommand<unknown>("get_transfers"));
 }
 
 export async function getPendingIncomingRequests(): Promise<TransferIncomingPayload[]> {
-  return invokeCommand<TransferIncomingPayload[]>("get_pending_incoming_requests");
+  return asArray<TransferIncomingPayload>(
+    await invokeCommand<unknown>("get_pending_incoming_requests"),
+  );
 }
 
 export async function getTransfer(transferId: string): Promise<TransferView | null> {
@@ -154,7 +161,9 @@ export async function getTransfer(transferId: string): Promise<TransferView | nu
 }
 
 export async function getTransferHistory(limit = 50, offset = 0): Promise<TransferView[]> {
-  return invokeCommand<TransferView[]>("get_transfer_history", { limit, offset });
+  return asArray<TransferView>(
+    await invokeCommand<unknown>("get_transfer_history", { limit, offset }),
+  );
 }
 
 export async function getSecurityPosture(): Promise<{ secure_store_available: boolean }> {
@@ -162,7 +171,9 @@ export async function getSecurityPosture(): Promise<{ secure_store_available: bo
 }
 
 export async function getSecurityEvents(limit = 50, offset = 0): Promise<SecurityEvent[]> {
-  return invokeCommand("get_security_events", { limit, offset });
+  return asArray<SecurityEvent>(
+    await invokeCommand<unknown>("get_security_events", { limit, offset }),
+  );
 }
 
 export async function getRuntimeStatus(): Promise<RuntimeStatus> {
@@ -259,4 +270,8 @@ export function onIdentityMismatch(callback: (payload: IdentityMismatchPayload) 
 
 export function onFingerprintChanged(callback: (payload: FingerprintChangedPayload) => void) {
   return listenEvent("fingerprint_changed", callback);
+}
+
+export function onExternalShareReceived(callback: (payload: ExternalSharePayload) => void) {
+  return listenEvent("external_share_received", callback);
 }

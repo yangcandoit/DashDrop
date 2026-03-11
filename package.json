@@ -8,6 +8,7 @@
     "build": "vue-tsc --noEmit && vite build",
     "test:e2e:contract": "node tests/e2e_transfer_flow.mjs",
     "test:e2e": "playwright test",
+    "test:tauri:smoke": "node tests/tauri_runtime_smoke.mjs",
     "test": "npm run test:e2e",
     "preview": "vite preview",
     "tauri": "tauri"

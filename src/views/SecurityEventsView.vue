@@ -7,13 +7,16 @@ const emit = defineEmits(['openSettings']);
 
 const loading = ref(true);
 const events = ref<SecurityEvent[]>([]);
+const loadError = ref<string | null>(null);
 
 const load = async () => {
   loading.value = true;
   try {
+    loadError.value = null;
     events.value = await getSecurityEvents(100, 0);
   } catch (e) {
     console.error('Failed to load security events', e);
+    loadError.value = 'Unable to load security events right now.';
   } finally {
     loading.value = false;
   }
@@ -37,6 +40,10 @@ const formatTime = (unix: number) => new Date(unix * 1000).toLocaleString();
       </div>
     </header>
     <main class="content">
+      <div v-if="loadError" class="error-banner">
+        <span>{{ loadError }}</span>
+        <button class="btn btn-secondary" @click="load">Retry</button>
+      </div>
       <div v-if="loading" class="empty-state">
         <p class="text-muted">Loading security events...</p>
       </div>
@@ -93,6 +100,19 @@ const formatTime = (unix: number) => new Date(unix * 1000).toLocaleString();
   overflow-y: auto;
 }
 
+.error-banner {
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(198, 40, 40, 0.25);
+  background: rgba(198, 40, 40, 0.06);
+  color: #8f2d2a;
+}
+
 .empty-state {
   height: 200px;
   display: flex;
@@ -139,6 +159,11 @@ const formatTime = (unix: number) => new Date(unix * 1000).toLocaleString();
 
 @media (max-width: 860px) {
   .view-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .error-banner {
     flex-direction: column;
     align-items: flex-start;
   }

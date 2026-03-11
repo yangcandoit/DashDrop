@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref } from 'vue';
+import { message } from '@tauri-apps/plugin-dialog';
 import type { TrustedPeer } from '../types';
 import { getTrustedPeers, setTrustedAlias, unpairDevice } from '../ipc';
 import { devices } from '../store';
@@ -14,6 +15,18 @@ const aliasDrafts = ref<Record<string, string>>({});
 const editingAliasFp = ref<string | null>(null);
 const savingAlias = ref<Record<string, boolean>>({});
 const unpairTarget = ref<TrustedPeer | null>(null);
+const loadError = ref<string | null>(null);
+const actionError = ref<string | null>(null);
+
+const showActionError = async (summary: string, error: unknown) => {
+  const detail = String(error || '').trim();
+  actionError.value = detail ? `${summary} ${detail}` : summary;
+  try {
+    await message(actionError.value, { title: 'Trusted Devices Error', kind: 'error' });
+  } catch (dialogError) {
+    console.debug('Unable to show trusted-devices error dialog', dialogError);
+  }
+};
 
 const onlineFingerprints = computed(() => {
   const set = new Set<string>();
@@ -30,10 +43,14 @@ const isOnline = (fp: string) => onlineFingerprints.value.has(fp);
 const loadPeers = async () => {
   loading.value = true;
   try {
+    loadError.value = null;
     peers.value = await getTrustedPeers();
     aliasDrafts.value = Object.fromEntries(
       peers.value.map((peer) => [peer.fingerprint, peer.alias || '']),
     );
+  } catch (e) {
+    console.error('Failed to load trusted devices', e);
+    loadError.value = 'Unable to load trusted devices right now.';
   } finally {
     loading.value = false;
   }
@@ -65,11 +82,15 @@ const commitAlias = async (peer: TrustedPeer) => {
 
   savingAlias.value[peer.fingerprint] = true;
   try {
+    actionError.value = null;
     await setTrustedAlias(peer.fingerprint, next);
     const idx = peers.value.findIndex((p) => p.fingerprint === peer.fingerprint);
     if (idx !== -1) {
       peers.value[idx] = { ...peers.value[idx], alias: next };
     }
+  } catch (e) {
+    aliasDrafts.value[peer.fingerprint] = prev || '';
+    await showActionError('Unable to update this alias.', e);
   } finally {
     savingAlias.value[peer.fingerprint] = false;
   }
@@ -93,11 +114,13 @@ const removePeer = async () => {
   delete aliasDrafts.value[target.fingerprint];
 
   try {
+    actionError.value = null;
     await unpairDevice(target.fingerprint);
   } catch (e) {
     console.error('Unpair failed', e);
     peers.value = previous;
     await loadPeers();
+    await showActionError('Unable to unpair this device.', e);
   }
 };
 
@@ -125,6 +148,14 @@ onMounted(loadPeers);
     </header>
 
     <main class="content">
+      <div v-if="loadError" class="error-banner">
+        <span>{{ loadError }}</span>
+        <button class="btn btn-secondary" @click="loadPeers">Retry</button>
+      </div>
+      <div v-else-if="actionError" class="error-banner">
+        <span>{{ actionError }}</span>
+        <button class="btn btn-secondary" @click="actionError = null">Dismiss</button>
+      </div>
       <div class="empty-state" v-if="loading">
         <p class="text-muted">Loading trusted devices...</p>
       </div>
@@ -218,6 +249,19 @@ onMounted(loadPeers);
   flex: 1;
   padding: 14px 22px 22px;
   overflow-y: auto;
+}
+
+.error-banner {
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(198, 40, 40, 0.25);
+  background: rgba(198, 40, 40, 0.06);
+  color: #8f2d2a;
 }
 
 .empty-state {
@@ -344,6 +388,11 @@ onMounted(loadPeers);
     flex-direction: column;
     align-items: flex-start;
     gap: 10px;
+  }
+
+  .error-banner {
+    flex-direction: column;
+    align-items: flex-start;
   }
 
   .trusted-card {

@@ -4,7 +4,7 @@
 
 ---
 
-## 当前实现状态（2026-03-10）
+## 当前实现状态（2026-03-11）
 
 1. 已完成：
 - 状态契约收口（含 `transfer_accepted`）与终态事件统一。
@@ -14,6 +14,15 @@
 - Playwright UI E2E（mock IPC 驱动）与 Security Events 视图。
 - 失败项按文件级重传（failed-file-only retry）已落地。
 - 发现链路已升级为 mDNS + UDP beacon fallback。
+- 前端状态读取已补齐契约兜底，Transfers/History 不再因空载荷直接崩溃。
+- 首次未配对发送失败时保留确认上下文，避免误导成“已完成发送”。
+- History / Security Events / Transfers 的关键失败路径已补用户可见反馈与重试入口。
+- 主壳层已补窄窗口导航重排，避免固定侧栏在小窗口下挤压内容区。
+- 本地 IPC 启动链路已修正为非 Tokio runtime 预绑定路径，`npm run test:tauri:smoke` 已覆盖真实启动链路并验证 setup 阶段不再因 listener 绑定崩溃。
+- Windows 本地 IPC named pipe 基线实现已补齐，不再停留在 placeholder。
+- 首次信任相关 UI 已统一显示双方一致的 shared verification code，且未信任发送/接收/按地址连接要求显式确认后才能继续。
+- 外部文件打开/分享路径现在可进入 Nearby 的待发送队列，作为 system share/daemon 方向的第一段基础能力。
+- 第二实例启动时现在会优先走本地 IPC handoff，把激活/分享路径转交给已运行实例，作为 single-instance 基础。
 
 2. 进行中：
 - 真实双端集成测试（QUIC 多机编排与压力验证）。

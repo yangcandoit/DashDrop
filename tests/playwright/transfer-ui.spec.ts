@@ -11,6 +11,7 @@ test.beforeEach(async ({ page }) => {
       incoming: {} as Record<string, any>,
       history: [] as any[],
       connectByAddressCalls: [] as string[],
+      sendFileCalls: [] as Array<{ peerFp: string; paths: string[] }>,
       retryCalls: [] as string[],
       cancelAllCalls: 0,
       trustedPeers: [] as any[],
@@ -149,6 +150,12 @@ test.beforeEach(async ({ page }) => {
             });
             return 1;
           }
+          case "send_files_cmd":
+            state.sendFileCalls.push({
+              peerFp: String(args?.peerFp ?? ""),
+              paths: Array.isArray(args?.paths) ? (args?.paths as string[]) : [],
+            });
+            return null;
           case "retry_transfer":
             state.retryCalls.push(String(args?.transferId ?? ""));
             return null;
@@ -296,6 +303,8 @@ test("incoming -> accept -> history visible", async ({ page }) => {
     .locator("article.incoming-card", { hasText: "Peer Accept" })
     .getByRole("button", { name: "Accept", exact: true })
     .click();
+  await page.getByRole("checkbox", { name: "I compared this shared code on both devices" }).check();
+  await page.getByRole("button", { name: "Continue" }).click();
 
   await page.getByRole("button", { name: "History" }).click();
   await expect(page.getByText("Peer Accept")).toBeVisible();
@@ -322,6 +331,8 @@ test("expired incoming action shows expiry error and does not create active tran
   const expiredCard = page.locator("article.incoming-card", { hasText: "Peer Expired" });
   await expect(expiredCard).toBeVisible();
   await expiredCard.getByRole("button", { name: "Accept", exact: true }).click();
+  await page.getByRole("checkbox", { name: "I compared this shared code on both devices" }).check();
+  await page.getByRole("button", { name: "Continue" }).click();
 
   await expect(page.getByText("This transfer request expired")).toBeVisible();
   await expect(expiredCard).toHaveCount(0);
@@ -334,6 +345,9 @@ test("connect by address dialog/confirm flow", async ({ page }) => {
   await page.getByLabel("Peer address").fill("127.0.0.1:7001");
   await page.locator(".dialog-actions").getByRole("button", { name: "Connect" }).click();
   await expect(page.getByText("Manual Peer")).toBeVisible();
+  await expect(page.locator(".preview-row", { hasText: "Shared Verification Code" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Confirm Fingerprint" })).toBeDisabled();
+  await page.getByRole("checkbox", { name: "I compared this shared code on both devices" }).check();
   await page.getByRole("button", { name: "Confirm Fingerprint" }).click();
 
   const state = await page.evaluate(() => (window as any).__getTestState());
@@ -491,14 +505,54 @@ test("nearby and trusted share online rule when session has no usable address", 
 
   await page.getByRole("button", { name: "Nearby" }).click();
   await expect(page.getByText("Discovering (address pending)")).toBeVisible();
+  await expect(page.locator(".device-card", { hasText: "NoAddr Peer" }).getByText("Unavailable")).toBeVisible();
 
   await page.getByRole("button", { name: "Trusted Devices" }).click();
   const trustedCard = page.locator(".trusted-card", { hasText: "NoAddr Peer" });
   await expect(trustedCard.getByText("Offline")).toBeVisible();
 });
 
+test("external share event queues files and nearby sends them to selected device", async ({ page }) => {
+  await page.evaluate(() => {
+    const trustedDevice = {
+      fingerprint: "fp-trusted",
+      name: "Trusted Peer",
+      platform: "Mac",
+      trusted: true,
+      sessions: {
+        "s-trusted": {
+          session_id: "s-trusted",
+          addrs: ["192.168.1.7:7000"],
+          last_seen_unix: 1,
+        },
+      },
+      last_seen: 1,
+      reachability: "reachable",
+      probe_fail_count: 0,
+      last_probe_at: null,
+    };
+    (window as any).__setMockDevices([trustedDevice]);
+    (window as any).__emitTestEvent("device_discovered", trustedDevice);
+    (window as any).__emitTestEvent("external_share_received", {
+      paths: ["/tmp/from-share/a.txt", "/tmp/from-share/b.txt"],
+      source: "local_ipc",
+    });
+  });
+
+  await page.getByRole("button", { name: "Nearby" }).click();
+  await expect(page.locator(".share-banner")).toContainText("2 shared items");
+  await page.locator(".device-card", { hasText: "Trusted Peer" }).click();
+
+  const state = await page.evaluate(() => (window as any).__getTestState());
+  expect(state.sendFileCalls).toContainEqual({
+    peerFp: "fp-trusted",
+    paths: ["/tmp/from-share/a.txt", "/tmp/from-share/b.txt"],
+  });
+});
+
 test("settings diagnostics copy includes extended discovery fields", async ({ page }) => {
   await page.locator(".app-rail").getByRole("button", { name: "Settings", exact: true }).click();
+  await expect(page.getByText("Verification Code")).toBeVisible();
   await page.getByRole("button", { name: "Copy Discovery Diagnostics" }).click();
 
   const copied = await page.evaluate(() => (window as any).__getClipboardText());

@@ -14,6 +14,8 @@ pub mod state;
 pub mod transport;
 
 pub use crypto::Identity;
+use daemon::client::LocalIpcClient;
+use local_ipc::LocalIpcCommand;
 use state::{AppConfig, AppState, TransferStatus};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -46,6 +48,27 @@ fn resolve_config_dir<R: tauri::Runtime, T: tauri::Manager<R>>(app: &T) -> anyho
     Ok(base.join("dashdrop"))
 }
 
+fn collect_external_share_paths() -> Vec<String> {
+    std::env::args_os()
+        .skip(1)
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .map(|path| path.to_string_lossy().to_string())
+        .collect()
+}
+
+fn handoff_to_running_instance(config_dir: &std::path::Path, paths: &[String]) -> bool {
+    let client = LocalIpcClient::from_config_dir(config_dir);
+    tauri::async_runtime::block_on(async {
+        client
+            .send(LocalIpcCommand::AppActivate {
+                paths: paths.to_vec(),
+            })
+            .await
+            .is_ok()
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -74,6 +97,13 @@ pub fn run() {
                     return Err(anyhow::anyhow!(message).into());
                 }
             };
+
+            let startup_share_paths = collect_external_share_paths();
+            if handoff_to_running_instance(&config_dir, &startup_share_paths) {
+                tracing::info!("Forwarded activation/share payload to running DashDrop instance");
+                app.handle().exit(0);
+                return Ok(());
+            }
 
             // Initialize identity
             let identity = match Identity::load_or_create(&config_dir) {
@@ -183,6 +213,22 @@ pub fn run() {
                         )
                         .ok();
                 }
+            }
+
+            if !startup_share_paths.is_empty() {
+                let handle_for_share = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                    handle_for_share
+                        .emit(
+                            "external_share_received",
+                            serde_json::json!({
+                                "paths": startup_share_paths,
+                                "source": "startup_args"
+                            }),
+                        )
+                        .ok();
+                });
             }
 
             // Start async subsystems

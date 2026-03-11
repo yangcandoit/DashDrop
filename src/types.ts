@@ -226,6 +226,11 @@ export interface SystemErrorPayload {
   rollback_device_name?: string;
 }
 
+export interface ExternalSharePayload {
+  paths: string[];
+  source?: string | null;
+}
+
 export interface SecurityEvent {
   id: number;
   event_type: string;

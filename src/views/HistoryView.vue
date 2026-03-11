@@ -16,6 +16,7 @@ const emit = defineEmits(['openSettings']);
 
 const history = ref<TransferView[]>([]);
 const loading = ref(true);
+const loadError = ref<string | null>(null);
 const unlistens: Array<() => void> = [];
 const peerFilter = ref('');
 const directionFilter = ref<'All' | 'Send' | 'Receive'>('All');
@@ -25,9 +26,11 @@ const timeFilter = ref<'All' | '24h' | '7d' | '30d'>('All');
 const load = async () => {
   try {
     loading.value = true;
+    loadError.value = null;
     history.value = await getTransferHistory(50, 0);
   } catch (e) {
     console.error("Failed to load history", e);
+    loadError.value = 'Unable to load transfer history right now.';
   } finally {
     loading.value = false;
   }
@@ -53,7 +56,10 @@ onUnmounted(() => {
 });
 
 const openFolder = (id: string) => {
-  openTransferFolder(id).catch(e => console.error("Failed to open folder", e));
+  openTransferFolder(id).catch((e) => {
+    console.error("Failed to open folder", e);
+    loadError.value = 'Unable to open the transfer folder.';
+  });
 };
 
 const formatSize = (bytes: number) => {
@@ -139,6 +145,10 @@ const filteredHistory = computed(() => {
           </option>
         </select>
       </section>
+      <div v-if="loadError" class="error-banner">
+        <span>{{ loadError }}</span>
+        <button class="btn btn-secondary" @click="load">Retry</button>
+      </div>
       <div v-if="loading" class="empty-state">
         <p class="text-muted">Loading history...</p>
       </div>
@@ -220,6 +230,19 @@ const filteredHistory = computed(() => {
   color: var(--text-secondary);
 }
 
+.error-banner {
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(198, 40, 40, 0.25);
+  background: rgba(198, 40, 40, 0.06);
+  color: #8f2d2a;
+}
+
 .empty-state {
   height: 200px;
   display: flex;
@@ -295,6 +318,11 @@ const filteredHistory = computed(() => {
 @media (max-width: 960px) {
   .filters {
     grid-template-columns: 1fr;
+  }
+
+  .error-banner {
+    flex-direction: column;
+    align-items: flex-start;
   }
 
   .view-header {

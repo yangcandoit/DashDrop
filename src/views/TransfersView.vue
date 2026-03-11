@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
-import { activeTransfers, incomingQueue } from '../store';
+import { message } from '@tauri-apps/plugin-dialog';
+import { activeTransfers, incomingQueue, myIdentity } from '../store';
 import ProgressBar from '../components/ProgressBar.vue';
 import {
   acceptTransfer,
@@ -14,6 +15,7 @@ import {
   retryTransfer,
 } from '../ipc';
 import type { ConnectByAddressResult } from '../types';
+import { sharedVerificationCode, verificationCodeFromFingerprint } from '../security';
 
 const emit = defineEmits(['openSettings']);
 
@@ -28,17 +30,101 @@ const connectLoading = ref(false);
 const connectError = ref<string | null>(null);
 const connectResult = ref<ConnectByAddressResult | null>(null);
 const rememberDevice = ref(true);
+const connectVerified = ref(false);
+const actionError = ref<string | null>(null);
+const verifyIncomingRequest = ref<{
+  transferId: string;
+  notificationId: string;
+  senderFp: string;
+  senderName: string;
+  mode: 'accept' | 'accept_and_pair';
+} | null>(null);
+const verifyIncomingBusy = ref(false);
+const verifyIncomingConfirmed = ref(false);
+const verificationCode = (fingerprint: string) =>
+  myIdentity.value
+    ? sharedVerificationCode(myIdentity.value.fingerprint, fingerprint)
+    : verificationCodeFromFingerprint(fingerprint);
+
+const setActionError = async (summary: string, error: unknown) => {
+  const detail = errorToMessage(error);
+  actionError.value = `${summary} ${detail}`;
+  try {
+    await message(actionError.value, { title: 'Transfer Action Failed', kind: 'error' });
+  } catch (dialogError) {
+    console.debug('Unable to show transfer action error dialog', dialogError);
+  }
+};
 
 const handleAccept = async (id: string, notificationId: string) => {
-  await acceptTransfer(id, notificationId);
+  try {
+    actionError.value = null;
+    await acceptTransfer(id, notificationId);
+  } catch (e) {
+    console.error('Accept transfer failed', e);
+    await setActionError('Unable to accept this incoming request.', e);
+  }
 };
 
 const handleAcceptAndPair = async (id: string, notificationId: string, senderFp: string) => {
-  await acceptAndPairTransfer(id, notificationId, senderFp);
+  try {
+    actionError.value = null;
+    await acceptAndPairTransfer(id, notificationId, senderFp);
+  } catch (e) {
+    console.error('Accept and pair failed', e);
+    await setActionError('Unable to accept and pair with this sender.', e);
+  }
+};
+
+const requestAcceptVerification = (
+  transferId: string,
+  notificationId: string,
+  senderFp: string,
+  senderName: string,
+  mode: 'accept' | 'accept_and_pair',
+) => {
+  verifyIncomingRequest.value = {
+    transferId,
+    notificationId,
+    senderFp,
+    senderName,
+    mode,
+  };
+  verifyIncomingConfirmed.value = false;
+};
+
+const closeIncomingVerification = () => {
+  if (verifyIncomingBusy.value) return;
+  verifyIncomingRequest.value = null;
+  verifyIncomingConfirmed.value = false;
+};
+
+const confirmIncomingVerification = async () => {
+  const request = verifyIncomingRequest.value;
+  if (!request || !verifyIncomingConfirmed.value) return;
+
+  verifyIncomingBusy.value = true;
+  try {
+    if (request.mode === 'accept_and_pair') {
+      await handleAcceptAndPair(request.transferId, request.notificationId, request.senderFp);
+    } else {
+      await handleAccept(request.transferId, request.notificationId);
+    }
+    verifyIncomingRequest.value = null;
+    verifyIncomingConfirmed.value = false;
+  } finally {
+    verifyIncomingBusy.value = false;
+  }
 };
 
 const handleReject = async (id: string, notificationId: string) => {
-  await rejectTransfer(id, notificationId);
+  try {
+    actionError.value = null;
+    await rejectTransfer(id, notificationId);
+  } catch (e) {
+    console.error('Reject transfer failed', e);
+    await setActionError('Unable to reject this incoming request.', e);
+  }
 };
 
 const formatSize = (bytes: number) => {
@@ -71,13 +157,20 @@ const transferItemsPreview = (items: Array<{ name: string }>) => {
 const errorToMessage = (error: unknown): string => {
   const text = String(error || '').trim();
   if (!text) return 'Unable to connect to that address right now.';
-  if (text.toLowerCase().includes('handshake')) {
+  const lower = text.toLowerCase();
+  if (lower.includes('e_request_expired')) {
+    return 'This incoming request already expired. Ask the sender to share again.';
+  }
+  if (lower.includes('not found') || lower.includes('already handled')) {
+    return 'The transfer state changed before this action completed. Refresh and try again.';
+  }
+  if (lower.includes('handshake')) {
     return 'Handshake failed. Verify both devices run compatible versions and are on the same LAN.';
   }
-  if (text.toLowerCase().includes('identity')) {
+  if (lower.includes('identity')) {
     return 'Identity verification failed. Confirm fingerprint out-of-band before retrying.';
   }
-  if (text.toLowerCase().includes('connection attempts failed')) {
+  if (lower.includes('connection attempts failed')) {
     return 'No route to the peer from this network. Check address, firewall and local network.';
   }
   return text;
@@ -89,6 +182,8 @@ const openConnectDialog = () => {
   connectError.value = null;
   connectResult.value = null;
   rememberDevice.value = true;
+  connectVerified.value = false;
+  actionError.value = null;
 };
 
 const closeConnectDialog = () => {
@@ -111,6 +206,7 @@ const lookupPeerByAddress = async () => {
     const result = await connectByAddress(address);
     connectResult.value = result;
     rememberDevice.value = !result.trusted;
+    connectVerified.value = result.trusted;
   } catch (e) {
     connectError.value = errorToMessage(e);
   } finally {
@@ -120,6 +216,7 @@ const lookupPeerByAddress = async () => {
 
 const confirmConnectIdentity = async () => {
   if (!connectResult.value) return;
+  if (!connectResult.value.trusted && !connectVerified.value) return;
 
   connectLoading.value = true;
   connectError.value = null;
@@ -147,17 +244,41 @@ const retryLabel = (status: string) => (status === 'PartialCompleted' ? 'Retry F
 
 const handleRetry = async (transferId: string) => {
   try {
+    actionError.value = null;
     await retryTransfer(transferId);
   } catch (e) {
     console.error('Retry failed', e);
+    await setActionError('Unable to retry this transfer.', e);
   }
 };
 
 const handleCancelAll = async () => {
   try {
+    actionError.value = null;
     await cancelAllTransfers();
   } catch (e) {
     console.error('Cancel all failed', e);
+    await setActionError('Unable to cancel all active transfers.', e);
+  }
+};
+
+const handleCancel = async (transferId: string) => {
+  try {
+    actionError.value = null;
+    await cancelTransfer(transferId);
+  } catch (e) {
+    console.error('Cancel transfer failed', e);
+    await setActionError('Unable to cancel this transfer.', e);
+  }
+};
+
+const handleOpenFolder = async (transferId: string) => {
+  try {
+    actionError.value = null;
+    await openTransferFolder(transferId);
+  } catch (e) {
+    console.error('Open folder failed', e);
+    await setActionError('Unable to open the saved transfer folder.', e);
   }
 };
 </script>
@@ -173,6 +294,10 @@ const handleCancelAll = async () => {
     </header>
 
     <main class="content">
+      <div v-if="actionError" class="error-banner">
+        <span>{{ actionError }}</span>
+        <button class="btn btn-secondary" @click="actionError = null">Dismiss</button>
+      </div>
       <div class="top-actions">
         <button class="btn btn-secondary" :disabled="!hasActiveRunning" @click="handleCancelAll">
           Cancel All Active
@@ -192,15 +317,24 @@ const handleCancelAll = async () => {
                 {{ request.items.length }} items • {{ formatSize(request.total_size) }}
               </div>
               <div v-if="!request.trusted" class="risk text-muted">
-                Verify fingerprint {{ request.sender_fp.slice(-8) }}
+                Compare shared code {{ verificationCode(request.sender_fp) }}
               </div>
             </div>
             <div class="incoming-actions">
               <button class="btn btn-secondary" @click="handleReject(request.transfer_id, request.notification_id)">Reject</button>
-              <button class="btn btn-secondary" v-if="!request.trusted" @click="handleAcceptAndPair(request.transfer_id, request.notification_id, request.sender_fp)">
+              <button
+                class="btn btn-secondary"
+                v-if="!request.trusted"
+                @click="requestAcceptVerification(request.transfer_id, request.notification_id, request.sender_fp, request.sender_name, 'accept_and_pair')"
+              >
                 Accept & Pair
               </button>
-              <button class="btn btn-primary" @click="handleAccept(request.transfer_id, request.notification_id)">Accept</button>
+              <button
+                class="btn btn-primary"
+                @click="request.trusted ? handleAccept(request.transfer_id, request.notification_id) : requestAcceptVerification(request.transfer_id, request.notification_id, request.sender_fp, request.sender_name, 'accept')"
+              >
+                Accept
+              </button>
             </div>
           </article>
         </div>
@@ -216,14 +350,14 @@ const handleCancelAll = async () => {
             <div class="transfer-actions">
               <button
                 v-if="t.status === 'Transferring' || t.status === 'PendingAccept'"
-                @click="cancelTransfer(t.id)"
+                @click="handleCancel(t.id)"
                 class="mini-btn"
               >
                 Cancel
               </button>
               <button
                 v-if="t.status === 'Completed' && t.direction === 'Receive'"
-                @click="openTransferFolder(t.id)"
+                @click="handleOpenFolder(t.id)"
                 class="mini-btn"
               >
                 Open Folder
@@ -287,6 +421,14 @@ const handleCancelAll = async () => {
               <span class="preview-key">Fingerprint</span>
               <code class="fingerprint">{{ connectResult.fingerprint }}</code>
             </div>
+            <div class="preview-row">
+              <span class="preview-key">Shared Verification Code</span>
+              <code class="fingerprint">{{ verificationCode(connectResult.fingerprint) }}</code>
+            </div>
+            <label v-if="!connectResult.trusted" class="remember-row">
+              <input type="checkbox" v-model="connectVerified" :disabled="connectLoading" />
+              <span>I compared this shared code on both devices</span>
+            </label>
             <label v-if="!connectResult.trusted" class="remember-row">
               <input type="checkbox" v-model="rememberDevice" :disabled="connectLoading" />
               <span>Pair and remember this device after confirmation</span>
@@ -302,10 +444,42 @@ const handleCancelAll = async () => {
           </button>
           <button
             class="btn btn-primary"
-            :disabled="!connectResult || connectLoading"
+            :disabled="!connectResult || connectLoading || (!connectResult.trusted && !connectVerified)"
             @click="confirmConnectIdentity"
           >
             {{ connectLoading && connectResult ? 'Saving...' : 'Confirm Fingerprint' }}
+          </button>
+        </div>
+      </section>
+    </div>
+
+    <div v-if="verifyIncomingRequest" class="dialog-backdrop" @click.self="closeIncomingVerification">
+      <section class="dialog-card">
+        <div class="dialog-header">
+          <h3>Verify Sender Before Accepting</h3>
+          <button class="btn btn-secondary" :disabled="verifyIncomingBusy" @click="closeIncomingVerification">Close</button>
+        </div>
+        <div class="dialog-body">
+          <p class="text-muted">Confirm the sender identity for <strong>{{ verifyIncomingRequest.senderName }}</strong> before continuing.</p>
+          <div class="peer-preview">
+            <div class="preview-row">
+              <span class="preview-key">Fingerprint</span>
+              <code class="fingerprint">{{ verifyIncomingRequest.senderFp }}</code>
+            </div>
+            <div class="preview-row">
+              <span class="preview-key">Shared Verification Code</span>
+              <code class="fingerprint">{{ verificationCode(verifyIncomingRequest.senderFp) }}</code>
+            </div>
+          </div>
+          <label class="remember-row">
+            <input type="checkbox" v-model="verifyIncomingConfirmed" :disabled="verifyIncomingBusy" />
+            <span>I compared this shared code on both devices</span>
+          </label>
+        </div>
+        <div class="dialog-actions">
+          <button class="btn btn-secondary" :disabled="verifyIncomingBusy" @click="closeIncomingVerification">Cancel</button>
+          <button class="btn btn-primary" :disabled="verifyIncomingBusy || !verifyIncomingConfirmed" @click="confirmIncomingVerification">
+            {{ verifyIncomingBusy ? 'Confirming...' : 'Continue' }}
           </button>
         </div>
       </section>
@@ -350,6 +524,18 @@ const handleCancelAll = async () => {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+}
+
+.error-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(198, 40, 40, 0.25);
+  background: rgba(198, 40, 40, 0.06);
+  color: #8f2d2a;
 }
 
 .incoming-section {
@@ -603,6 +789,11 @@ const handleCancelAll = async () => {
     flex-direction: column;
     align-items: flex-start;
     gap: 10px;
+  }
+
+  .error-banner {
+    flex-direction: column;
+    align-items: flex-start;
   }
 
   .top-actions {

@@ -12,6 +12,7 @@ import {
 } from '../ipc';
 import { open as openDialog, message } from '@tauri-apps/plugin-dialog';
 import type { RuntimeStatus, TransferMetrics } from '../types';
+import { verificationCodeFromFingerprint } from '../security';
 
 const emit = defineEmits(['back']);
 const form = ref({
@@ -22,10 +23,12 @@ const form = ref({
   max_parallel_streams: 4,
 });
 const fingerprint = ref('');
+const verificationCode = ref('');
 const loading = ref(true);
 const insecureStorage = ref(false);
 const runtimeStatus = ref<RuntimeStatus | null>(null);
 const metrics = ref<TransferMetrics | null>(null);
+const loadError = ref<string | null>(null);
 
 const formatSize = (bytes: number) => {
   if (bytes < 1024) return `${bytes} B`;
@@ -47,25 +50,39 @@ const formatDuration = (ms: number) => {
 };
 
 const loadRuntime = async () => {
-  runtimeStatus.value = await getRuntimeStatus();
-  metrics.value = await getTransferMetrics();
+  const [runtime, transferMetrics] = await Promise.all([
+    getRuntimeStatus(),
+    getTransferMetrics(),
+  ]);
+  runtimeStatus.value = runtime;
+  metrics.value = transferMetrics;
 };
 
 onMounted(async () => {
-  const backendConfig = await getAppConfig();
-  form.value.device_name = backendConfig.device_name;
-  form.value.auto_accept_trusted_only = backendConfig.auto_accept_trusted_only;
-  form.value.download_dir = backendConfig.download_dir || '';
-  form.value.file_conflict_strategy = backendConfig.file_conflict_strategy;
-  form.value.max_parallel_streams = backendConfig.max_parallel_streams;
+  try {
+    loadError.value = null;
+    const [backendConfig, identity, posture] = await Promise.all([
+      getAppConfig(),
+      getLocalIdentity(),
+      getSecurityPosture(),
+    ]);
 
-  const identity = await getLocalIdentity();
-  fingerprint.value = identity.fingerprint;
-  const posture = await getSecurityPosture();
-  insecureStorage.value = !posture.secure_store_available;
-  await loadRuntime();
+    form.value.device_name = backendConfig.device_name;
+    form.value.auto_accept_trusted_only = backendConfig.auto_accept_trusted_only;
+    form.value.download_dir = backendConfig.download_dir || '';
+    form.value.file_conflict_strategy = backendConfig.file_conflict_strategy;
+    form.value.max_parallel_streams = backendConfig.max_parallel_streams;
 
-  loading.value = false;
+    fingerprint.value = identity.fingerprint;
+    verificationCode.value = verificationCodeFromFingerprint(identity.fingerprint);
+    insecureStorage.value = !posture.secure_store_available;
+    await loadRuntime();
+  } catch (e) {
+    console.error('Failed to load settings', e);
+    loadError.value = 'Unable to load current settings. Check backend/runtime status and retry.';
+  } finally {
+    loading.value = false;
+  }
 });
 
 async function copyFingerprint() {
@@ -73,6 +90,14 @@ async function copyFingerprint() {
     await copyToClipboard(fingerprint.value);
   } catch (e) {
     console.error('Failed to copy', e);
+  }
+}
+
+async function copyVerificationCode() {
+  try {
+    await copyToClipboard(verificationCode.value);
+  } catch (e) {
+    console.error('Failed to copy verification code', e);
   }
 }
 
@@ -135,8 +160,14 @@ async function pickFolder() {
 }
 
 async function save() {
+  const deviceName = form.value.device_name.trim();
+  if (!deviceName) {
+    await message('Device name cannot be empty.', { title: 'Invalid Settings', kind: 'warning' });
+    return;
+  }
+
   const payload = {
-    device_name: form.value.device_name,
+    device_name: deviceName,
     auto_accept_trusted_only: form.value.auto_accept_trusted_only,
     download_dir: form.value.download_dir || null,
     file_conflict_strategy: form.value.file_conflict_strategy,
@@ -161,6 +192,9 @@ async function save() {
       </div>
     </header>
     <main class="content glass-panel" v-if="!loading">
+      <div v-if="loadError" class="security-warning">
+        {{ loadError }}
+      </div>
       <div v-if="insecureStorage" class="security-warning">
         Security warning: system keyring is unavailable. Private key is stored in a local file with reduced protection.
       </div>
@@ -174,6 +208,14 @@ async function save() {
           <input type="text" :value="fingerprint" class="input-field" readonly style="font-family: monospace; font-size: 0.85em; opacity: 0.8;" />
           <button @click="copyFingerprint" class="btn btn-secondary">Copy</button>
         </div>
+      </div>
+      <div class="form-group">
+        <label>Verification Code</label>
+        <div class="path-picker">
+          <input type="text" :value="verificationCode" class="input-field" readonly style="font-family: monospace; font-size: 0.92em; letter-spacing: 0.08em;" />
+          <button @click="copyVerificationCode" class="btn btn-secondary">Copy</button>
+        </div>
+        <p class="text-muted" style="margin-top: 6px;">Use this short code when comparing identity out-of-band with another device.</p>
       </div>
       <div class="form-group">
         <label>Download Directory</label>

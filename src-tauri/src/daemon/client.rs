@@ -1,4 +1,6 @@
 use std::path::Path;
+#[cfg(windows)]
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 
@@ -68,29 +70,7 @@ impl LocalIpcClient {
                 .context("read local IPC response")?;
             let response =
                 Self::decode_response(&response_bytes).context("decode local IPC response")?;
-            let response_proto_version = match &response {
-                LocalIpcWireResponse::Ok(ok) => ok.proto_version,
-                LocalIpcWireResponse::Err(err) => err.proto_version,
-            };
-            if response_proto_version != LOCAL_IPC_PROTO_VERSION {
-                return Err(anyhow!(
-                    "local IPC response proto mismatch: expected {}, got {}",
-                    LOCAL_IPC_PROTO_VERSION,
-                    response_proto_version
-                ));
-            }
-            let response_request_id = match &response {
-                LocalIpcWireResponse::Ok(ok) => &ok.request_id,
-                LocalIpcWireResponse::Err(err) => &err.request_id,
-            };
-            if response_request_id != &request.request_id {
-                return Err(anyhow!(
-                    "local IPC response request id mismatch: expected {}, got {}",
-                    request.request_id,
-                    response_request_id
-                ));
-            }
-            Ok(response)
+            Self::validate_response(&request, response)
         }
 
         #[cfg(windows)]
@@ -100,9 +80,16 @@ impl LocalIpcClient {
                     "windows local IPC client expected a named pipe endpoint"
                 ));
             };
-            Err(anyhow!(
-                "windows named pipe client placeholder is not implemented yet ({path})"
-            ))
+            let mut stream = open_windows_named_pipe(path).await?;
+            write_framed_message(&mut stream, &request)
+                .await
+                .context("write local IPC request")?;
+            let response_bytes = read_frame_bytes(&mut stream)
+                .await
+                .context("read local IPC response")?;
+            let response =
+                Self::decode_response(&response_bytes).context("decode local IPC response")?;
+            Self::validate_response(&request, response)
         }
 
         #[cfg(not(any(unix, windows)))]
@@ -111,6 +98,77 @@ impl LocalIpcClient {
             Err(anyhow!("local IPC is unsupported on this platform"))
         }
     }
+
+    fn validate_response(
+        request: &LocalIpcWireRequest,
+        response: LocalIpcWireResponse,
+    ) -> Result<LocalIpcWireResponse> {
+        let response_proto_version = match &response {
+            LocalIpcWireResponse::Ok(ok) => ok.proto_version,
+            LocalIpcWireResponse::Err(err) => err.proto_version,
+        };
+        if response_proto_version != LOCAL_IPC_PROTO_VERSION {
+            return Err(anyhow!(
+                "local IPC response proto mismatch: expected {}, got {}",
+                LOCAL_IPC_PROTO_VERSION,
+                response_proto_version
+            ));
+        }
+        let response_request_id = match &response {
+            LocalIpcWireResponse::Ok(ok) => &ok.request_id,
+            LocalIpcWireResponse::Err(err) => &err.request_id,
+        };
+        if response_request_id != &request.request_id {
+            return Err(anyhow!(
+                "local IPC response request id mismatch: expected {}, got {}",
+                request.request_id,
+                response_request_id
+            ));
+        }
+        Ok(response)
+    }
+}
+
+#[cfg(windows)]
+fn with_tokio_io_context<T>(
+    operation: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        operation()
+    } else {
+        tauri::async_runtime::block_on(async { operation() })
+    }
+}
+
+#[cfg(windows)]
+async fn open_windows_named_pipe(
+    path: &str,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    const ERROR_PIPE_BUSY: i32 = 231;
+    const MAX_ATTEMPTS: usize = 80;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match with_tokio_io_context(|| ClientOptions::new().open(path)) {
+            Ok(client) => return Ok(client),
+            Err(err)
+                if err.raw_os_error() == Some(ERROR_PIPE_BUSY)
+                    || err.kind() == std::io::ErrorKind::NotFound =>
+            {
+                if attempt + 1 == MAX_ATTEMPTS {
+                    return Err(err)
+                        .with_context(|| format!("connect local IPC named pipe {path}"));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("connect local IPC named pipe {path}"));
+            }
+        }
+    }
+
+    unreachable!("windows named pipe open loop must return or error before exhausting attempts")
 }
 
 #[cfg(test)]
@@ -139,7 +197,7 @@ mod tests {
         ))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn config_get_round_trips_over_local_ipc_server() {
         let state = build_test_state();

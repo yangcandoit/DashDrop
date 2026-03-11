@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { ref } from 'vue';
+import { myIdentity } from '../store';
 import {
   acceptTransfer,
   rejectTransfer,
   acceptAndPairTransfer
 } from '../ipc';
 import type { FileItemMeta } from '../types';
+import { sharedVerificationCode, verificationCodeFromFingerprint } from '../security';
 
 const props = defineProps<{
   transferId: string;
@@ -22,6 +24,10 @@ const emit = defineEmits<{
 }>();
 
 const isProcessing = ref(false);
+const verificationCode = (fingerprint: string) =>
+  myIdentity.value
+    ? sharedVerificationCode(myIdentity.value.fingerprint, fingerprint)
+    : verificationCodeFromFingerprint(fingerprint);
 
 const formatBytes = (bytes: number) => {
   if (bytes === 0) return '0 B';
@@ -86,6 +92,8 @@ const handleReject = async () => {
           <span>First-time peer. Verify fingerprint before accepting sensitive files:</span>
           <br />
           <code class="fingerprint">{{ senderFp }}</code>
+          <br />
+          <span class="verification-copy">Shared verification code: <code class="fingerprint">{{ verificationCode(senderFp) }}</code></span>
         </div>
       </div>
 
@@ -190,6 +198,11 @@ const handleReject = async () => {
   border: 1px solid var(--border-subtle);
   padding: 4px 6px;
   border-radius: 6px;
+}
+
+.verification-copy {
+  display: inline-block;
+  margin-top: 8px;
 }
 
 .file-list {

@@ -150,8 +150,14 @@ pub enum LocalIpcCommand {
     TransferRetry {
         transfer_id: String,
     },
+    AppActivate {
+        paths: Vec<String>,
+    },
     AppGetLocalIdentity,
     AppGetRuntimeStatus,
+    AppQueueExternalShare {
+        paths: Vec<String>,
+    },
     SecurityGetPosture,
 }
 
@@ -172,8 +178,10 @@ impl LocalIpcCommand {
             Self::TransferCancel { .. } => "transfer/cancel",
             Self::TransferCancelAll => "transfer/cancel_all",
             Self::TransferRetry { .. } => "transfer/retry",
+            Self::AppActivate { .. } => "app/activate",
             Self::AppGetLocalIdentity => "app/get_local_identity",
             Self::AppGetRuntimeStatus => "app/get_runtime_status",
+            Self::AppQueueExternalShare { .. } => "app/queue_external_share",
             Self::SecurityGetPosture => "security/get_posture",
         }
     }
@@ -241,6 +249,8 @@ impl LocalIpcCommand {
             })),
             Self::TransferCancel { transfer_id }
             | Self::TransferRetry { transfer_id } => Some(json!({ "transfer_id": transfer_id })),
+            Self::AppActivate { paths } => Some(json!({ "paths": paths })),
+            Self::AppQueueExternalShare { paths } => Some(json!({ "paths": paths })),
         }
     }
 
@@ -287,8 +297,14 @@ impl LocalIpcCommand {
             "transfer/retry" => Ok(Self::TransferRetry {
                 transfer_id: required_string(payload, "transfer_id")?,
             }),
+            "app/activate" => Ok(Self::AppActivate {
+                paths: required_string_vec(payload, "paths")?,
+            }),
             "app/get_local_identity" => Ok(Self::AppGetLocalIdentity),
             "app/get_runtime_status" => Ok(Self::AppGetRuntimeStatus),
+            "app/queue_external_share" => Ok(Self::AppQueueExternalShare {
+                paths: required_string_vec(payload, "paths")?,
+            }),
             "security/get_posture" => Ok(Self::SecurityGetPosture),
             reserved if RESERVED_PHASE_A_COMMANDS.contains(&reserved) => Err(
                 LocalIpcError::invalid_request(format!(
@@ -635,6 +651,10 @@ mod tests {
         assert_eq!(
             LocalIpcCommand::AppGetRuntimeStatus.name(),
             "app/get_runtime_status"
+        );
+        assert_eq!(
+            LocalIpcCommand::AppActivate { paths: vec!["/tmp/a.txt".into()] }.name(),
+            "app/activate"
         );
     }
 

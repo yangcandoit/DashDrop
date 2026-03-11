@@ -6,6 +6,7 @@ import { firstUsableAddress, hasAnySession, hasUsableAddress, isDeviceOnline } f
 const props = defineProps<{
   device: DeviceView;
   isSending?: boolean;
+  disabled?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -17,6 +18,7 @@ const emit = defineEmits<{
 const isDragOver = ref(false);
 
 function onDragOver(e: DragEvent) {
+  if (props.disabled) return;
   e.preventDefault();
   if (e.dataTransfer && e.dataTransfer.types.includes('Files')) {
     isDragOver.value = true;
@@ -24,6 +26,7 @@ function onDragOver(e: DragEvent) {
 }
 
 function onDragEnter(e: DragEvent) {
+  if (props.disabled) return;
   e.preventDefault();
   if (e.dataTransfer && e.dataTransfer.types.includes('Files')) {
     isDragOver.value = true;
@@ -32,18 +35,20 @@ function onDragEnter(e: DragEvent) {
 }
 
 function onDragLeave(e: DragEvent) {
+  if (props.disabled) return;
   e.preventDefault();
   isDragOver.value = false;
   emit('drag-target-leave');
 }
 
 function onDrop(e: DragEvent) {
+  if (props.disabled) return;
   e.preventDefault();
   isDragOver.value = false;
   emit('drag-target-enter');
 }
 
-const initial = props.device.name.charAt(0).toUpperCase();
+const initial = computed(() => props.device.name.charAt(0).toUpperCase());
 
 const timeAgo = (unixSecs: number) => {
   const diff = Math.floor(Date.now() / 1000 - unixSecs);
@@ -71,17 +76,18 @@ const getAddr = () => {
 };
 
 const isOffline = computed(() => !isDeviceOnline(props.device));
+const isDisabled = computed(() => Boolean(props.disabled));
 </script>
 
 <template>
   <div
     class="device-card animate-fade-in"
-    :class="{ 'drag-over': isDragOver, offline: isOffline }"
+    :class="{ 'drag-over': isDragOver, offline: isOffline, disabled: isDisabled }"
     @dragenter="onDragEnter"
     @dragover="onDragOver"
     @dragleave="onDragLeave"
     @drop="onDrop"
-    @click="emit('click')"
+    @click="!isDisabled && emit('click')"
   >
     <div class="avatar">{{ initial }}</div>
 
@@ -95,6 +101,7 @@ const isOffline = computed(() => !isDeviceOnline(props.device));
     </div>
 
     <div class="status" v-if="isSending">Sending</div>
+    <div class="status" v-else-if="isDisabled">Unavailable</div>
     <div class="status trusted" v-else-if="device.trusted">Trusted</div>
 
     <div class="drag-overlay" v-if="isDragOver">Drop to send</div>
@@ -125,6 +132,10 @@ const isOffline = computed(() => !isDeviceOnline(props.device));
 
 .device-card.offline {
   opacity: 0.74;
+}
+
+.device-card.disabled {
+  cursor: not-allowed;
 }
 
 .avatar {

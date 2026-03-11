@@ -23,6 +23,9 @@ npm install
 # 开发模式（热重载）
 npm run tauri dev
 
+# 真实运行时启动烟测
+npm run test:tauri:smoke
+
 # 仅运行前端（不启动 Tauri）
 npm run dev
 
@@ -35,8 +38,14 @@ cargo test --manifest-path src-tauri/Cargo.toml
 npm run build
 npm run test:e2e
 npm run test:e2e:contract
+npm run test:tauri:smoke
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features
 ```
+
+如改动影响“当前状态 / 已实现 / 已通过”类描述，请同步更新：
+- `README.md`
+- `STATUS.md`
+- 相关设计或发布文档（如 `DESIGN_V1.md`、`ARCHITECTURE.md`、`RELEASE_CHECKLIST.md`）
 
 ---
 

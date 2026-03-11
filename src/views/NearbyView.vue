@@ -5,19 +5,44 @@ import DeviceCard from '../components/DeviceCard.vue';
 import { pairDevice, sendFiles } from '../ipc';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import type { DeviceView } from '../types';
-import { myIdentity, devices, incomingQueue, sendingPeerFingerprints } from '../store';
+import {
+  myIdentity,
+  devices,
+  incomingQueue,
+  sendingPeerFingerprints,
+  externalSharePaths,
+  externalShareSource,
+  clearExternalShare,
+} from '../store';
+import { isDeviceOnline } from '../devicePresence';
+import { sharedVerificationCode, verificationCodeFromFingerprint } from '../security';
 
 const emit = defineEmits(['openSettings']);
 
 const incomingCount = computed(() => incomingQueue.value.length);
+const queuedShareCount = computed(() => externalSharePaths.value.length);
 const activeDropTargetFp = ref<string | null>(null);
 const showTrustConfirm = ref(false);
 const trustConfirmBusy = ref(false);
 const trustRemember = ref(true);
+const trustVerified = ref(false);
 const pendingTarget = ref<DeviceView | null>(null);
 const pendingPaths = ref<string[]>([]);
 
 let dragDropUnlisten: (() => void) | null = null;
+
+const canSendToDevice = (device: DeviceView) => isDeviceOnline(device);
+const verificationCode = (fingerprint: string) =>
+  myIdentity.value
+    ? sharedVerificationCode(myIdentity.value.fingerprint, fingerprint)
+    : verificationCodeFromFingerprint(fingerprint);
+
+const showUnavailableDeviceMessage = async (device: DeviceView) => {
+  await message(
+    `${device.name} is currently unavailable for transfer.\nBring both devices online and on the same LAN, then retry.`,
+    { title: 'Device unavailable', kind: 'warning' },
+  );
+};
 
 onMounted(async () => {
   dragDropUnlisten = await getCurrentWebview().onDragDropEvent(async (event) => {
@@ -37,6 +62,10 @@ onMounted(async () => {
       await message('Selected device is no longer available.', { title: 'Device unavailable', kind: 'warning' });
       return;
     }
+    if (!canSendToDevice(target)) {
+      await showUnavailableDeviceMessage(target);
+      return;
+    }
 
     await prepareAndSend(paths, target);
   });
@@ -47,6 +76,14 @@ onUnmounted(() => {
 });
 
 const handleDeviceClick = async (device: DeviceView) => {
+  if (!canSendToDevice(device)) {
+    await showUnavailableDeviceMessage(device);
+    return;
+  }
+  if (queuedShareCount.value > 0) {
+    await prepareAndSend([...externalSharePaths.value], device);
+    return;
+  }
   const selected = await open({
     multiple: true,
     title: `Send to ${device.name}`,
@@ -69,10 +106,11 @@ const handleDragTargetLeave = (device: DeviceView) => {
 };
 
 const executeSend = async (paths: string[], device: DeviceView) => {
-  if (sendingPeerFingerprints.value.has(device.fingerprint)) return;
+  if (sendingPeerFingerprints.value.has(device.fingerprint)) return false;
 
   try {
     await sendFiles(device.fingerprint, paths);
+    return true;
   } catch (e: unknown) {
     console.error('Failed to send files:', e);
     const detail = String(e || '').toLowerCase();
@@ -110,18 +148,23 @@ const executeSend = async (paths: string[], device: DeviceView) => {
       `Failed to send files to ${device.name}.\nReason: ${userReason}${extraHint ? `\n${extraHint}` : ''}\nOpen Transfers or Security Events for details, then retry.`,
       { title: 'Transfer Failed', kind: 'error' },
     );
+    return false;
   }
 };
 
 const prepareAndSend = async (paths: string[], device: DeviceView) => {
   if (device.trusted) {
-    await executeSend(paths, device);
+    const sent = await executeSend(paths, device);
+    if (sent && queuedShareCount.value > 0) {
+      clearExternalShare();
+    }
     return;
   }
 
   pendingTarget.value = device;
   pendingPaths.value = [...paths];
   trustRemember.value = true;
+  trustVerified.value = false;
   showTrustConfirm.value = true;
 };
 
@@ -130,6 +173,7 @@ const closeTrustConfirm = () => {
   showTrustConfirm.value = false;
   pendingTarget.value = null;
   pendingPaths.value = [];
+  trustVerified.value = false;
 };
 
 const forceCloseTrustConfirm = () => {
@@ -141,14 +185,20 @@ const forceCloseTrustConfirm = () => {
 const confirmTrustAndSend = async () => {
   const device = pendingTarget.value;
   if (!device) return;
+  if (!trustVerified.value) return;
 
   trustConfirmBusy.value = true;
   try {
     if (trustRemember.value) {
       await pairDevice(device.fingerprint);
     }
-    await executeSend([...pendingPaths.value], device);
-    forceCloseTrustConfirm();
+    const sent = await executeSend([...pendingPaths.value], device);
+    if (sent) {
+      if (queuedShareCount.value > 0) {
+        clearExternalShare();
+      }
+      forceCloseTrustConfirm();
+    }
   } finally {
     trustConfirmBusy.value = false;
   }
@@ -172,6 +222,15 @@ const confirmTrustAndSend = async () => {
     </header>
 
     <main class="content">
+      <div v-if="queuedShareCount > 0" class="share-banner">
+        <div class="share-copy">
+          <strong>{{ queuedShareCount }} shared item{{ queuedShareCount > 1 ? 's' : '' }}</strong>
+          <span class="text-muted">
+            {{ externalShareSource ? `Source: ${externalShareSource}. ` : '' }}Choose a nearby device to send them.
+          </span>
+        </div>
+        <button class="btn btn-secondary" @click="clearExternalShare">Clear</button>
+      </div>
       <div class="devices-section">
         <div class="devices-grid" v-if="devices.length > 0">
           <DeviceCard
@@ -179,6 +238,7 @@ const confirmTrustAndSend = async () => {
             :key="device.fingerprint"
             :device="device"
             :isSending="sendingPeerFingerprints.has(device.fingerprint)"
+            :disabled="!canSendToDevice(device)"
             @click="handleDeviceClick(device)"
             @drag-target-enter="handleDragTargetEnter(device)"
             @drag-target-leave="handleDragTargetLeave(device)"
@@ -206,6 +266,13 @@ const confirmTrustAndSend = async () => {
         <p class="fingerprint-line" v-if="pendingTarget">
           Fingerprint: <code>{{ pendingTarget.fingerprint }}</code>
         </p>
+        <p class="verification-line" v-if="pendingTarget">
+          Shared verification code: <code>{{ verificationCode(pendingTarget.fingerprint) }}</code>
+        </p>
+        <label class="remember-row">
+          <input type="checkbox" v-model="trustVerified" :disabled="trustConfirmBusy" />
+          <span>I compared this shared code on both devices</span>
+        </label>
         <label class="remember-row">
           <input type="checkbox" v-model="trustRemember" :disabled="trustConfirmBusy" />
           <span>Pair and remember this device</span>
@@ -214,7 +281,7 @@ const confirmTrustAndSend = async () => {
           <button class="btn btn-secondary" :disabled="trustConfirmBusy" @click="closeTrustConfirm">
             Cancel
           </button>
-          <button class="btn btn-primary" :disabled="trustConfirmBusy" @click="confirmTrustAndSend">
+          <button class="btn btn-primary" :disabled="trustConfirmBusy || !trustVerified" @click="confirmTrustAndSend">
             {{ trustConfirmBusy ? "Sending..." : "Confirm and Send" }}
           </button>
         </div>
@@ -287,6 +354,24 @@ const confirmTrustAndSend = async () => {
   overflow-y: auto;
 }
 
+.share-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 20%, var(--border-subtle));
+  background: color-mix(in srgb, var(--accent) 6%, #fff);
+}
+
+.share-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
 .devices-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
@@ -343,7 +428,8 @@ const confirmTrustAndSend = async () => {
   font-size: 0.9rem;
 }
 
-.fingerprint-line {
+.fingerprint-line,
+.verification-line {
   border: 1px solid var(--border-subtle);
   border-radius: 10px;
   background: var(--surface-muted);

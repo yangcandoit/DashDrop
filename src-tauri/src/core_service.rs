@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::dto::{DeviceView, TrustedPeerView};
 use crate::local_ipc::{
@@ -177,12 +177,20 @@ impl AppCoreService {
                 self.retry_transfer(&transfer_id).await?;
                 Ok(LocalIpcResponse::Ack)
             }
+            LocalIpcCommand::AppActivate { paths } => {
+                self.activate_app(paths).await?;
+                Ok(LocalIpcResponse::Ack)
+            }
             LocalIpcCommand::AppGetLocalIdentity => Ok(LocalIpcResponse::LocalIdentity {
                 identity: self.get_local_identity().await?,
             }),
             LocalIpcCommand::AppGetRuntimeStatus => Ok(LocalIpcResponse::RuntimeStatus {
                 runtime_status: self.get_runtime_status().await?,
             }),
+            LocalIpcCommand::AppQueueExternalShare { paths } => {
+                self.queue_external_share(paths).await?;
+                Ok(LocalIpcResponse::Ack)
+            }
             LocalIpcCommand::SecurityGetPosture => Ok(LocalIpcResponse::SecurityPosture {
                 posture: self.get_security_posture().await?,
             }),
@@ -348,6 +356,54 @@ impl AppCoreService {
         })
     }
 
+    pub async fn queue_external_share(&self, paths: Vec<String>) -> Result<(), String> {
+        if paths.is_empty() {
+            return Err("external share requires at least one path".to_string());
+        }
+
+        let app = self
+            .app
+            .clone()
+            .ok_or_else(|| "app/queue_external_share requires app handle".to_string())?;
+
+        let payload = serde_json::json!({
+            "paths": paths,
+            "source": "local_ipc",
+        });
+        app.emit("external_share_received", payload)
+            .map_err(|e| format!("failed to emit external share event: {e}"))?;
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+        Ok(())
+    }
+
+    pub async fn activate_app(&self, paths: Vec<String>) -> Result<(), String> {
+        let app = self
+            .app
+            .clone()
+            .ok_or_else(|| "app/activate requires app handle".to_string())?;
+
+        if !paths.is_empty() {
+            app.emit(
+                "external_share_received",
+                serde_json::json!({
+                    "paths": paths,
+                    "source": "app_activate"
+                }),
+            )
+            .map_err(|e| format!("failed to emit activation share event: {e}"))?;
+        }
+
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+
+        Ok(())
+    }
+
     pub async fn pair_device(&self, fingerprint: &str) -> Result<(), String> {
         let name = {
             let mut devices = self.state.devices.write().await;
@@ -410,7 +466,11 @@ impl AppCoreService {
         Ok(self.state.config.read().await.clone())
     }
 
-    pub async fn set_app_config(&self, config: AppConfig) -> Result<(), String> {
+    pub async fn set_app_config(&self, mut config: AppConfig) -> Result<(), String> {
+        config.device_name = config.device_name.trim().to_string();
+        if config.device_name.is_empty() {
+            return Err("device_name cannot be empty".to_string());
+        }
         if config.max_parallel_streams == 0 || config.max_parallel_streams > 32 {
             return Err("max_parallel_streams must be between 1 and 32".to_string());
         }
@@ -1179,6 +1239,22 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn config_set_rejects_blank_device_name() {
+        let state = build_test_state();
+        let service = AppCoreService::new(Arc::clone(&state));
+
+        let err = service
+            .set_app_config(AppConfig {
+                device_name: "   ".into(),
+                ..AppConfig::default()
+            })
+            .await
+            .expect_err("blank device name should be rejected");
+
+        assert!(err.contains("device_name cannot be empty"));
     }
 
     #[tokio::test]
