@@ -107,6 +107,7 @@ export interface TransferStartedPayload {
 export interface TransferIncomingPayload {
   transfer_id: string;
   batch_id?: string | null;
+  notification_id: string;
   sender_name: string;
   sender_fp: string;
   trusted: boolean;

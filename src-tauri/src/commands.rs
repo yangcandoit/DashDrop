@@ -1,5 +1,8 @@
 use crate::dto::{DeviceView, TransferView, TrustedPeerView};
-use crate::state::{AppState, DeviceInfo, Platform, ReachabilityStatus, SessionInfo};
+use crate::state::{
+    AppState, DeviceInfo, FileItemMeta, Platform, ReachabilityStatus, SessionInfo,
+    TransferDirection, TransferStatus,
+};
 use crate::transport::connect_to_peer;
 use crate::transport::sender::send_files;
 use serde::Serialize;
@@ -20,7 +23,22 @@ const REQUEST_EXPIRED_PHASE: &str = "notification_action";
 enum IncomingRequestActionState {
     Pending,
     Expired,
+    StaleNotification,
     Missing,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingIncomingRequestPayload {
+    pub transfer_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
+    pub notification_id: String,
+    pub sender_name: String,
+    pub sender_fp: String,
+    pub trusted: bool,
+    pub items: Vec<FileItemMeta>,
+    pub total_size: u64,
+    pub revision: u64,
 }
 
 fn classify_runtime_send_error(detail: &str) -> (&'static str, &'static str) {
@@ -112,8 +130,12 @@ async fn persist_runtime_state(state: &Arc<AppState>) -> Result<(), String> {
     Ok(())
 }
 
-async fn accept_pending_transfer(state: &Arc<AppState>, transfer_id: &str) -> Result<(), String> {
-    match incoming_request_action_state(state, transfer_id).await {
+async fn accept_pending_transfer(
+    state: &Arc<AppState>,
+    transfer_id: &str,
+    notification_id: &str,
+) -> Result<(), String> {
+    match incoming_request_action_state(state, transfer_id, notification_id).await {
         IncomingRequestActionState::Expired => {
             let _ = state.pending_accepts.write().await.remove(transfer_id);
             state
@@ -122,6 +144,9 @@ async fn accept_pending_transfer(state: &Arc<AppState>, transfer_id: &str) -> Re
                     Some(REQUEST_EXPIRED_CODE),
                 )
                 .await;
+            return Err(REQUEST_EXPIRED_CODE.to_string());
+        }
+        IncomingRequestActionState::StaleNotification => {
             return Err(REQUEST_EXPIRED_CODE.to_string());
         }
         IncomingRequestActionState::Missing => {
@@ -140,7 +165,7 @@ async fn accept_pending_transfer(state: &Arc<AppState>, transfer_id: &str) -> Re
         let _ = sender.send(true);
         Ok(())
     } else {
-        match incoming_request_action_state(state, transfer_id).await {
+        match incoming_request_action_state(state, transfer_id, notification_id).await {
             IncomingRequestActionState::Expired => {
                 state
                     .mark_incoming_request_notification_inactive(
@@ -150,6 +175,7 @@ async fn accept_pending_transfer(state: &Arc<AppState>, transfer_id: &str) -> Re
                     .await;
                 Err(REQUEST_EXPIRED_CODE.to_string())
             }
+            IncomingRequestActionState::StaleNotification => Err(REQUEST_EXPIRED_CODE.to_string()),
             IncomingRequestActionState::Pending | IncomingRequestActionState::Missing => Err(
                 format!("transfer {transfer_id} not found or already handled"),
             ),
@@ -157,8 +183,12 @@ async fn accept_pending_transfer(state: &Arc<AppState>, transfer_id: &str) -> Re
     }
 }
 
-async fn reject_pending_transfer(state: &Arc<AppState>, transfer_id: &str) -> Result<(), String> {
-    match incoming_request_action_state(state, transfer_id).await {
+async fn reject_pending_transfer(
+    state: &Arc<AppState>,
+    transfer_id: &str,
+    notification_id: &str,
+) -> Result<(), String> {
+    match incoming_request_action_state(state, transfer_id, notification_id).await {
         IncomingRequestActionState::Expired => {
             let _ = state.pending_accepts.write().await.remove(transfer_id);
             state
@@ -167,6 +197,9 @@ async fn reject_pending_transfer(state: &Arc<AppState>, transfer_id: &str) -> Re
                     Some(REQUEST_EXPIRED_CODE),
                 )
                 .await;
+            return Err(REQUEST_EXPIRED_CODE.to_string());
+        }
+        IncomingRequestActionState::StaleNotification => {
             return Err(REQUEST_EXPIRED_CODE.to_string());
         }
         IncomingRequestActionState::Missing => return Ok(()),
@@ -181,7 +214,7 @@ async fn reject_pending_transfer(state: &Arc<AppState>, transfer_id: &str) -> Re
         let _ = sender.send(false);
         Ok(())
     } else {
-        match incoming_request_action_state(state, transfer_id).await {
+        match incoming_request_action_state(state, transfer_id, notification_id).await {
             IncomingRequestActionState::Expired => {
                 state
                     .mark_incoming_request_notification_inactive(
@@ -191,6 +224,7 @@ async fn reject_pending_transfer(state: &Arc<AppState>, transfer_id: &str) -> Re
                     .await;
                 Err(REQUEST_EXPIRED_CODE.to_string())
             }
+            IncomingRequestActionState::StaleNotification => Err(REQUEST_EXPIRED_CODE.to_string()),
             IncomingRequestActionState::Pending | IncomingRequestActionState::Missing => Ok(()),
         }
     }
@@ -199,6 +233,7 @@ async fn reject_pending_transfer(state: &Arc<AppState>, transfer_id: &str) -> Re
 async fn incoming_request_action_state(
     state: &Arc<AppState>,
     transfer_id: &str,
+    notification_id: &str,
 ) -> IncomingRequestActionState {
     let notification = state.incoming_request_notification(transfer_id).await;
     let transfer_status = {
@@ -207,17 +242,14 @@ async fn incoming_request_action_state(
     };
 
     match transfer_status {
-        Some(crate::state::TransferStatus::PendingAccept) => {
-            if notification
-                .as_ref()
-                .map(|entry| !entry.active)
-                .unwrap_or(false)
-            {
-                IncomingRequestActionState::Expired
-            } else {
-                IncomingRequestActionState::Pending
+        Some(TransferStatus::PendingAccept) => match notification {
+            Some(entry) if !entry.active => IncomingRequestActionState::Expired,
+            Some(entry) if entry.notification_id != notification_id => {
+                IncomingRequestActionState::StaleNotification
             }
-        }
+            Some(_) => IncomingRequestActionState::Pending,
+            None => IncomingRequestActionState::Missing,
+        },
         Some(_) => IncomingRequestActionState::Expired,
         None => {
             if notification
@@ -226,7 +258,15 @@ async fn incoming_request_action_state(
                 .unwrap_or(false)
             {
                 IncomingRequestActionState::Expired
-            } else if state.pending_accepts.read().await.contains_key(transfer_id) {
+            } else if notification
+                .as_ref()
+                .map(|entry| entry.notification_id != notification_id)
+                .unwrap_or(false)
+            {
+                IncomingRequestActionState::StaleNotification
+            } else if notification.is_some()
+                && state.pending_accepts.read().await.contains_key(transfer_id)
+            {
                 IncomingRequestActionState::Pending
             } else {
                 IncomingRequestActionState::Missing
@@ -251,6 +291,41 @@ async fn emit_request_expired(app: &AppHandle, state: &Arc<AppState>, transfer_i
         REQUEST_EXPIRED_PHASE,
         revision,
     );
+}
+
+async fn pending_incoming_requests(state: &Arc<AppState>) -> Vec<PendingIncomingRequestPayload> {
+    let notifications = state.incoming_request_notifications.read().await.clone();
+    let trusted = state.trusted_peers.read().await.clone();
+    let transfers = state.transfers.read().await;
+
+    let mut requests = transfers
+        .values()
+        .filter(|task| {
+            task.direction == TransferDirection::Receive
+                && task.status == TransferStatus::PendingAccept
+        })
+        .filter_map(|task| {
+            let notification = notifications.get(&task.id)?;
+            if !notification.active {
+                return None;
+            }
+
+            Some(PendingIncomingRequestPayload {
+                transfer_id: task.id.clone(),
+                batch_id: task.batch_id.clone(),
+                notification_id: notification.notification_id.clone(),
+                sender_name: task.peer_name.clone(),
+                sender_fp: task.peer_fingerprint.clone(),
+                trusted: trusted.contains_key(&task.peer_fingerprint),
+                items: task.items.clone(),
+                total_size: task.total_bytes,
+                revision: task.revision,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    requests.sort_by(|left, right| left.transfer_id.cmp(&right.transfer_id));
+    requests
 }
 
 fn select_retry_paths(task: &crate::state::TransferTask) -> Result<Vec<String>, String> {
@@ -294,6 +369,13 @@ pub async fn get_devices(state: AppStateRef<'_>) -> Result<Vec<DeviceView>, Stri
 pub async fn get_trusted_peers(state: AppStateRef<'_>) -> Result<Vec<TrustedPeerView>, String> {
     let trusted = state.trusted_peers.read().await;
     Ok(trusted.values().map(TrustedPeerView::from).collect())
+}
+
+#[tauri::command]
+pub async fn get_pending_incoming_requests(
+    state: AppStateRef<'_>,
+) -> Result<Vec<PendingIncomingRequestPayload>, String> {
+    Ok(pending_incoming_requests(&state).await)
 }
 
 #[tauri::command]
@@ -710,10 +792,11 @@ pub async fn connect_by_address(
 #[tauri::command]
 pub async fn accept_transfer(
     transfer_id: String,
+    notification_id: String,
     app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<(), String> {
-    let result = accept_pending_transfer(&state, &transfer_id).await;
+    let result = accept_pending_transfer(&state, &transfer_id, &notification_id).await;
     if matches!(result.as_ref(), Err(err) if err == REQUEST_EXPIRED_CODE) {
         emit_request_expired(&app, &state, &transfer_id).await;
     }
@@ -723,21 +806,29 @@ pub async fn accept_transfer(
 #[tauri::command]
 pub async fn accept_and_pair_transfer(
     transfer_id: String,
+    notification_id: String,
     sender_fp: String,
     app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<(), String> {
-    accept_transfer(transfer_id, app.clone(), State::clone(&state)).await?;
+    accept_transfer(
+        transfer_id,
+        notification_id,
+        app.clone(),
+        State::clone(&state),
+    )
+    .await?;
     pair_device(sender_fp, app, State::clone(&state)).await
 }
 
 #[tauri::command]
 pub async fn reject_transfer(
     transfer_id: String,
+    notification_id: String,
     app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<(), String> {
-    let result = reject_pending_transfer(&state, &transfer_id).await;
+    let result = reject_pending_transfer(&state, &transfer_id, &notification_id).await;
     if matches!(result.as_ref(), Err(err) if err == REQUEST_EXPIRED_CODE) {
         emit_request_expired(&app, &state, &transfer_id).await;
     }
@@ -812,6 +903,11 @@ async fn cancel_transfer_inner(transfer_id: &str, app: &AppHandle, state: &Arc<A
         cancelled = true;
     }
     drop(transfers);
+    if cancelled {
+        state
+            .mark_incoming_request_notification_inactive(transfer_id, Some("E_CANCELLED_BY_USER"))
+            .await;
+    }
     if let Some((direction, status, bytes)) = metrics_snapshot {
         state
             .record_transfer_terminal(&direction, &status, bytes)
@@ -896,8 +992,8 @@ mod diagnostics_tests {
 
     use super::{
         accept_pending_transfer, build_discovery_diagnostics, incoming_request_action_state,
-        reject_pending_transfer, select_retry_paths, windows_non_admin_firewall_hint,
-        IncomingRequestActionState, REQUEST_EXPIRED_CODE,
+        pending_incoming_requests, reject_pending_transfer, select_retry_paths,
+        windows_non_admin_firewall_hint, IncomingRequestActionState, REQUEST_EXPIRED_CODE,
     };
 
     fn build_test_state() -> Arc<crate::state::AppState> {
@@ -949,7 +1045,11 @@ mod diagnostics_tests {
             .ensure_incoming_request_notification(&transfer_id)
             .await;
 
-        accept_pending_transfer(&state, &transfer_id)
+        let notification_id = state
+            .ensure_incoming_request_notification(&transfer_id)
+            .await;
+
+        accept_pending_transfer(&state, &transfer_id, &notification_id)
             .await
             .expect("accept should succeed");
         let accepted = rx.await.expect("receiver should get value");
@@ -994,7 +1094,11 @@ mod diagnostics_tests {
             .ensure_incoming_request_notification(&transfer_id)
             .await;
 
-        reject_pending_transfer(&state, &transfer_id)
+        let notification_id = state
+            .ensure_incoming_request_notification(&transfer_id)
+            .await;
+
+        reject_pending_transfer(&state, &transfer_id, &notification_id)
             .await
             .expect("reject should succeed");
         let accepted = rx.await.expect("receiver should get value");
@@ -1029,7 +1133,7 @@ mod diagnostics_tests {
                 ended_at: None,
             },
         );
-        state
+        let notification_id = state
             .ensure_incoming_request_notification(&transfer_id)
             .await;
         state
@@ -1037,14 +1141,178 @@ mod diagnostics_tests {
             .await;
 
         assert_eq!(
-            incoming_request_action_state(&state, &transfer_id).await,
+            incoming_request_action_state(&state, &transfer_id, &notification_id).await,
             IncomingRequestActionState::Expired
         );
 
-        let err = accept_pending_transfer(&state, &transfer_id)
+        let err = accept_pending_transfer(&state, &transfer_id, &notification_id)
             .await
             .expect_err("expired request should fail");
         assert_eq!(err, REQUEST_EXPIRED_CODE);
+    }
+
+    #[tokio::test]
+    async fn stale_notification_binding_returns_request_expired() {
+        let state = build_test_state();
+        let transfer_id = "transfer-stale".to_string();
+        let (tx, _rx) = oneshot::channel::<bool>();
+        state
+            .pending_accepts
+            .write()
+            .await
+            .insert(transfer_id.clone(), tx);
+        state.transfers.write().await.insert(
+            transfer_id.clone(),
+            TransferTask {
+                id: transfer_id.clone(),
+                batch_id: None,
+                direction: TransferDirection::Receive,
+                peer_fingerprint: "fp".into(),
+                peer_name: "peer".into(),
+                items: vec![],
+                status: TransferStatus::PendingAccept,
+                bytes_transferred: 0,
+                total_bytes: 0,
+                revision: 0,
+                started_at_unix: 1,
+                ended_at_unix: None,
+                terminal_reason_code: None,
+                error: None,
+                source_paths: None,
+                source_path_by_file_id: None,
+                failed_file_ids: None,
+                conn: None,
+                ended_at: None,
+            },
+        );
+        let notification_id = state
+            .ensure_incoming_request_notification(&transfer_id)
+            .await;
+
+        let err = reject_pending_transfer(&state, &transfer_id, "stale-notification-id")
+            .await
+            .expect_err("stale notification should expire");
+        assert_eq!(err, REQUEST_EXPIRED_CODE);
+        let notification = state
+            .incoming_request_notification(&transfer_id)
+            .await
+            .expect("notification entry");
+        assert_eq!(notification.notification_id, notification_id);
+        assert!(notification.active);
+        assert!(state
+            .pending_accepts
+            .read()
+            .await
+            .contains_key(&transfer_id));
+    }
+
+    #[tokio::test]
+    async fn pending_incoming_requests_only_returns_active_receive_requests() {
+        let state = build_test_state();
+        let active_transfer_id = "incoming-active".to_string();
+        let inactive_transfer_id = "incoming-inactive".to_string();
+        let sender_transfer_id = "outgoing".to_string();
+
+        state.transfers.write().await.extend([
+            (
+                active_transfer_id.clone(),
+                TransferTask {
+                    id: active_transfer_id.clone(),
+                    batch_id: Some("batch-1".into()),
+                    direction: TransferDirection::Receive,
+                    peer_fingerprint: "peer-a".into(),
+                    peer_name: "Peer A".into(),
+                    items: vec![FileItemMeta {
+                        file_id: 1,
+                        name: "a.txt".into(),
+                        rel_path: "a.txt".into(),
+                        size: 12,
+                    }],
+                    status: TransferStatus::PendingAccept,
+                    bytes_transferred: 0,
+                    total_bytes: 12,
+                    revision: 4,
+                    started_at_unix: 1,
+                    ended_at_unix: None,
+                    terminal_reason_code: None,
+                    error: None,
+                    source_paths: None,
+                    source_path_by_file_id: None,
+                    failed_file_ids: None,
+                    conn: None,
+                    ended_at: None,
+                },
+            ),
+            (
+                inactive_transfer_id.clone(),
+                TransferTask {
+                    id: inactive_transfer_id.clone(),
+                    batch_id: None,
+                    direction: TransferDirection::Receive,
+                    peer_fingerprint: "peer-b".into(),
+                    peer_name: "Peer B".into(),
+                    items: vec![],
+                    status: TransferStatus::PendingAccept,
+                    bytes_transferred: 0,
+                    total_bytes: 1,
+                    revision: 2,
+                    started_at_unix: 1,
+                    ended_at_unix: None,
+                    terminal_reason_code: None,
+                    error: None,
+                    source_paths: None,
+                    source_path_by_file_id: None,
+                    failed_file_ids: None,
+                    conn: None,
+                    ended_at: None,
+                },
+            ),
+            (
+                sender_transfer_id.clone(),
+                TransferTask {
+                    id: sender_transfer_id,
+                    batch_id: None,
+                    direction: TransferDirection::Send,
+                    peer_fingerprint: "peer-c".into(),
+                    peer_name: "Peer C".into(),
+                    items: vec![],
+                    status: TransferStatus::PendingAccept,
+                    bytes_transferred: 0,
+                    total_bytes: 1,
+                    revision: 1,
+                    started_at_unix: 1,
+                    ended_at_unix: None,
+                    terminal_reason_code: None,
+                    error: None,
+                    source_paths: None,
+                    source_path_by_file_id: None,
+                    failed_file_ids: None,
+                    conn: None,
+                    ended_at: None,
+                },
+            ),
+        ]);
+
+        let active_notification_id = state
+            .ensure_incoming_request_notification(&active_transfer_id)
+            .await;
+        state
+            .ensure_incoming_request_notification(&inactive_transfer_id)
+            .await;
+        state
+            .mark_incoming_request_notification_inactive(
+                &inactive_transfer_id,
+                Some(REQUEST_EXPIRED_CODE),
+            )
+            .await;
+        state.add_trust("peer-a".into(), "Peer A".into()).await;
+
+        let pending = pending_incoming_requests(&state).await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].transfer_id, active_transfer_id);
+        assert_eq!(pending[0].batch_id.as_deref(), Some("batch-1"));
+        assert_eq!(pending[0].notification_id, active_notification_id);
+        assert!(pending[0].trusted);
     }
 
     #[test]

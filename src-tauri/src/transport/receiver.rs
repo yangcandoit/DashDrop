@@ -235,9 +235,13 @@ pub async fn handle_offer(
 
     // Emit incoming transfer event to frontend
     let trusted = state.is_trusted(&peer_fp).await;
+    let notification_id = state
+        .ensure_incoming_request_notification(&transfer_id)
+        .await;
     emit_transfer_incoming(
         &app,
         &transfer_id,
+        &notification_id,
         &offer.sender_name,
         &peer_fp,
         trusted,
@@ -254,10 +258,6 @@ pub async fn handle_offer(
         if should_auto_accept(trusted && peer_authenticated, auto_accept_enabled) {
             (true, false)
         } else {
-            state
-                .ensure_incoming_request_notification(&transfer_id)
-                .await;
-
             // Wait for user accept/reject
             let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
             {
@@ -960,6 +960,7 @@ async fn update_transfer_status(
 ) -> Option<u64> {
     let mut metrics_snapshot: Option<(TransferDirection, TransferStatus, u64)> = None;
     let mut terminal_snapshot: Option<crate::state::TransferTask> = None;
+    let mut notification_reason_code: Option<String> = None;
     let mut transfers = state.transfers.write().await;
     if let Some(t) = transfers.get_mut(&id) {
         let previous_status = t.status.clone();
@@ -1001,11 +1002,28 @@ async fn update_transfer_status(
                     metrics_snapshot =
                         Some((t.direction.clone(), t.status.clone(), t.bytes_transferred));
                 }
+                notification_reason_code = t.terminal_reason_code.clone();
             }
             _ => {}
         }
         let revision = t.revision;
         drop(transfers);
+        if matches!(
+            status,
+            TransferStatus::Completed
+                | TransferStatus::PartialCompleted
+                | TransferStatus::Failed
+                | TransferStatus::CancelledBySender
+                | TransferStatus::CancelledByReceiver
+                | TransferStatus::Rejected
+        ) {
+            state
+                .mark_incoming_request_notification_inactive(
+                    &id,
+                    notification_reason_code.as_deref(),
+                )
+                .await;
+        }
         if let Some((direction, terminal_status, bytes)) = metrics_snapshot {
             state
                 .record_transfer_terminal(&direction, &terminal_status, bytes)
