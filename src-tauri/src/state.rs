@@ -1,3 +1,4 @@
+use crate::persistence_progress::TransferProgressPersistence;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -276,6 +277,29 @@ pub struct TransferMetrics {
     pub failure_distribution: HashMap<String, u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct DeviceSloObservability {
+    pub remote_peer_online_at: Option<u64>,
+    pub local_device_visible_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct TransferSloObservability {
+    #[serde(default)]
+    pub peer_fingerprint: Option<String>,
+    pub sender_dispatch_at: Option<u64>,
+    pub receiver_prompted_at: Option<u64>,
+    pub receiver_fallback_prompted_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SloObservabilitySnapshot {
+    #[serde(default)]
+    pub devices: HashMap<String, DeviceSloObservability>,
+    #[serde(default)]
+    pub transfers: HashMap<String, TransferSloObservability>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeStatus {
     pub local_port: u16,
@@ -397,14 +421,21 @@ pub struct AppState {
     pub listener_addrs: Arc<RwLock<Vec<String>>>,
 
     /// SQLite Database for persistent transfer history.
-    pub db: std::sync::Mutex<rusqlite::Connection>,
+    pub db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+
+    /// Coalesced progress persistence coordinator.
+    pub progress_persistence: TransferProgressPersistence,
 
     /// Runtime transfer metrics.
     pub metrics: Arc<RwLock<TransferMetrics>>,
+
+    /// Local-only SLO observability timestamps for diagnostics and tests.
+    pub slo_observability: Arc<RwLock<SloObservabilitySnapshot>>,
 }
 
 impl AppState {
     pub fn new(identity: Identity, config: AppConfig, db: rusqlite::Connection) -> Self {
+        let db = Arc::new(std::sync::Mutex::new(db));
         AppState {
             identity,
             devices: Arc::new(RwLock::new(HashMap::new())),
@@ -436,8 +467,36 @@ impl AppState {
             listener_port_mode: Arc::new(RwLock::new(default_listener_port_mode())),
             firewall_rule_state: Arc::new(RwLock::new(default_firewall_rule_state())),
             listener_addrs: Arc::new(RwLock::new(Vec::new())),
-            db: std::sync::Mutex::new(db),
+            progress_persistence: TransferProgressPersistence::new(Arc::clone(&db)),
+            db,
             metrics: Arc::new(RwLock::new(TransferMetrics::default())),
+            slo_observability: Arc::new(RwLock::new(SloObservabilitySnapshot::default())),
+        }
+    }
+
+    pub async fn schedule_progress_persist(&self, task: &TransferTask) {
+        if let Err(error) = self.progress_persistence.schedule(task).await {
+            tracing::warn!(
+                transfer_id = %task.id,
+                revision = task.revision,
+                bytes_transferred = task.bytes_transferred,
+                status = ?task.status,
+                reason = %error,
+                "failed to enqueue coalesced progress persistence"
+            );
+        }
+    }
+
+    pub async fn flush_progress_persist_now(&self, task: &TransferTask) {
+        if let Err(error) = self.progress_persistence.flush_now(task).await {
+            tracing::warn!(
+                transfer_id = %task.id,
+                revision = task.revision,
+                bytes_transferred = task.bytes_transferred,
+                status = ?task.status,
+                reason = %error,
+                "failed to force progress persistence flush"
+            );
         }
     }
 
@@ -454,25 +513,120 @@ impl AppState {
             .unwrap_or(0)
     }
 
-    pub async fn ensure_incoming_request_notification(&self, transfer_id: &str) -> String {
-        let mut guard = self.incoming_request_notifications.write().await;
-        if let Some(existing) = guard.get_mut(transfer_id) {
-            existing.active = true;
-            existing.updated_at_unix = Self::now_unix();
-            return existing.notification_id.clone();
-        }
+    fn now_unix_millis() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
 
-        let notification_id = uuid::Uuid::new_v4().to_string();
-        guard.insert(
-            transfer_id.to_string(),
-            IncomingRequestNotification {
-                notification_id: notification_id.clone(),
-                transfer_id: transfer_id.to_string(),
-                active: true,
-                terminal_reason_code: None,
-                updated_at_unix: Self::now_unix(),
-            },
-        );
+    fn record_first_timestamp(slot: &mut Option<u64>, value: u64) {
+        if slot.is_none() {
+            *slot = Some(value);
+        }
+    }
+
+    async fn set_transfer_slo_peer_if_missing(
+        &self,
+        transfer_id: &str,
+        peer_fingerprint: Option<&str>,
+    ) {
+        let Some(peer_fingerprint) = peer_fingerprint else {
+            return;
+        };
+        let mut guard = self.slo_observability.write().await;
+        let entry = guard.transfers.entry(transfer_id.to_string()).or_default();
+        if entry.peer_fingerprint.is_none() {
+            entry.peer_fingerprint = Some(peer_fingerprint.to_string());
+        }
+    }
+
+    pub async fn record_device_visibility(&self, peer_fingerprint: &str) {
+        let observed_at = Self::now_unix_millis();
+        let mut guard = self.slo_observability.write().await;
+        let entry = guard
+            .devices
+            .entry(peer_fingerprint.to_string())
+            .or_default();
+        Self::record_first_timestamp(&mut entry.remote_peer_online_at, observed_at);
+        Self::record_first_timestamp(&mut entry.local_device_visible_at, observed_at);
+    }
+
+    pub async fn record_sender_dispatch(&self, transfer_id: &str, peer_fingerprint: &str) {
+        let observed_at = Self::now_unix_millis();
+        let mut guard = self.slo_observability.write().await;
+        let entry = guard.transfers.entry(transfer_id.to_string()).or_default();
+        if entry.peer_fingerprint.is_none() {
+            entry.peer_fingerprint = Some(peer_fingerprint.to_string());
+        }
+        Self::record_first_timestamp(&mut entry.sender_dispatch_at, observed_at);
+    }
+
+    pub async fn record_receiver_prompted(
+        &self,
+        transfer_id: &str,
+        peer_fingerprint: Option<&str>,
+    ) {
+        let observed_at = Self::now_unix_millis();
+        let mut guard = self.slo_observability.write().await;
+        let entry = guard.transfers.entry(transfer_id.to_string()).or_default();
+        if entry.peer_fingerprint.is_none() {
+            entry.peer_fingerprint = peer_fingerprint.map(str::to_string);
+        }
+        Self::record_first_timestamp(&mut entry.receiver_prompted_at, observed_at);
+    }
+
+    pub async fn record_receiver_fallback_prompted(
+        &self,
+        transfer_id: &str,
+        peer_fingerprint: &str,
+    ) {
+        let observed_at = Self::now_unix_millis();
+        let mut guard = self.slo_observability.write().await;
+        let entry = guard.transfers.entry(transfer_id.to_string()).or_default();
+        if entry.peer_fingerprint.is_none() {
+            entry.peer_fingerprint = Some(peer_fingerprint.to_string());
+        }
+        Self::record_first_timestamp(&mut entry.receiver_fallback_prompted_at, observed_at);
+    }
+
+    pub async fn slo_observability_snapshot(&self) -> SloObservabilitySnapshot {
+        self.slo_observability.read().await.clone()
+    }
+
+    pub async fn ensure_incoming_request_notification(&self, transfer_id: &str) -> String {
+        let notification_id = {
+            let mut guard = self.incoming_request_notifications.write().await;
+            if let Some(existing) = guard.get_mut(transfer_id) {
+                existing.active = true;
+                existing.updated_at_unix = Self::now_unix();
+                existing.notification_id.clone()
+            } else {
+                let notification_id = uuid::Uuid::new_v4().to_string();
+                guard.insert(
+                    transfer_id.to_string(),
+                    IncomingRequestNotification {
+                        notification_id: notification_id.clone(),
+                        transfer_id: transfer_id.to_string(),
+                        active: true,
+                        terminal_reason_code: None,
+                        updated_at_unix: Self::now_unix(),
+                    },
+                );
+                notification_id
+            }
+        };
+
+        let peer_fingerprint = {
+            let transfers = self.transfers.read().await;
+            transfers
+                .get(transfer_id)
+                .map(|task| task.peer_fingerprint.clone())
+        };
+        self.set_transfer_slo_peer_if_missing(transfer_id, peer_fingerprint.as_deref())
+            .await;
+        self.record_receiver_prompted(transfer_id, peer_fingerprint.as_deref())
+            .await;
         notification_id
     }
 
@@ -604,8 +758,8 @@ impl AppState {
 mod tests {
     use super::{
         default_firewall_rule_state, default_listener_port_mode, AppConfig, AppState, DeviceInfo,
-        FileConflictStrategy, Platform, ReachabilityStatus, SessionInfo, TransferDirection,
-        TransferStatus, TransferTask,
+        FileConflictStrategy, IncomingRequestNotification, Platform, ReachabilityStatus,
+        SessionInfo, TransferDirection, TransferStatus, TransferTask,
     };
     use crate::crypto::Identity;
     use serde_json::json;
@@ -737,5 +891,20 @@ mod tests {
         assert_eq!(task.batch_id, None);
         assert_eq!(task.direction, TransferDirection::Send);
         assert_eq!(task.status, TransferStatus::PendingAccept);
+    }
+
+    #[test]
+    fn notification_id_field_name_is_stable() {
+        let value = serde_json::to_value(IncomingRequestNotification {
+            notification_id: "notif-1".into(),
+            transfer_id: "transfer-1".into(),
+            active: true,
+            terminal_reason_code: Some("E_REQUEST_EXPIRED".into()),
+            updated_at_unix: 1,
+        })
+        .expect("serialize notification");
+
+        assert_eq!(value["notification_id"], json!("notif-1"));
+        assert!(value.get("notificationId").is_none());
     }
 }

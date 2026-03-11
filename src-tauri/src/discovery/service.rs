@@ -227,8 +227,12 @@ mod tests {
     fn filters_virtual_interface_names() {
         assert!(super::is_virtual_or_filtered_interface("utun4"));
         assert!(super::is_virtual_or_filtered_interface("awdl0"));
-        assert!(super::is_virtual_or_filtered_interface("Loopback Pseudo-Interface 1"));
-        assert!(super::is_virtual_or_filtered_interface("vEthernet (Default Switch)"));
+        assert!(super::is_virtual_or_filtered_interface(
+            "Loopback Pseudo-Interface 1"
+        ));
+        assert!(super::is_virtual_or_filtered_interface(
+            "vEthernet (Default Switch)"
+        ));
     }
 
     #[test]

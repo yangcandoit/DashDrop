@@ -375,6 +375,8 @@ pub async fn send_files_cmd(
     state: AppStateRef<'_>,
 ) -> Result<(), String> {
     let state = Arc::clone(&state);
+    let transfer_id = uuid::Uuid::new_v4().to_string();
+    state.record_sender_dispatch(&transfer_id, &peer_fp).await;
 
     // Get peer addresses
     let remote_addrs = {
@@ -453,7 +455,6 @@ pub async fn send_files_cmd(
     }
 
     // Spawn sender task
-    let transfer_id = uuid::Uuid::new_v4().to_string();
     let transfer_id_clone = transfer_id.clone();
     let retry_paths = path_bufs.clone();
     let retry_peer_fp = peer_fp.clone();
@@ -1205,6 +1206,55 @@ mod diagnostics_tests {
         assert_eq!(diagnostics["firewall_rule_state"], "user_scope_unmanaged");
     }
 
+    #[tokio::test]
+    async fn discovery_diagnostics_include_slo_observability_snapshot() {
+        let state = Arc::new(crate::state::AppState::new(
+            Identity {
+                fingerprint: "self-fp".into(),
+                cert_der: Vec::new(),
+                key_der: Vec::new(),
+                device_name: "Observer".into(),
+            },
+            AppConfig::default(),
+            rusqlite::Connection::open_in_memory().expect("in-memory db"),
+        ));
+
+        state.record_device_visibility("peer-fp").await;
+        state.record_sender_dispatch("transfer-1", "peer-fp").await;
+        state
+            .record_receiver_fallback_prompted("transfer-1", "peer-fp")
+            .await;
+
+        let diagnostics = build_discovery_diagnostics(
+            &state,
+            BeaconCadence {
+                power_profile: PowerProfile::Ac,
+                interval_secs: 3,
+            },
+        )
+        .await;
+
+        assert!(
+            diagnostics["slo_observability"]["devices"]["peer-fp"]["remote_peer_online_at"]
+                .as_u64()
+                .is_some()
+        );
+        assert!(
+            diagnostics["slo_observability"]["devices"]["peer-fp"]["local_device_visible_at"]
+                .as_u64()
+                .is_some()
+        );
+        assert!(
+            diagnostics["slo_observability"]["transfers"]["transfer-1"]["sender_dispatch_at"]
+                .as_u64()
+                .is_some()
+        );
+        assert!(diagnostics["slo_observability"]["transfers"]["transfer-1"]
+            ["receiver_fallback_prompted_at"]
+            .as_u64()
+            .is_some());
+    }
+
     #[test]
     fn windows_non_admin_hint_mentions_manual_firewall_steps() {
         let hint = windows_non_admin_firewall_hint(54001, "fallback_random");
@@ -1539,6 +1589,7 @@ async fn build_discovery_diagnostics(
     let firewall_rule_state = state.firewall_rule_state.read().await.clone();
     let listener_addrs = state.listener_addrs.read().await.clone();
     let network_interfaces = collect_network_interfaces();
+    let slo_observability = state.slo_observability_snapshot().await;
     let devices = state.devices.read().await;
 
     let device_rows: Vec<serde_json::Value> = devices.values().map(discovery_device_row).collect();
@@ -1647,6 +1698,7 @@ async fn build_discovery_diagnostics(
         "firewall_rule_state": firewall_rule_state,
         "listener_addrs": listener_addrs,
         "network_interfaces": network_interfaces,
+        "slo_observability": slo_observability,
         "browser_status": serde_json::json!({
             "active": browser_status.active,
             "restart_count": browser_status.restart_count,
