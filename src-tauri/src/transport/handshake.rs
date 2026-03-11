@@ -14,6 +14,28 @@ const OFFER_RATE_LIMIT_TRUSTED_PER_MIN: u32 = 60;
 const OFFER_RATE_LIMIT_UNTRUSTED_PER_MIN: u32 = 20;
 const CONNECTION_RATE_LIMIT_TRUSTED_PER_MIN: u32 = 400;
 const CONNECTION_RATE_LIMIT_UNTRUSTED_PER_MIN: u32 = 120;
+const HARD_REJECT_KNOWN_IDENTITY_MISMATCH: bool = false;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncomingIdentityMismatchAction {
+    AuditOnly,
+    Reject,
+}
+
+fn incoming_identity_mismatch_action(
+    expected_peer_fp: Option<&str>,
+    actual_peer_fp: Option<&str>,
+    hard_reject_known_identity_mismatch: bool,
+) -> IncomingIdentityMismatchAction {
+    match (expected_peer_fp, actual_peer_fp) {
+        (Some(expected), Some(actual))
+            if hard_reject_known_identity_mismatch && is_identity_mismatch(expected, actual) =>
+        {
+            IncomingIdentityMismatchAction::Reject
+        }
+        _ => IncomingIdentityMismatchAction::AuditOnly,
+    }
+}
 
 async fn reject_control_stream(
     send: &mut quinn::SendStream,
@@ -77,6 +99,11 @@ pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppSta
     if let Some((mdns_fp, session_id)) = mismatch {
         let remote_addr = conn.remote_address().to_string();
         let cert_fp = peer_cert_fp.as_deref().unwrap_or("unknown");
+        let mismatch_action = incoming_identity_mismatch_action(
+            Some(&mdns_fp),
+            peer_cert_fp.as_deref(),
+            HARD_REJECT_KNOWN_IDENTITY_MISMATCH,
+        );
         tracing::warn!(
             transfer_id = "",
             peer_fp = %mdns_fp,
@@ -147,6 +174,17 @@ pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppSta
                     );
                 }
             }
+        }
+
+        if mismatch_action == IncomingIdentityMismatchAction::Reject {
+            tracing::warn!(
+                peer_fp = %mdns_fp,
+                cert_fp = %cert_fp,
+                phase = "incoming",
+                "known-identity mismatch hit hard reject policy"
+            );
+            conn.close(quinn::VarInt::from_u32(1), b"identity mismatch");
+            return Ok(());
         }
     }
 
@@ -422,7 +460,9 @@ pub fn is_identity_mismatch(expected_peer_fp: &str, actual_peer_fp: &str) -> boo
 
 #[cfg(test)]
 mod tests {
-    use super::is_identity_mismatch;
+    use super::{
+        incoming_identity_mismatch_action, is_identity_mismatch, IncomingIdentityMismatchAction,
+    };
 
     #[test]
     fn detects_identity_mismatch() {
@@ -432,5 +472,21 @@ mod tests {
     #[test]
     fn accepts_matching_identity() {
         assert!(!is_identity_mismatch("same-fp", "same-fp"));
+    }
+
+    #[test]
+    fn known_identity_mismatch_extension_point_defaults_to_audit_only() {
+        assert_eq!(
+            incoming_identity_mismatch_action(Some("expected"), Some("actual"), false),
+            IncomingIdentityMismatchAction::AuditOnly
+        );
+    }
+
+    #[test]
+    fn known_identity_mismatch_extension_point_can_hard_reject() {
+        assert_eq!(
+            incoming_identity_mismatch_action(Some("expected"), Some("actual"), true),
+            IncomingIdentityMismatchAction::Reject
+        );
     }
 }

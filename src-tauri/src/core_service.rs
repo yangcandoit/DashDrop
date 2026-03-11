@@ -1093,6 +1093,7 @@ mod tests {
                 name: "file.txt".into(),
                 rel_path: "file.txt".into(),
                 size: 1,
+                risk_class: None,
             }],
             status,
             bytes_transferred: 0,
@@ -1404,12 +1405,14 @@ mod tests {
                 name: "a.txt".into(),
                 rel_path: "a.txt".into(),
                 size: 1,
+                risk_class: None,
             },
             FileItemMeta {
                 file_id: 2,
                 name: "b.txt".into(),
                 rel_path: "b.txt".into(),
                 size: 1,
+                risk_class: None,
             },
         ];
 

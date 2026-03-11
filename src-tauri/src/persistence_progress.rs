@@ -359,6 +359,7 @@ mod tests {
                 name: "file.bin".to_string(),
                 rel_path: "file.bin".to_string(),
                 size: 128,
+                risk_class: None,
             }],
             status,
             bytes_transferred,
