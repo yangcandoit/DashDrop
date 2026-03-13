@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "DashDrop — Fast, secure LAN file transfer"
 authors = ["DashDrop"]
 edition = "2021"
+default-run = "dashdrop"
 
 [lib]
 name = "dashdrop_lib"
@@ -13,7 +14,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
@@ -53,8 +54,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 parking_lot = "0.12"
 sysinfo = "0.38.3"
+libc = "0.2"
 tauri-plugin-notification = "2.3.3"
 tauri-plugin-store = "2.4.2"
+tauri-plugin-deep-link = "2"
 rusqlite = { version = "0.31", features = ["bundled"] }
 socket2 = "0.5"
 arboard = "3"
@@ -62,8 +65,29 @@ arboard = "3"
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7.0"
 
-[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
-keyring = "2.3.3"
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "4.3.0"
+futures-util = "0.3.30"
+tokio = { version = "1.37.0", features = ["full"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58.0", features = [
+    "Devices_Bluetooth",
+    "Devices_Bluetooth_Advertisement",
+    "Devices_WiFiDirect",
+    "Networking",
+    "Networking_Connectivity",
+    "Storage_Streams",
+    "Foundation",
+] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }
 
 [profile.release]
 opt-level = "s"

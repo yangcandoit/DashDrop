@@ -3,12 +3,7 @@ import { computed, ref, onMounted, onUnmounted } from 'vue';
 import {
   getTransferHistory,
   openTransferFolder,
-  onTransferCancelledByReceiver,
-  onTransferCancelledBySender,
-  onTransferComplete,
-  onTransferFailed,
-  onTransferPartial,
-  onTransferRejected,
+  subscribeRuntimeEvents,
 } from '../ipc';
 import type { TransferView } from '../types';
 
@@ -39,12 +34,21 @@ const load = async () => {
 onMounted(load);
 onMounted(async () => {
   unlistens.push(
-    await onTransferComplete(() => void load()),
-    await onTransferPartial(() => void load()),
-    await onTransferRejected(() => void load()),
-    await onTransferCancelledBySender(() => void load()),
-    await onTransferCancelledByReceiver(() => void load()),
-    await onTransferFailed(() => void load()),
+    await subscribeRuntimeEvents(
+      [
+        'daemon_control_plane_recovered',
+        'transfer_complete',
+        'transfer_partial',
+        'transfer_rejected',
+        'transfer_cancelled_by_sender',
+        'transfer_cancelled_by_receiver',
+        'transfer_failed',
+        'daemon_event_feed_resync_required',
+      ],
+      () => {
+        void load();
+      },
+    ),
   );
 });
 

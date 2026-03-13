@@ -1,87 +1,536 @@
 use crate::core_service::AppCoreService;
+use crate::daemon::client::LocalIpcClient;
 use crate::dto::{DeviceView, TransferView, TrustedPeerView};
-use crate::local_ipc::ConnectByAddressResult;
-use crate::state::{
-    AppState, DeviceInfo, FileItemMeta, Platform, ReachabilityStatus, TransferDirection,
-    TransferStatus,
+use crate::local_ipc::{
+    ConnectByAddressResult, LocalAuthContext, LocalIpcAccessGrant, LocalIpcCommand,
+    LocalIpcWireResponse, PendingIncomingRequestPayload,
 };
-use serde::Serialize;
+use crate::runtime::bootstrap::resolve_config_dir_from_base;
+use crate::state::{
+    AppState, DeviceInfo, Platform, ReachabilityStatus, RuntimeEventCheckpoint,
+    RuntimeEventFeedSnapshot, TrustVerificationMethod,
+};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tauri::{AppHandle, State};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::{AppHandle, Manager, State};
 
 type AppStateRef<'a> = State<'a, Arc<AppState>>;
 
-#[derive(Debug, Clone, Serialize)]
-pub struct PendingIncomingRequestPayload {
-    pub transfer_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub batch_id: Option<String>,
-    pub notification_id: String,
-    pub sender_name: String,
-    pub sender_fp: String,
-    pub trusted: bool,
-    pub items: Vec<FileItemMeta>,
-    pub total_size: u64,
-    pub revision: u64,
+const DAEMON_CONTROL_PLANE_MODE: &str = "daemon";
+const IN_PROCESS_CONTROL_PLANE_MODE: &str = "in_process";
+const DAEMON_PROXY_READ_RETRY_DELAYS_MS: &[u64] = &[0, 100, 250, 500];
+const DAEMON_PROXY_WRITE_RETRY_DELAYS_MS: &[u64] = &[0];
+const DAEMON_ACCESS_GRANT_EXPIRY_SKEW_MS: u64 = 5_000;
+
+#[derive(Debug, Clone)]
+struct CachedDaemonAccessGrant {
+    access_token: String,
+    expires_at_unix_ms: u64,
+    refresh_after_unix_ms: u64,
 }
-async fn pending_incoming_requests(state: &Arc<AppState>) -> Vec<PendingIncomingRequestPayload> {
-    let notifications = state.incoming_request_notifications.read().await.clone();
-    let trusted = state.trusted_peers.read().await.clone();
-    let transfers = state.transfers.read().await;
 
-    let mut requests = transfers
-        .values()
-        .filter(|task| {
-            task.direction == TransferDirection::Receive
-                && task.status == TransferStatus::PendingAccept
-        })
-        .filter_map(|task| {
-            let notification = notifications.get(&task.id)?;
-            if !notification.active {
-                return None;
+pub struct DaemonIpcAuthState {
+    cached_grant: Mutex<Option<CachedDaemonAccessGrant>>,
+}
+
+impl Default for DaemonIpcAuthState {
+    fn default() -> Self {
+        Self {
+            cached_grant: Mutex::new(None),
+        }
+    }
+}
+
+impl From<LocalIpcAccessGrant> for CachedDaemonAccessGrant {
+    fn from(grant: LocalIpcAccessGrant) -> Self {
+        Self {
+            access_token: grant.access_token,
+            expires_at_unix_ms: grant.expires_at_unix_ms,
+            refresh_after_unix_ms: grant.refresh_after_unix_ms,
+        }
+    }
+}
+
+impl CachedDaemonAccessGrant {
+    fn is_usable_at(&self, now_unix_ms: u64) -> bool {
+        now_unix_ms.saturating_add(DAEMON_ACCESS_GRANT_EXPIRY_SKEW_MS) < self.expires_at_unix_ms
+    }
+
+    fn should_refresh_at(&self, now_unix_ms: u64) -> bool {
+        now_unix_ms.saturating_add(DAEMON_ACCESS_GRANT_EXPIRY_SKEW_MS) >= self.refresh_after_unix_ms
+    }
+
+    fn auth_context(&self) -> LocalAuthContext {
+        LocalAuthContext {
+            access_token: Some(self.access_token.clone()),
+        }
+    }
+}
+
+fn now_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn env_flag(name: &str) -> Option<bool> {
+    std::env::var(name).ok().and_then(|value| {
+        let normalized = value.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    })
+}
+
+fn build_link_capabilities(
+    own_platform: &str,
+    ble_runtime_status: &crate::state::BleRuntimeStatus,
+) -> serde_json::Value {
+    let ble_baseline_enabled =
+        env_flag("DASHDROP_BLE_BASELINE_ENABLED").unwrap_or(cfg!(debug_assertions));
+    let ble_supported = matches!(own_platform, "Mac" | "Windows" | "Linux");
+    let provider_runtime_available = matches!(
+        ble_runtime_status.scanner_state.as_str(),
+        "hardware_ready_scaffold"
+            | "observing_capsules"
+            | "bridge_snapshot_ready"
+            | "bridge_scanning"
+            | "bridge_authorized_idle"
+    );
+    let ble_permission_state =
+        ble_runtime_status
+            .permission_state
+            .as_deref()
+            .unwrap_or(if !ble_supported {
+                "not_supported"
+            } else {
+                "not_requested"
+            });
+    let ble_runtime_available = ble_baseline_enabled
+        && ble_supported
+        && (env_flag("DASHDROP_BLE_RUNTIME_AVAILABLE").unwrap_or(false)
+            || provider_runtime_available
+            || ble_runtime_status.last_bridge_snapshot_at_unix_ms.is_some());
+    let single_radio_risk = env_flag("DASHDROP_SINGLE_RADIO_RISK").unwrap_or(false);
+    let softap_capable = matches!(own_platform, "Windows" | "Linux")
+        && env_flag("DASHDROP_SOFTAP_CAPABLE").unwrap_or(false);
+    let p2p_capable = matches!(own_platform, "Mac" | "Windows" | "Linux")
+        && env_flag("DASHDROP_P2P_CAPABLE").unwrap_or(false);
+
+    serde_json::json!({
+        "ble_baseline_enabled": ble_baseline_enabled,
+        "ble_supported": ble_supported,
+        "ble_permission_state": ble_permission_state,
+        "ble_runtime_available": ble_runtime_available,
+        "single_radio_risk": single_radio_risk,
+        "softap_capable": softap_capable,
+        "p2p_capable": p2p_capable,
+        "rolling_identifier_mode": if ble_baseline_enabled { "planned_ephemeral" } else { "disabled" },
+        "ephemeral_capsule_mode": if ble_baseline_enabled { "diagnostics_only" } else { "disabled" },
+        "fallback_mode": "qr_or_short_code",
+        "provider_name": ble_runtime_status.provider_name,
+        "scanner_state": ble_runtime_status.scanner_state,
+        "advertiser_state": ble_runtime_status.advertiser_state,
+        "bridge_mode": ble_runtime_status.bridge_mode,
+        "bridge_file_path": ble_runtime_status.bridge_file_path,
+        "advertisement_file_path": ble_runtime_status.advertisement_file_path,
+        "last_started_at_unix_ms": ble_runtime_status.last_started_at_unix_ms,
+        "last_error": ble_runtime_status.last_error,
+        "last_capsule_ingested_at_unix_ms": ble_runtime_status.last_capsule_ingested_at_unix_ms,
+        "last_observation_prune_at_unix_ms": ble_runtime_status.last_observation_prune_at_unix_ms,
+        "last_bridge_snapshot_at_unix_ms": ble_runtime_status.last_bridge_snapshot_at_unix_ms,
+        "last_advertisement_request_at_unix_ms": ble_runtime_status.last_advertisement_request_at_unix_ms,
+        "advertised_rolling_identifier": ble_runtime_status.advertised_rolling_identifier,
+        "notes": [
+            "BLE baseline exposes capability and diagnostics only in this release line.",
+            "QUIC/TLS fingerprint verification remains the source of identity truth until BLE assist is promoted from diagnostics."
+        ],
+    })
+}
+
+fn daemon_ipc_auth_state(app: &AppHandle) -> Result<State<'_, DaemonIpcAuthState>, String> {
+    app.try_state::<DaemonIpcAuthState>()
+        .ok_or_else(|| "daemon IPC auth state unavailable".to_string())
+}
+
+fn cached_daemon_access_grant(app: &AppHandle) -> Result<Option<CachedDaemonAccessGrant>, String> {
+    let auth_state = daemon_ipc_auth_state(app)?;
+    let guard = auth_state
+        .cached_grant
+        .lock()
+        .map_err(|_| "daemon IPC auth cache lock poisoned".to_string())?;
+    Ok(guard.clone())
+}
+
+fn set_cached_daemon_access_grant(
+    app: &AppHandle,
+    grant: Option<CachedDaemonAccessGrant>,
+) -> Result<(), String> {
+    let auth_state = daemon_ipc_auth_state(app)?;
+    let mut guard = auth_state
+        .cached_grant
+        .lock()
+        .map_err(|_| "daemon IPC auth cache lock poisoned".to_string())?;
+    *guard = grant;
+    Ok(())
+}
+
+fn clear_cached_daemon_access_grant(app: &AppHandle) -> Result<(), String> {
+    set_cached_daemon_access_grant(app, None)
+}
+
+async fn issue_daemon_access_grant(
+    app: &AppHandle,
+    current_access_token: Option<&str>,
+) -> Result<CachedDaemonAccessGrant, String> {
+    let client = daemon_client_for_app(app)?;
+    let grant = client
+        .issue_access_grant(current_access_token)
+        .await
+        .map_err(|err| format!("failed to issue daemon access token: {err:#}"))?;
+    let cached = CachedDaemonAccessGrant::from(grant);
+    set_cached_daemon_access_grant(app, Some(cached.clone()))?;
+    Ok(cached)
+}
+
+pub async fn revoke_cached_daemon_access_grant(app: &AppHandle) -> Result<(), String> {
+    let Some(grant) = cached_daemon_access_grant(app)? else {
+        return Ok(());
+    };
+    clear_cached_daemon_access_grant(app)?;
+
+    if !should_proxy_via_daemon(app) {
+        return Ok(());
+    }
+
+    let client = daemon_client_for_app(app)?;
+    client
+        .revoke_access_grant(&grant.access_token)
+        .await
+        .map_err(|err| format!("failed to revoke daemon access token: {err:#}"))
+}
+
+pub async fn best_effort_revoke_cached_daemon_access_grant(app: &AppHandle) {
+    if app.try_state::<DaemonIpcAuthState>().is_none() {
+        return;
+    }
+
+    if let Err(err) = revoke_cached_daemon_access_grant(app).await {
+        tracing::warn!("failed to revoke cached daemon access token during shutdown: {err}");
+    }
+}
+
+async fn daemon_access_grant_for_command(
+    app: &AppHandle,
+    force_refresh: bool,
+) -> Result<CachedDaemonAccessGrant, String> {
+    let now_unix_ms = now_unix_millis();
+    let cached = cached_daemon_access_grant(app)?;
+
+    if let Some(grant) = cached {
+        if !force_refresh
+            && grant.is_usable_at(now_unix_ms)
+            && !grant.should_refresh_at(now_unix_ms)
+        {
+            return Ok(grant);
+        }
+
+        if !force_refresh && grant.is_usable_at(now_unix_ms) {
+            match issue_daemon_access_grant(app, Some(&grant.access_token)).await {
+                Ok(fresh) => return Ok(fresh),
+                Err(err) => {
+                    tracing::warn!(
+                        command_auth_refresh = true,
+                        "failed to refresh daemon access token, falling back to cached grant: {err}"
+                    );
+                    return Ok(grant);
+                }
             }
+        }
+    }
 
-            Some(PendingIncomingRequestPayload {
-                transfer_id: task.id.clone(),
-                batch_id: task.batch_id.clone(),
-                notification_id: notification.notification_id.clone(),
-                sender_name: task.peer_name.clone(),
-                sender_fp: task.peer_fingerprint.clone(),
-                trusted: trusted.contains_key(&task.peer_fingerprint),
-                items: task.items.clone(),
-                total_size: task.total_bytes,
-                revision: task.revision,
-            })
-        })
-        .collect::<Vec<_>>();
+    issue_daemon_access_grant(app, None).await
+}
 
-    requests.sort_by(|left, right| left.transfer_id.cmp(&right.transfer_id));
-    requests
+fn env_control_plane_mode() -> Option<String> {
+    std::env::var("DASHDROP_CONTROL_PLANE_MODE")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_control_plane_mode(value: Option<&str>) -> Option<&'static str> {
+    match value.map(|raw| raw.trim().to_ascii_lowercase()) {
+        Some(mode) if mode == DAEMON_CONTROL_PLANE_MODE => Some(DAEMON_CONTROL_PLANE_MODE),
+        Some(mode) if mode == IN_PROCESS_CONTROL_PLANE_MODE => Some(IN_PROCESS_CONTROL_PLANE_MODE),
+        _ => None,
+    }
+}
+
+fn control_plane_mode_from_sources(
+    state_mode: Option<&str>,
+    env_mode: Option<&str>,
+) -> &'static str {
+    normalize_control_plane_mode(state_mode)
+        .or_else(|| normalize_control_plane_mode(env_mode))
+        .unwrap_or(IN_PROCESS_CONTROL_PLANE_MODE)
+}
+
+fn control_plane_mode_for_app(app: &AppHandle) -> String {
+    let state_mode = app.try_state::<Arc<AppState>>().and_then(|state| {
+        let mode =
+            tauri::async_runtime::block_on(async { state.control_plane_mode.read().await.clone() });
+        if mode.trim().is_empty() {
+            None
+        } else {
+            Some(mode)
+        }
+    });
+    control_plane_mode_from_sources(state_mode.as_deref(), env_control_plane_mode().as_deref())
+        .to_string()
+}
+
+fn should_proxy_via_daemon(app: &AppHandle) -> bool {
+    control_plane_mode_for_app(app) == DAEMON_CONTROL_PLANE_MODE
+}
+
+fn daemon_client_for_app(app: &AppHandle) -> Result<LocalIpcClient, String> {
+    let base_config_dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| format!("failed to resolve app config directory: {e}"))?;
+    let config_dir = resolve_config_dir_from_base(Some(base_config_dir))
+        .map_err(|e| format!("failed to resolve control-plane config dir: {e:#}"))?;
+    Ok(LocalIpcClient::from_config_dir(&config_dir))
+}
+
+fn payload_from_response(response: LocalIpcWireResponse) -> Result<serde_json::Value, String> {
+    match response {
+        LocalIpcWireResponse::Ok(ok) => Ok(ok.payload.unwrap_or(serde_json::Value::Null)),
+        LocalIpcWireResponse::Err(err) => Err(format!(
+            "daemon control-plane request failed: {} ({})",
+            err.error.message, err.error.code
+        )),
+    }
+}
+
+fn parse_payload_field<T>(payload: serde_json::Value, field: &str) -> Result<T, String>
+where
+    T: for<'de> serde::Deserialize<'de>,
+{
+    let value = payload
+        .as_object()
+        .and_then(|object| object.get(field))
+        .cloned()
+        .ok_or_else(|| format!("daemon response missing payload.{field}"))?;
+    serde_json::from_value(value)
+        .map_err(|err| format!("daemon response payload.{field} is invalid: {err}"))
+}
+
+fn parse_payload<T>(payload: serde_json::Value) -> Result<T, String>
+where
+    T: for<'de> serde::Deserialize<'de>,
+{
+    serde_json::from_value(payload)
+        .map_err(|err| format!("daemon response payload is invalid: {err}"))
+}
+
+async fn proxy_command_payload_with_retries(
+    app: &AppHandle,
+    command: LocalIpcCommand,
+    retry_delays_ms: &[u64],
+) -> Result<Option<serde_json::Value>, String> {
+    if !should_proxy_via_daemon(app) {
+        return Ok(None);
+    }
+
+    let client = daemon_client_for_app(app)?;
+    let mut last_error = None;
+    let requires_auth = command.requires_auth();
+
+    for (attempt_index, delay_ms) in retry_delays_ms.iter().enumerate() {
+        if *delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
+        }
+
+        let mut retried_after_unauthorized = false;
+
+        loop {
+            let response = if requires_auth {
+                let grant =
+                    daemon_access_grant_for_command(app, retried_after_unauthorized).await?;
+                client
+                    .send_envelope(command.to_wire_request(
+                        uuid::Uuid::new_v4().to_string(),
+                        Some(grant.auth_context()),
+                    ))
+                    .await
+            } else {
+                client.send(command.clone()).await
+            };
+
+            match response {
+                Ok(response @ LocalIpcWireResponse::Ok(_)) => {
+                    return Ok(Some(payload_from_response(response)?));
+                }
+                Ok(LocalIpcWireResponse::Err(err))
+                    if requires_auth
+                        && err.error.code == "unauthorized"
+                        && !retried_after_unauthorized =>
+                {
+                    clear_cached_daemon_access_grant(app)?;
+                    retried_after_unauthorized = true;
+                    tracing::warn!(
+                        attempt = attempt_index + 1,
+                        command = command.name(),
+                        "daemon access token rejected; refreshing and retrying request"
+                    );
+                }
+                Ok(LocalIpcWireResponse::Err(err)) => {
+                    return Err(format!(
+                        "daemon control-plane request failed: {} ({})",
+                        err.error.message, err.error.code
+                    ));
+                }
+                Err(err) => {
+                    last_error = Some(format!("{err:#}"));
+                    tracing::warn!(
+                        attempt = attempt_index + 1,
+                        command = command.name(),
+                        "daemon control-plane connect attempt failed"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    let attempts = retry_delays_ms.len();
+    let detail = last_error.unwrap_or_else(|| "unknown local IPC error".to_string());
+    let response =
+        format!("daemon control-plane connect failed after {attempts} attempt(s): {detail}");
+    Err(response)
+}
+
+async fn proxy_read<T>(
+    app: &AppHandle,
+    command: LocalIpcCommand,
+    field: &str,
+) -> Result<Option<T>, String>
+where
+    T: for<'de> serde::Deserialize<'de>,
+{
+    let Some(payload) =
+        proxy_command_payload_with_retries(app, command, DAEMON_PROXY_READ_RETRY_DELAYS_MS).await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(parse_payload_field(payload, field)?))
+}
+
+async fn proxy_write_result<T>(
+    app: &AppHandle,
+    command: LocalIpcCommand,
+    field: &str,
+) -> Result<Option<T>, String>
+where
+    T: for<'de> serde::Deserialize<'de>,
+{
+    let Some(payload) =
+        proxy_command_payload_with_retries(app, command, DAEMON_PROXY_WRITE_RETRY_DELAYS_MS)
+            .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(parse_payload_field(payload, field)?))
+}
+
+async fn proxy_ack(app: &AppHandle, command: LocalIpcCommand) -> Result<bool, String> {
+    Ok(
+        proxy_command_payload_with_retries(app, command, DAEMON_PROXY_WRITE_RETRY_DELAYS_MS)
+            .await?
+            .is_some(),
+    )
+}
+
+async fn pending_incoming_requests(
+    state: &Arc<AppState>,
+) -> Result<Vec<PendingIncomingRequestPayload>, String> {
+    AppCoreService::new(Arc::clone(state))
+        .get_pending_incoming_requests()
+        .await
 }
 // ─── Device commands ────────────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn get_devices(state: AppStateRef<'_>) -> Result<Vec<DeviceView>, String> {
+pub async fn get_devices(
+    app: AppHandle,
+    state: AppStateRef<'_>,
+) -> Result<Vec<DeviceView>, String> {
+    if let Some(devices) =
+        proxy_read::<Vec<DeviceView>>(&app, LocalIpcCommand::DiscoverList, "devices").await?
+    {
+        return Ok(devices);
+    }
     let devices = state.devices.read().await;
     Ok(devices.values().map(DeviceView::from).collect())
 }
 
 #[tauri::command]
-pub async fn get_trusted_peers(state: AppStateRef<'_>) -> Result<Vec<TrustedPeerView>, String> {
+pub async fn get_trusted_peers(
+    app: AppHandle,
+    state: AppStateRef<'_>,
+) -> Result<Vec<TrustedPeerView>, String> {
+    if let Some(trusted) =
+        proxy_read::<Vec<TrustedPeerView>>(&app, LocalIpcCommand::TrustList, "trusted_peers")
+            .await?
+    {
+        return Ok(trusted);
+    }
     let trusted = state.trusted_peers.read().await;
     Ok(trusted.values().map(TrustedPeerView::from).collect())
 }
 
 #[tauri::command]
 pub async fn get_pending_incoming_requests(
+    app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<Vec<PendingIncomingRequestPayload>, String> {
-    Ok(pending_incoming_requests(&state).await)
+    if let Some(requests) = proxy_read::<Vec<PendingIncomingRequestPayload>>(
+        &app,
+        LocalIpcCommand::TransferPendingIncoming,
+        "requests",
+    )
+    .await?
+    {
+        return Ok(requests);
+    }
+    pending_incoming_requests(&state).await
+}
+
+#[tauri::command]
+pub fn get_control_plane_mode(app: AppHandle) -> String {
+    control_plane_mode_for_app(&app)
 }
 
 #[tauri::command]
 pub async fn pair_device(fp: String, app: AppHandle, state: AppStateRef<'_>) -> Result<(), String> {
+    if proxy_ack(
+        &app,
+        LocalIpcCommand::TrustPair {
+            fingerprint: fp.clone(),
+        },
+    )
+    .await?
+    {
+        return Ok(());
+    }
     let service = AppCoreService::with_app(Arc::clone(&state), app);
     service.pair_device(&fp).await
 }
@@ -92,6 +541,16 @@ pub async fn unpair_device(
     app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<(), String> {
+    if proxy_ack(
+        &app,
+        LocalIpcCommand::TrustUnpair {
+            fingerprint: fp.clone(),
+        },
+    )
+    .await?
+    {
+        return Ok(());
+    }
     let service = AppCoreService::with_app(Arc::clone(&state), app);
     service.unpair_device(&fp).await
 }
@@ -103,8 +562,45 @@ pub async fn set_trusted_alias(
     _app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<(), String> {
+    if proxy_ack(
+        &_app,
+        LocalIpcCommand::TrustSetAlias {
+            fingerprint: fp.clone(),
+            alias: alias.clone(),
+        },
+    )
+    .await?
+    {
+        return Ok(());
+    }
     let service = AppCoreService::with_app(Arc::clone(&state), _app);
     service.set_trusted_alias(&fp, alias).await
+}
+
+#[tauri::command]
+pub async fn confirm_trusted_peer_verification(
+    fp: String,
+    verification_method: TrustVerificationMethod,
+    mutual_confirmation: bool,
+    app: AppHandle,
+    state: AppStateRef<'_>,
+) -> Result<(), String> {
+    if proxy_ack(
+        &app,
+        LocalIpcCommand::TrustConfirmVerification {
+            fingerprint: fp.clone(),
+            verification_method: verification_method.clone(),
+            mutual_confirmation,
+        },
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    let service = AppCoreService::with_app(Arc::clone(&state), app);
+    service
+        .confirm_trusted_peer_verification(&fp, verification_method, mutual_confirmation)
+        .await
 }
 
 // ─── Transfer commands ───────────────────────────────────────────────────────
@@ -116,6 +612,17 @@ pub async fn send_files_cmd(
     app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<(), String> {
+    if proxy_ack(
+        &app,
+        LocalIpcCommand::TransferSend {
+            peer_fingerprint: peer_fp.clone(),
+            paths: paths.clone(),
+        },
+    )
+    .await?
+    {
+        return Ok(());
+    }
     let service = AppCoreService::with_app(Arc::clone(&state), app);
     service.send_files(peer_fp, paths).await
 }
@@ -126,6 +633,17 @@ pub async fn connect_by_address(
     app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<ConnectByAddressResult, String> {
+    if let Some(result) = proxy_write_result::<ConnectByAddressResult>(
+        &app,
+        LocalIpcCommand::DiscoverConnectByAddress {
+            address: address.clone(),
+        },
+        "result",
+    )
+    .await?
+    {
+        return Ok(result);
+    }
     let service = AppCoreService::with_app(Arc::clone(&state), app);
     service.connect_by_address(address).await
 }
@@ -137,8 +655,21 @@ pub async fn accept_transfer(
     app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<(), String> {
+    if proxy_ack(
+        &app,
+        LocalIpcCommand::TransferAccept {
+            transfer_id: transfer_id.clone(),
+            notification_id: notification_id.clone(),
+        },
+    )
+    .await?
+    {
+        return Ok(());
+    }
     let service = AppCoreService::with_app(Arc::clone(&state), app);
-    service.accept_transfer(&transfer_id, &notification_id).await
+    service
+        .accept_transfer(&transfer_id, &notification_id)
+        .await
 }
 
 #[tauri::command]
@@ -166,8 +697,21 @@ pub async fn reject_transfer(
     app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<(), String> {
+    if proxy_ack(
+        &app,
+        LocalIpcCommand::TransferReject {
+            transfer_id: transfer_id.clone(),
+            notification_id: notification_id.clone(),
+        },
+    )
+    .await?
+    {
+        return Ok(());
+    }
     let service = AppCoreService::with_app(Arc::clone(&state), app);
-    service.reject_transfer(&transfer_id, &notification_id).await
+    service
+        .reject_transfer(&transfer_id, &notification_id)
+        .await
 }
 
 #[tauri::command]
@@ -176,12 +720,27 @@ pub async fn cancel_transfer(
     app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<(), String> {
+    if proxy_ack(
+        &app,
+        LocalIpcCommand::TransferCancel {
+            transfer_id: transfer_id.clone(),
+        },
+    )
+    .await?
+    {
+        return Ok(());
+    }
     let service = AppCoreService::with_app(Arc::clone(&state), app);
     service.cancel_transfer(&transfer_id).await
 }
 
 #[tauri::command]
 pub async fn cancel_all_transfers(app: AppHandle, state: AppStateRef<'_>) -> Result<u32, String> {
+    if let Some(count) =
+        proxy_write_result::<u32>(&app, LocalIpcCommand::TransferCancelAll, "count").await?
+    {
+        return Ok(count);
+    }
     let service = AppCoreService::with_app(Arc::clone(&state), app);
     service.cancel_all_transfers().await
 }
@@ -192,17 +751,32 @@ pub async fn retry_transfer(
     app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<(), String> {
+    if proxy_ack(
+        &app,
+        LocalIpcCommand::TransferRetry {
+            transfer_id: transfer_id.clone(),
+        },
+    )
+    .await?
+    {
+        return Ok(());
+    }
     let service = AppCoreService::with_app(Arc::clone(&state), app);
     service.retry_transfer(&transfer_id).await
 }
 
 #[cfg(test)]
 mod diagnostics_tests {
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::crypto::Identity;
     use crate::discovery::beacon::{BeaconCadence, PowerProfile};
-    use crate::state::AppConfig;
+    use crate::state::{
+        AppConfig, RuntimeEventCheckpoint, RUNTIME_EVENT_CHECKPOINT_ACTIVE_THRESHOLD_MS,
+        RUNTIME_EVENT_CHECKPOINT_STALE_THRESHOLD_MS,
+    };
 
     use super::{build_discovery_diagnostics, windows_non_admin_firewall_hint};
 
@@ -327,6 +901,638 @@ mod diagnostics_tests {
             .is_some());
     }
 
+    #[tokio::test]
+    async fn discovery_diagnostics_include_runtime_event_replay_snapshot() {
+        let state = Arc::new(crate::state::AppState::new(
+            Identity {
+                fingerprint: "self-fp".into(),
+                cert_der: Vec::new(),
+                key_der: Vec::new(),
+                device_name: "Observer".into(),
+            },
+            AppConfig::default(),
+            rusqlite::Connection::open_in_memory().expect("in-memory db"),
+        ));
+
+        let event = state.record_runtime_event("device_updated", serde_json::json!({ "index": 1 }));
+        state
+            .save_runtime_event_checkpoint("shared-ui", &state.runtime_event_generation, event.seq)
+            .await
+            .expect("save checkpoint");
+
+        let diagnostics = build_discovery_diagnostics(
+            &state,
+            BeaconCadence {
+                power_profile: PowerProfile::Ac,
+                interval_secs: 3,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["latest_seq"].as_u64(),
+            Some(event.seq)
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["memory_window_capacity"].as_u64(),
+            Some(crate::state::RUNTIME_EVENT_FEED_CAPACITY as u64)
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["persisted_window_capacity"].as_u64(),
+            Some(crate::state::RUNTIME_EVENT_PERSISTED_JOURNAL_CAPACITY as u64)
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["persisted_window_max_capacity"].as_u64(),
+            Some(crate::state::RUNTIME_EVENT_PERSISTED_JOURNAL_MAX_CAPACITY as u64)
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["persisted_segment_size"].as_u64(),
+            Some(crate::state::RUNTIME_EVENT_PERSISTED_SEGMENT_SIZE as u64)
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["persisted_segment_count"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["compacted_segment_count"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["compaction_watermark_seq"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["compaction_watermark_segment_id"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["checkpoint_count"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["active_checkpoint_count"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["checkpoints"][0]["consumer_id"].as_str(),
+            Some("shared-ui")
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["checkpoints"][0]["recovery_state"].as_str(),
+            Some("up_to_date")
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["metrics"]["checkpoint_saves"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["checkpoint_heartbeat_interval_ms"].as_u64(),
+            Some(crate::state::RUNTIME_EVENT_CHECKPOINT_HEARTBEAT_INTERVAL_MS)
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["retention_mode"].as_str(),
+            Some("baseline")
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["oldest_recoverable_seq"].as_u64(),
+            Some(event.seq)
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["retention_cutoff_reason"].as_str(),
+            Some("baseline_capacity")
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["persisted_journal_health"].as_str(),
+            Some("available")
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["retention_pinned_checkpoint_count"].as_u64(),
+            Some(1)
+        );
+        assert!(
+            diagnostics["runtime_event_replay"]["checkpoints"][0]["lease_expires_at_unix_ms"]
+                .as_u64()
+                .is_some()
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["checkpoints"][0]["consumer_recovery_mode"]
+                .as_str(),
+            Some("incremental_catch_up")
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["checkpoints"][0]["recovery_safety"].as_str(),
+            Some("safe_incremental")
+        );
+        assert_eq!(
+            diagnostics["transfer_progress_persistence"]["flush_interval_ms"].as_u64(),
+            Some(3_000)
+        );
+        assert_eq!(
+            diagnostics["transfer_progress_persistence"]["flush_threshold_bytes"].as_u64(),
+            Some(32 * 1024 * 1024)
+        );
+        assert_eq!(
+            diagnostics["transfer_progress_persistence"]["successful_writes"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            diagnostics["link_capabilities"]["fallback_mode"].as_str(),
+            Some("qr_or_short_code")
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_diagnostics_include_ble_assist_observation_snapshot() {
+        let state = Arc::new(crate::state::AppState::new(
+            Identity {
+                fingerprint: "self-fp".into(),
+                cert_der: Vec::new(),
+                key_der: Vec::new(),
+                device_name: "Observer".into(),
+            },
+            AppConfig::default(),
+            rusqlite::Connection::open_in_memory().expect("in-memory db"),
+        ));
+        state
+            .mark_ble_runtime_started("noop", "idle_noop", "capsule_preview_only")
+            .await;
+        let observed_at = super::now_unix_millis();
+        state
+            .record_ble_assist_observation(&crate::ble::BleAssistCapsule {
+                version: 1,
+                issued_at_unix_ms: observed_at,
+                expires_at_unix_ms: observed_at.saturating_add(60_000),
+                rolling_identifier: "capsule-1".into(),
+                integrity_tag: "tag-1".into(),
+                transport_hint: "qr_or_short_code_fallback".into(),
+                qr_fallback_available: true,
+                short_code_fallback_available: true,
+                rotation_window_ms: 30_000,
+            })
+            .await;
+
+        let diagnostics = build_discovery_diagnostics(
+            &state,
+            BeaconCadence {
+                power_profile: PowerProfile::Ac,
+                interval_secs: 3,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            diagnostics["link_capabilities"]["observed_capsule_count"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            diagnostics["link_capabilities"]["recent_capsules"][0]["rolling_identifier"].as_str(),
+            Some("capsule-1")
+        );
+        assert_eq!(
+            diagnostics["link_capabilities"]["provider_name"].as_str(),
+            Some("noop")
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_diagnostics_include_ble_bridge_snapshot_metadata() {
+        let state = Arc::new(crate::state::AppState::new(
+            Identity {
+                fingerprint: "self-fp".into(),
+                cert_der: Vec::new(),
+                key_der: Vec::new(),
+                device_name: "Observer".into(),
+            },
+            AppConfig::default(),
+            rusqlite::Connection::open_in_memory().expect("in-memory db"),
+        ));
+        state
+            .mark_ble_runtime_started(
+                "macos_native",
+                "bridge_authorized_idle",
+                "scaffold_unimplemented",
+            )
+            .await;
+        state
+            .update_ble_runtime_bridge(
+                Some("granted".into()),
+                Some("json_file_bridge".into()),
+                Some("/tmp/dashdrop-ble-bridge.json".into()),
+                Some(1_700_000_000_000),
+                Some("bridge-roll".into()),
+            )
+            .await;
+        state
+            .update_ble_runtime_advertisement(
+                Some("/tmp/dashdrop-ble-advertisement.json".into()),
+                Some(1_700_000_000_100),
+                Some("request-roll".into()),
+            )
+            .await;
+
+        let diagnostics = build_discovery_diagnostics(
+            &state,
+            BeaconCadence {
+                power_profile: PowerProfile::Ac,
+                interval_secs: 3,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            diagnostics["link_capabilities"]["ble_permission_state"].as_str(),
+            Some("granted")
+        );
+        assert_eq!(
+            diagnostics["link_capabilities"]["bridge_mode"].as_str(),
+            Some("json_file_bridge")
+        );
+        assert_eq!(
+            diagnostics["link_capabilities"]["bridge_file_path"].as_str(),
+            Some("/tmp/dashdrop-ble-bridge.json")
+        );
+        assert_eq!(
+            diagnostics["link_capabilities"]["last_bridge_snapshot_at_unix_ms"].as_u64(),
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(
+            diagnostics["link_capabilities"]["advertisement_file_path"].as_str(),
+            Some("/tmp/dashdrop-ble-advertisement.json")
+        );
+        assert_eq!(
+            diagnostics["link_capabilities"]["last_advertisement_request_at_unix_ms"].as_u64(),
+            Some(1_700_000_000_100)
+        );
+        assert_eq!(
+            diagnostics["link_capabilities"]["advertised_rolling_identifier"].as_str(),
+            Some("request-roll")
+        );
+        assert_eq!(
+            diagnostics["link_capabilities"]["ble_runtime_available"].as_bool(),
+            Some(cfg!(debug_assertions))
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_diagnostics_include_last_replay_source_and_resync_reason() {
+        let state = Arc::new(crate::state::AppState::new(
+            Identity {
+                fingerprint: "self-fp".into(),
+                cert_der: Vec::new(),
+                key_der: Vec::new(),
+                device_name: "Observer".into(),
+            },
+            AppConfig::default(),
+            rusqlite::Connection::open_in_memory().expect("in-memory db"),
+        ));
+
+        {
+            let mut feed = state
+                .runtime_event_feed
+                .lock()
+                .expect("runtime event feed lock poisoned");
+            for seq in 9_077..=10_100 {
+                feed.push_back(crate::state::RuntimeEventEnvelope {
+                    seq,
+                    event: "device_updated".to_string(),
+                    payload: serde_json::json!({ "index": seq }),
+                    emitted_at_unix_ms: seq,
+                });
+            }
+        }
+        state
+            .runtime_event_seq
+            .store(10_100, std::sync::atomic::Ordering::SeqCst);
+        state
+            .runtime_event_persisted_oldest_seq
+            .store(101, std::sync::atomic::Ordering::SeqCst);
+
+        let snapshot = state.runtime_events_since(10, 25);
+        assert!(snapshot.resync_required);
+
+        let diagnostics = build_discovery_diagnostics(
+            &state,
+            BeaconCadence {
+                power_profile: PowerProfile::Ac,
+                interval_secs: 3,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["metrics"]["last_replay_source"].as_str(),
+            Some("resync_required")
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["metrics"]["last_resync_reason"].as_str(),
+            Some("cursor_before_oldest_available")
+        );
+        assert!(
+            diagnostics["runtime_event_replay"]["metrics"]["last_replay_source_at_unix_ms"]
+                .as_u64()
+                .is_some()
+        );
+        assert!(
+            diagnostics["runtime_event_replay"]["metrics"]["last_resync_required_at_unix_ms"]
+                .as_u64()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_diagnostics_recommend_connect_by_address_when_discovery_isolation_is_likely()
+    {
+        let state = Arc::new(crate::state::AppState::new(
+            Identity {
+                fingerprint: "self-fp".into(),
+                cert_der: Vec::new(),
+                key_der: Vec::new(),
+                device_name: "Observer".into(),
+            },
+            AppConfig::default(),
+            rusqlite::Connection::open_in_memory().expect("in-memory db"),
+        ));
+
+        state.bump_discovery_event("search_started").await;
+        state.bump_discovery_event("beacon_sent").await;
+
+        let diagnostics = build_discovery_diagnostics(
+            &state,
+            BeaconCadence {
+                power_profile: PowerProfile::Ac,
+                interval_secs: 3,
+            },
+        )
+        .await;
+
+        let quick_hints = diagnostics["quick_hints"]
+            .as_array()
+            .expect("quick hints array");
+        assert!(quick_hints.iter().any(|hint| {
+            hint.as_str()
+                .map(|value| {
+                    value.contains("Connect by Address")
+                        && (value.contains("VLAN") || value.contains("subnet"))
+                })
+                .unwrap_or(false)
+        }));
+    }
+
+    #[tokio::test]
+    async fn discovery_diagnostics_summarize_checkpoint_lifecycle_and_recovery_states() {
+        let state = Arc::new(crate::state::AppState::new(
+            Identity {
+                fingerprint: "self-fp".into(),
+                cert_der: Vec::new(),
+                key_der: Vec::new(),
+                device_name: "Observer".into(),
+            },
+            AppConfig::default(),
+            rusqlite::Connection::open_in_memory().expect("in-memory db"),
+        ));
+
+        for index in 0..1_500 {
+            state.record_runtime_event("device_updated", serde_json::json!({ "index": index }));
+        }
+
+        let generation = state.runtime_event_generation.clone();
+        let now_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("unix time")
+            .as_millis() as u64;
+
+        {
+            let guard = state.db.lock().expect("db lock");
+            for checkpoint in [
+                RuntimeEventCheckpoint {
+                    consumer_id: "active-up-to-date".into(),
+                    generation: generation.clone(),
+                    seq: 1_500,
+                    updated_at_unix_ms: now_unix_ms,
+                    created_at_unix_ms: Some(now_unix_ms),
+                    last_read_at_unix_ms: None,
+                    lease_expires_at_unix_ms: None,
+                    revision: Some(1),
+                    last_transition: Some("created".into()),
+                    recovery_hint: Some("up_to_date".into()),
+                    current_oldest_available_seq: None,
+                    current_latest_available_seq: None,
+                    current_compaction_watermark_seq: None,
+                    current_compaction_watermark_segment_id: None,
+                },
+                RuntimeEventCheckpoint {
+                    consumer_id: "active-hot-window".into(),
+                    generation: generation.clone(),
+                    seq: 1_499,
+                    updated_at_unix_ms: now_unix_ms,
+                    created_at_unix_ms: Some(now_unix_ms),
+                    last_read_at_unix_ms: None,
+                    lease_expires_at_unix_ms: None,
+                    revision: Some(1),
+                    last_transition: Some("created".into()),
+                    recovery_hint: Some("hot_window".into()),
+                    current_oldest_available_seq: None,
+                    current_latest_available_seq: None,
+                    current_compaction_watermark_seq: None,
+                    current_compaction_watermark_segment_id: None,
+                },
+                RuntimeEventCheckpoint {
+                    consumer_id: "idle-persisted".into(),
+                    generation: generation.clone(),
+                    seq: 400,
+                    updated_at_unix_ms: now_unix_ms
+                        .saturating_sub(RUNTIME_EVENT_CHECKPOINT_ACTIVE_THRESHOLD_MS + 1_000),
+                    created_at_unix_ms: Some(now_unix_ms),
+                    last_read_at_unix_ms: None,
+                    lease_expires_at_unix_ms: None,
+                    revision: Some(1),
+                    last_transition: Some("created".into()),
+                    recovery_hint: Some("persisted_catch_up".into()),
+                    current_oldest_available_seq: None,
+                    current_latest_available_seq: None,
+                    current_compaction_watermark_seq: None,
+                    current_compaction_watermark_segment_id: None,
+                },
+                RuntimeEventCheckpoint {
+                    consumer_id: "stale-resync".into(),
+                    generation: "older-generation".into(),
+                    seq: 10,
+                    updated_at_unix_ms: now_unix_ms
+                        .saturating_sub(RUNTIME_EVENT_CHECKPOINT_STALE_THRESHOLD_MS + 1_000),
+                    created_at_unix_ms: Some(now_unix_ms),
+                    last_read_at_unix_ms: None,
+                    lease_expires_at_unix_ms: None,
+                    revision: Some(1),
+                    last_transition: Some("generation_reset".into()),
+                    recovery_hint: Some("resync_required".into()),
+                    current_oldest_available_seq: None,
+                    current_latest_available_seq: None,
+                    current_compaction_watermark_seq: None,
+                    current_compaction_watermark_segment_id: None,
+                },
+            ] {
+                crate::db::save_runtime_event_checkpoint(&guard, &checkpoint)
+                    .expect("save checkpoint");
+            }
+        }
+
+        let diagnostics = build_discovery_diagnostics(
+            &state,
+            BeaconCadence {
+                power_profile: PowerProfile::Ac,
+                interval_secs: 3,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["checkpoint_count"].as_u64(),
+            Some(4)
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["active_checkpoint_count"].as_u64(),
+            Some(2)
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["idle_checkpoint_count"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["stale_checkpoint_count"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["resync_required_checkpoint_count"].as_u64(),
+            Some(1)
+        );
+
+        let checkpoints = diagnostics["runtime_event_replay"]["checkpoints"]
+            .as_array()
+            .expect("checkpoint diagnostics array");
+
+        let find_checkpoint = |consumer_id: &str| {
+            checkpoints
+                .iter()
+                .find(|row| row["consumer_id"].as_str() == Some(consumer_id))
+                .unwrap_or_else(|| panic!("missing checkpoint row for {consumer_id}"))
+        };
+
+        assert_eq!(
+            find_checkpoint("active-up-to-date")["lifecycle_state"].as_str(),
+            Some("active")
+        );
+        assert_eq!(
+            find_checkpoint("active-up-to-date")["recovery_state"].as_str(),
+            Some("up_to_date")
+        );
+        assert_eq!(
+            find_checkpoint("active-hot-window")["recovery_state"].as_str(),
+            Some("hot_window")
+        );
+        assert_eq!(
+            find_checkpoint("idle-persisted")["lifecycle_state"].as_str(),
+            Some("idle")
+        );
+        assert_eq!(
+            find_checkpoint("idle-persisted")["recovery_state"].as_str(),
+            Some("persisted_catch_up")
+        );
+        assert_eq!(
+            find_checkpoint("stale-resync")["lifecycle_state"].as_str(),
+            Some("stale")
+        );
+        assert_eq!(
+            find_checkpoint("stale-resync")["recovery_state"].as_str(),
+            Some("resync_required")
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_diagnostics_report_checkpoint_pinned_max_capped_retention_mode() {
+        let state = Arc::new(crate::state::AppState::new(
+            Identity {
+                fingerprint: "self-fp".into(),
+                cert_der: Vec::new(),
+                key_der: Vec::new(),
+                device_name: "Observer".into(),
+            },
+            AppConfig::default(),
+            rusqlite::Connection::open_in_memory().expect("in-memory db"),
+        ));
+
+        let latest_seq = 120_000u64;
+        let pinned_oldest_seq = 20_001u64;
+        let now_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("unix time")
+            .as_millis() as u64;
+
+        state.runtime_event_seq.store(latest_seq, Ordering::SeqCst);
+        state
+            .runtime_event_persisted_oldest_seq
+            .store(pinned_oldest_seq, Ordering::SeqCst);
+
+        {
+            let guard = state.db.lock().expect("db lock");
+            crate::db::save_runtime_event_checkpoint(
+                &guard,
+                &RuntimeEventCheckpoint {
+                    consumer_id: "shared-ui".into(),
+                    generation: state.runtime_event_generation.clone(),
+                    seq: 25_000,
+                    updated_at_unix_ms: now_unix_ms,
+                    created_at_unix_ms: Some(now_unix_ms),
+                    last_read_at_unix_ms: None,
+                    lease_expires_at_unix_ms: None,
+                    revision: Some(1),
+                    last_transition: Some("advanced".into()),
+                    recovery_hint: Some("persisted_catch_up".into()),
+                    current_oldest_available_seq: None,
+                    current_latest_available_seq: None,
+                    current_compaction_watermark_seq: None,
+                    current_compaction_watermark_segment_id: None,
+                },
+            )
+            .expect("save checkpoint");
+        }
+
+        let diagnostics = build_discovery_diagnostics(
+            &state,
+            BeaconCadence {
+                power_profile: PowerProfile::Ac,
+                interval_secs: 3,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["persisted_oldest_seq"].as_u64(),
+            Some(pinned_oldest_seq)
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["persisted_baseline_oldest_seq"].as_u64(),
+            Some(latest_seq - crate::state::RUNTIME_EVENT_PERSISTED_JOURNAL_CAPACITY as u64 + 1)
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["persisted_max_oldest_seq"].as_u64(),
+            Some(
+                latest_seq - crate::state::RUNTIME_EVENT_PERSISTED_JOURNAL_MAX_CAPACITY as u64 + 1
+            )
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["retention_mode"].as_str(),
+            Some("checkpoint_pinned_max_capped")
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["retention_pinned_checkpoint_count"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            diagnostics["runtime_event_replay"]["oldest_retention_pinned_checkpoint_seq"].as_u64(),
+            Some(25_000)
+        );
+    }
+
     #[test]
     fn windows_non_admin_hint_mentions_manual_firewall_steps() {
         let hint = windows_non_admin_firewall_hint(54001, "fallback_random");
@@ -339,11 +1545,17 @@ mod diagnostics_tests {
 #[tauri::command]
 pub async fn open_transfer_folder(
     transfer_id: String,
-    state: AppStateRef<'_>,
     app: tauri::AppHandle,
+    state: AppStateRef<'_>,
 ) -> Result<(), String> {
     use tauri::Manager;
-    let custom_dir = state.config.read().await.download_dir.clone();
+    let custom_dir = if let Some(config) =
+        proxy_read::<crate::state::AppConfig>(&app, LocalIpcCommand::ConfigGet, "config").await?
+    {
+        config.download_dir
+    } else {
+        state.config.read().await.download_dir.clone()
+    };
     let base_dir = custom_dir.map(std::path::PathBuf::from).unwrap_or_else(|| {
         app.path().download_dir().unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
@@ -363,7 +1575,15 @@ pub async fn open_transfer_folder(
 }
 
 #[tauri::command]
-pub async fn get_app_config(state: AppStateRef<'_>) -> Result<crate::state::AppConfig, String> {
+pub async fn get_app_config(
+    app: AppHandle,
+    state: AppStateRef<'_>,
+) -> Result<crate::state::AppConfig, String> {
+    if let Some(config) =
+        proxy_read::<crate::state::AppConfig>(&app, LocalIpcCommand::ConfigGet, "config").await?
+    {
+        return Ok(config);
+    }
     Ok(state.config.read().await.clone())
 }
 
@@ -373,16 +1593,105 @@ pub async fn set_app_config(
     app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<(), String> {
-    let service = AppCoreService::with_app(Arc::clone(&state), app);
-    service.set_app_config(config).await
+    let previous_config = if let Some(previous) =
+        proxy_read::<crate::state::AppConfig>(&app, LocalIpcCommand::ConfigGet, "config").await?
+    {
+        previous
+    } else {
+        state.config.read().await.clone()
+    };
+
+    let launch_at_login_changed = previous_config.launch_at_login != config.launch_at_login;
+
+    let persisted_via_proxy = proxy_ack(
+        &app,
+        LocalIpcCommand::ConfigSet {
+            config: config.clone(),
+        },
+    )
+    .await?;
+    if !persisted_via_proxy {
+        let service = AppCoreService::with_app(Arc::clone(&state), app.clone());
+        service.set_app_config(config.clone()).await?;
+    }
+
+    if !launch_at_login_changed {
+        return Ok(());
+    }
+
+    if let Err(err) = crate::runtime::autostart::sync_launch_at_login(&app, config.launch_at_login)
+    {
+        let rollback_result = if persisted_via_proxy {
+            let rolled_back = proxy_ack(
+                &app,
+                LocalIpcCommand::ConfigSet {
+                    config: previous_config.clone(),
+                },
+            )
+            .await?;
+            if rolled_back {
+                Ok(())
+            } else {
+                Err(
+                    "daemon-backed config rollback unexpectedly fell back to local path"
+                        .to_string(),
+                )
+            }
+        } else {
+            let service = AppCoreService::with_app(Arc::clone(&state), app.clone());
+            service.set_app_config(previous_config.clone()).await
+        };
+        if let Err(rollback_err) = rollback_result {
+            tracing::warn!(
+                "failed to roll back app config after launch-at-login sync error: {rollback_err}"
+            );
+        }
+        return Err(format!(
+            "failed to update launch-at-login registration: {err}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_shell_attention_state(
+    pending_incoming_count: u32,
+    active_transfer_count: u32,
+    recent_failure_count: u32,
+    notifications_degraded: bool,
+    app: AppHandle,
+) -> Result<(), String> {
+    // Shared shell-attention contract: keep these exact field names and
+    // semantics aligned with `src/ipc.ts` and `src/store.ts`. This command is
+    // intentionally narrow and only mirrors already-derived UI shell state.
+    super::update_tray_attention(
+        &app,
+        super::TrayAttentionState {
+            pending_incoming_count,
+            active_transfer_count,
+            recent_failure_count,
+            notifications_degraded,
+        },
+    )
 }
 
 // ─── App info commands ───────────────────────────────────────────────────────
 
 #[tauri::command]
 pub async fn get_local_identity(
+    app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<crate::state::LocalIdentityView, String> {
+    if let Some(identity) = proxy_read::<crate::state::LocalIdentityView>(
+        &app,
+        LocalIpcCommand::AppGetLocalIdentity,
+        "identity",
+    )
+    .await?
+    {
+        return Ok(identity);
+    }
     Ok(crate::dto::local_identity_view(
         state.identity.fingerprint.clone(),
         state.config.read().await.device_name.clone(),
@@ -391,26 +1700,95 @@ pub async fn get_local_identity(
 }
 
 #[tauri::command]
-pub async fn get_transfers(state: AppStateRef<'_>) -> Result<Vec<TransferView>, String> {
+pub async fn get_local_ble_assist_capsule(
+    app: AppHandle,
+    state: AppStateRef<'_>,
+) -> Result<crate::ble::BleAssistCapsule, String> {
+    if let Some(capsule) = proxy_read::<crate::ble::BleAssistCapsule>(
+        &app,
+        LocalIpcCommand::AppGetBleAssistCapsule,
+        "capsule",
+    )
+    .await?
+    {
+        return Ok(capsule);
+    }
+    crate::ble::build_ble_assist_capsule(&state.identity).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn ingest_ble_assist_capsule(
+    capsule: crate::ble::BleAssistCapsule,
+    source: Option<String>,
+    app: AppHandle,
+    state: AppStateRef<'_>,
+) -> Result<(), String> {
+    if proxy_ack(
+        &app,
+        LocalIpcCommand::AppIngestBleAssistCapsule {
+            capsule: capsule.clone(),
+            source: source.clone(),
+        },
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    let service = AppCoreService::with_app(Arc::clone(&state), app);
+    service.ingest_ble_assist_capsule(capsule, source).await
+}
+
+#[tauri::command]
+pub async fn get_transfers(
+    app: AppHandle,
+    state: AppStateRef<'_>,
+) -> Result<Vec<TransferView>, String> {
+    if let Some(transfers) =
+        proxy_read::<Vec<TransferView>>(&app, LocalIpcCommand::TransferList, "transfers").await?
+    {
+        return Ok(transfers);
+    }
     let transfers = state.transfers.read().await;
     Ok(transfers.values().map(TransferView::from).collect())
 }
 
 #[tauri::command]
 pub async fn get_transfer(
+    app: AppHandle,
     transfer_id: String,
     state: AppStateRef<'_>,
 ) -> Result<Option<TransferView>, String> {
+    if let Some(transfer) = proxy_read::<Option<TransferView>>(
+        &app,
+        LocalIpcCommand::TransferGet {
+            transfer_id: transfer_id.clone(),
+        },
+        "transfer",
+    )
+    .await?
+    {
+        return Ok(transfer);
+    }
     let transfers = state.transfers.read().await;
     Ok(transfers.get(&transfer_id).map(TransferView::from))
 }
 
 #[tauri::command]
 pub async fn get_transfer_history(
+    app: AppHandle,
     limit: u32,
     offset: u32,
     state: AppStateRef<'_>,
 ) -> Result<Vec<TransferView>, String> {
+    if let Some(history) = proxy_read::<Vec<TransferView>>(
+        &app,
+        LocalIpcCommand::TransferHistory { limit, offset },
+        "history",
+    )
+    .await?
+    {
+        return Ok(history);
+    }
     let guard = state.db.lock().map_err(|_| "DB lock poisoned")?;
     let history = crate::db::get_history(&guard, limit, offset).map_err(|e| e.to_string())?;
     Ok(history.iter().map(TransferView::from).collect())
@@ -418,16 +1796,32 @@ pub async fn get_transfer_history(
 
 #[tauri::command]
 pub async fn get_security_events(
+    app: AppHandle,
     limit: u32,
     offset: u32,
     state: AppStateRef<'_>,
 ) -> Result<Vec<crate::state::SecurityEvent>, String> {
+    if let Some(events) = proxy_read::<Vec<crate::state::SecurityEvent>>(
+        &app,
+        LocalIpcCommand::SecurityGetEvents { limit, offset },
+        "events",
+    )
+    .await?
+    {
+        return Ok(events);
+    }
     let guard = state.db.lock().map_err(|_| "DB lock poisoned")?;
     crate::db::get_security_events(&guard, limit, offset).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn get_security_posture() -> Result<serde_json::Value, String> {
+pub async fn get_security_posture(app: AppHandle) -> Result<serde_json::Value, String> {
+    if let Some(posture) =
+        proxy_read::<serde_json::Value>(&app, LocalIpcCommand::SecurityGetPosture, "posture")
+            .await?
+    {
+        return Ok(posture);
+    }
     Ok(serde_json::json!({
         "secure_store_available": crate::crypto::secret_store::secure_store_available(),
     }))
@@ -435,9 +1829,84 @@ pub async fn get_security_posture() -> Result<serde_json::Value, String> {
 
 #[tauri::command]
 pub async fn get_runtime_status(
+    app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<crate::state::RuntimeStatus, String> {
+    if let Some(status) = proxy_read::<crate::state::RuntimeStatus>(
+        &app,
+        LocalIpcCommand::AppGetRuntimeStatus,
+        "runtime_status",
+    )
+    .await?
+    {
+        return Ok(status);
+    }
     Ok(state.runtime_status().await)
+}
+
+#[tauri::command]
+pub async fn get_runtime_events(
+    after_seq: u64,
+    limit: u32,
+    app: AppHandle,
+    state: AppStateRef<'_>,
+) -> Result<RuntimeEventFeedSnapshot, String> {
+    if let Some(payload) = proxy_command_payload_with_retries(
+        &app,
+        LocalIpcCommand::AppGetEventFeed { after_seq, limit },
+        DAEMON_PROXY_READ_RETRY_DELAYS_MS,
+    )
+    .await?
+    {
+        return parse_payload(payload);
+    }
+    Ok(state.runtime_events_since(after_seq, limit as usize))
+}
+
+#[tauri::command]
+pub async fn get_runtime_event_checkpoint(
+    consumer_id: String,
+    app: AppHandle,
+    state: AppStateRef<'_>,
+) -> Result<Option<RuntimeEventCheckpoint>, String> {
+    if let Some(checkpoint) = proxy_read::<Option<RuntimeEventCheckpoint>>(
+        &app,
+        LocalIpcCommand::AppGetEventCheckpoint {
+            consumer_id: consumer_id.clone(),
+        },
+        "checkpoint",
+    )
+    .await?
+    {
+        return Ok(checkpoint);
+    }
+    state.runtime_event_checkpoint(&consumer_id).await
+}
+
+#[tauri::command]
+pub async fn set_runtime_event_checkpoint(
+    consumer_id: String,
+    generation: String,
+    seq: u64,
+    app: AppHandle,
+    state: AppStateRef<'_>,
+) -> Result<bool, String> {
+    if proxy_ack(
+        &app,
+        LocalIpcCommand::AppSetEventCheckpoint {
+            consumer_id: consumer_id.clone(),
+            generation: generation.clone(),
+            seq,
+        },
+    )
+    .await?
+    {
+        return Ok(true);
+    }
+    state
+        .save_runtime_event_checkpoint(&consumer_id, &generation, seq)
+        .await?;
+    Ok(true)
 }
 
 struct DiscoveryQuickHintContext<'a> {
@@ -494,7 +1963,7 @@ fn build_discovery_quick_hints(ctx: &DiscoveryQuickHintContext<'_>) -> Vec<Strin
         );
     } else if ctx.resolved_events == 0 {
         quick_hints.push(
-            "No peers resolved from mDNS browse yet; likely multicast traffic is blocked across firewall/VLAN/subnet."
+            "No peers resolved from mDNS browse yet; likely multicast traffic is blocked across firewall/VLAN/subnet. Automatic discovery is not expected to cross VLAN/subnet boundaries by default, so use Connect by Address for a manual host:port path."
                 .to_string(),
         );
     }
@@ -524,7 +1993,7 @@ fn build_discovery_quick_hints(ctx: &DiscoveryQuickHintContext<'_>) -> Vec<Strin
     }
     if ctx.resolved_no_usable_addrs > 0 {
         quick_hints.push(
-            "Some peers resolved without usable addresses; inspect virtual adapters/VPN interfaces and peer IP advertisement."
+            "Some peers resolved without usable addresses; inspect virtual adapters/VPN interfaces and peer IP advertisement, or fall back to Connect by Address on a known LAN endpoint."
                 .to_string(),
         );
     }
@@ -542,12 +2011,12 @@ fn build_discovery_quick_hints(ctx: &DiscoveryQuickHintContext<'_>) -> Vec<Strin
     }
     if ctx.beacon_sent > 0 && ctx.beacon_received == 0 && ctx.resolved_events == 0 {
         quick_hints.push(
-            "No inbound discovery packets seen from mDNS or UDP beacon; check AP isolation, VLAN segmentation, or host firewall multicast/broadcast rules."
+            "No inbound discovery packets seen from mDNS or UDP beacon; check AP isolation, VLAN segmentation, or host firewall multicast/broadcast rules. If the peers are on different subnets, use Connect by Address instead of waiting for Nearby."
                 .to_string(),
         );
     } else if ctx.beacon_received > 0 && ctx.resolved_events == 0 {
         quick_hints.push(
-            "UDP beacon fallback is receiving peers while mDNS is silent; mDNS multicast is likely blocked on this network."
+            "UDP beacon fallback is receiving peers while mDNS is silent; mDNS multicast is likely blocked on this network. Nearby discovery may stay partial until you use Connect by Address or adjust multicast policy."
                 .to_string(),
         );
     }
@@ -598,14 +2067,105 @@ pub async fn copy_to_clipboard(text: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn get_discovery_diagnostics(
+    app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<serde_json::Value, String> {
+    if let Some(diagnostics) = proxy_read::<serde_json::Value>(
+        &app,
+        LocalIpcCommand::AppGetDiscoveryDiagnostics,
+        "diagnostics",
+    )
+    .await?
+    {
+        return Ok(diagnostics);
+    }
     let state = Arc::clone(&state);
     let cadence = crate::discovery::beacon::current_beacon_cadence();
     Ok(build_discovery_diagnostics(&state, cadence).await)
 }
 
-async fn build_discovery_diagnostics(
+#[allow(clippy::too_many_arguments)]
+fn runtime_event_checkpoint_diagnostics(
+    checkpoint: &RuntimeEventCheckpoint,
+    generation: &str,
+    latest_seq: u64,
+    memory_oldest_seq: Option<u64>,
+    persisted_oldest_seq: Option<u64>,
+    oldest_recoverable_seq: Option<u64>,
+    retention_cutoff_reason: &str,
+    persisted_journal_health: &str,
+    now_unix_ms: u64,
+) -> serde_json::Value {
+    let age_ms = now_unix_ms.saturating_sub(checkpoint.updated_at_unix_ms);
+    let lag_events = if checkpoint.generation == generation {
+        latest_seq.saturating_sub(checkpoint.seq)
+    } else {
+        latest_seq
+    };
+    let lease_expires_at_unix_ms = checkpoint
+        .updated_at_unix_ms
+        .saturating_add(crate::state::RUNTIME_EVENT_CHECKPOINT_ACTIVE_THRESHOLD_MS);
+    let lifecycle_state = if age_ms <= crate::state::RUNTIME_EVENT_CHECKPOINT_ACTIVE_THRESHOLD_MS {
+        "active"
+    } else if age_ms <= crate::state::RUNTIME_EVENT_CHECKPOINT_STALE_THRESHOLD_MS {
+        "idle"
+    } else {
+        "stale"
+    };
+    let recovery_state = if checkpoint.generation != generation {
+        "resync_required"
+    } else if latest_seq == 0 || checkpoint.seq >= latest_seq {
+        "up_to_date"
+    } else if memory_oldest_seq
+        .map(|oldest_seq| checkpoint.seq >= oldest_seq.saturating_sub(1))
+        .unwrap_or(true)
+    {
+        "hot_window"
+    } else if persisted_oldest_seq
+        .map(|oldest_seq| checkpoint.seq >= oldest_seq.saturating_sub(1))
+        .unwrap_or(true)
+    {
+        "persisted_catch_up"
+    } else {
+        "resync_required"
+    };
+    let consumer_recovery_mode = if recovery_state == "resync_required" {
+        "authoritative_refresh"
+    } else {
+        "incremental_catch_up"
+    };
+    let recovery_safety = if checkpoint.generation != generation {
+        "generation_mismatch"
+    } else if recovery_state == "resync_required" {
+        "authoritative_refresh_required"
+    } else {
+        "safe_incremental"
+    };
+
+    serde_json::json!({
+        "consumer_id": checkpoint.consumer_id,
+        "generation": checkpoint.generation,
+        "seq": checkpoint.seq,
+        "updated_at_unix_ms": checkpoint.updated_at_unix_ms,
+        "lease_expires_at_unix_ms": lease_expires_at_unix_ms,
+        "age_ms": age_ms,
+        "lag_events": lag_events,
+        "lifecycle_state": lifecycle_state,
+        "recovery_state": recovery_state,
+        "recovery_hint": checkpoint.recovery_hint,
+        "oldest_recoverable_seq": oldest_recoverable_seq,
+        "retention_cutoff_reason": retention_cutoff_reason,
+        "persisted_journal_health": persisted_journal_health,
+        "consumer_recovery_mode": consumer_recovery_mode,
+        "recovery_safety": recovery_safety,
+        "current_oldest_available_seq": checkpoint.current_oldest_available_seq,
+        "current_latest_available_seq": checkpoint.current_latest_available_seq,
+        "current_compaction_watermark_seq": checkpoint.current_compaction_watermark_seq,
+        "current_compaction_watermark_segment_id": checkpoint.current_compaction_watermark_segment_id,
+    })
+}
+
+pub(crate) async fn build_discovery_diagnostics(
     state: &Arc<AppState>,
     beacon_cadence: crate::discovery::beacon::BeaconCadence,
 ) -> serde_json::Value {
@@ -620,12 +2180,166 @@ async fn build_discovery_diagnostics(
     let discovery_event_counts = state.discovery_event_counts_snapshot().await;
     let discovery_failure_counts = state.discovery_failure_counts_snapshot().await;
     let browser_status = state.browser_status_snapshot().await;
+    let ble_runtime_status = state.ble_runtime_status_snapshot().await;
     let listener_mode = state.listener_mode.read().await.clone();
     let listener_port_mode = state.listener_port_mode.read().await.clone();
     let firewall_rule_state = state.firewall_rule_state.read().await.clone();
     let listener_addrs = state.listener_addrs.read().await.clone();
     let network_interfaces = collect_network_interfaces();
     let slo_observability = state.slo_observability_snapshot().await;
+    let runtime_event_feed_len = state
+        .runtime_event_feed
+        .lock()
+        .map(|feed| feed.len())
+        .unwrap_or_default();
+    let runtime_event_memory_oldest_seq = state
+        .runtime_event_feed
+        .lock()
+        .ok()
+        .and_then(|feed| feed.front().map(|event| event.seq));
+    let runtime_event_latest_seq = state
+        .runtime_event_seq
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let runtime_event_persisted_oldest_seq = match state
+        .runtime_event_persisted_oldest_seq
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        0 => None,
+        seq => Some(seq),
+    };
+    let runtime_event_replay_metrics = state.runtime_event_replay_metrics_snapshot();
+    let transfer_progress_persistence = state.progress_persistence.diagnostics_snapshot();
+    let ble_assist_observations = state.ble_assist_observations_snapshot().await;
+    let runtime_event_checkpoints = state.runtime_event_checkpoints().await.unwrap_or_default();
+    let journal_stats = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|guard| crate::db::load_runtime_event_journal_stats(&guard).ok());
+    let retention_pinned_checkpoints: Vec<&RuntimeEventCheckpoint> = runtime_event_checkpoints
+        .iter()
+        .filter(|checkpoint| {
+            checkpoint.generation == state.runtime_event_generation
+                && now_unix_millis().saturating_sub(checkpoint.updated_at_unix_ms)
+                    <= crate::state::RUNTIME_EVENT_CHECKPOINT_STALE_THRESHOLD_MS
+        })
+        .collect();
+    let retention_pinned_checkpoint_count = retention_pinned_checkpoints.len();
+    let oldest_retention_pinned_checkpoint_seq = retention_pinned_checkpoints
+        .iter()
+        .map(|checkpoint| checkpoint.seq)
+        .min();
+    let persisted_window_len = runtime_event_persisted_oldest_seq
+        .map(|oldest_seq| {
+            runtime_event_latest_seq
+                .saturating_sub(oldest_seq)
+                .saturating_add(1)
+        })
+        .unwrap_or(0);
+    let oldest_recoverable_seq =
+        runtime_event_persisted_oldest_seq.or(runtime_event_memory_oldest_seq);
+    let persisted_baseline_oldest_seq = if runtime_event_latest_seq == 0 {
+        None
+    } else {
+        Some(
+            runtime_event_latest_seq
+                .saturating_sub(crate::state::RUNTIME_EVENT_PERSISTED_JOURNAL_CAPACITY as u64 - 1)
+                .max(1),
+        )
+    };
+    let persisted_max_oldest_seq = if runtime_event_latest_seq == 0 {
+        None
+    } else {
+        Some(
+            runtime_event_latest_seq
+                .saturating_sub(
+                    crate::state::RUNTIME_EVENT_PERSISTED_JOURNAL_MAX_CAPACITY as u64 - 1,
+                )
+                .max(1),
+        )
+    };
+    let retention_mode = match (
+        runtime_event_persisted_oldest_seq,
+        persisted_baseline_oldest_seq,
+    ) {
+        (None, _) => "empty",
+        (Some(oldest_seq), Some(baseline_oldest_seq)) if oldest_seq < baseline_oldest_seq => {
+            if persisted_max_oldest_seq == Some(oldest_seq) {
+                "checkpoint_pinned_max_capped"
+            } else {
+                "checkpoint_pinned"
+            }
+        }
+        _ => "baseline",
+    };
+    let persisted_journal_health = if journal_stats.is_none() {
+        "unavailable"
+    } else if runtime_event_latest_seq == 0 {
+        "empty"
+    } else {
+        "available"
+    };
+    let retention_cutoff_reason = match retention_mode {
+        "empty" => "journal_empty",
+        "checkpoint_pinned_max_capped" => "checkpoint_pinned_max_capacity",
+        "checkpoint_pinned" => "checkpoint_pinned",
+        _ => "baseline_capacity",
+    };
+    let mut link_capabilities = build_link_capabilities(own_platform, &ble_runtime_status);
+    if let Some(object) = link_capabilities.as_object_mut() {
+        let recent_capsules = ble_assist_observations
+            .iter()
+            .map(|observation| {
+                serde_json::json!({
+                    "rolling_identifier": observation.rolling_identifier,
+                    "integrity_tag": observation.integrity_tag,
+                    "last_seen_at_unix_ms": observation.last_seen_at_unix_ms,
+                    "expires_at_unix_ms": observation.expires_at_unix_ms,
+                    "transport_hint": observation.transport_hint,
+                })
+            })
+            .collect::<Vec<_>>();
+        object.insert(
+            "observed_capsule_count".to_string(),
+            serde_json::json!(ble_assist_observations.len()),
+        );
+        object.insert(
+            "recent_capsules".to_string(),
+            serde_json::json!(recent_capsules),
+        );
+    }
+    let runtime_event_checkpoint_rows: Vec<serde_json::Value> = runtime_event_checkpoints
+        .iter()
+        .map(|checkpoint| {
+            runtime_event_checkpoint_diagnostics(
+                checkpoint,
+                &state.runtime_event_generation,
+                runtime_event_latest_seq,
+                runtime_event_memory_oldest_seq,
+                runtime_event_persisted_oldest_seq,
+                oldest_recoverable_seq,
+                retention_cutoff_reason,
+                persisted_journal_health,
+                now_unix_millis(),
+            )
+        })
+        .collect();
+    let runtime_event_checkpoint_resync_required_count = runtime_event_checkpoint_rows
+        .iter()
+        .filter(|row| row["recovery_state"].as_str() == Some("resync_required"))
+        .count();
+    let runtime_event_checkpoint_stale_count = runtime_event_checkpoint_rows
+        .iter()
+        .filter(|row| row["lifecycle_state"].as_str() == Some("stale"))
+        .count();
+    let runtime_event_checkpoint_idle_count = runtime_event_checkpoint_rows
+        .iter()
+        .filter(|row| row["lifecycle_state"].as_str() == Some("idle"))
+        .count();
+    let runtime_event_checkpoint_active_count = runtime_event_checkpoint_rows
+        .iter()
+        .filter(|row| row["lifecycle_state"].as_str() == Some("active"))
+        .count();
     let devices = state.devices.read().await;
 
     let device_rows: Vec<serde_json::Value> = devices.values().map(discovery_device_row).collect();
@@ -714,6 +2428,45 @@ async fn build_discovery_diagnostics(
                 .to_string(),
         );
     }
+    let runtime_event_replay = serde_json::json!({
+        "generation": state.runtime_event_generation,
+        "latest_seq": runtime_event_latest_seq,
+        "memory_window_capacity": crate::state::RUNTIME_EVENT_FEED_CAPACITY,
+        "memory_window_len": runtime_event_feed_len,
+        "memory_oldest_seq": runtime_event_memory_oldest_seq,
+        "persisted_window_capacity": crate::state::RUNTIME_EVENT_PERSISTED_JOURNAL_CAPACITY,
+        "persisted_window_max_capacity": crate::state::RUNTIME_EVENT_PERSISTED_JOURNAL_MAX_CAPACITY,
+        "persisted_segment_size": crate::state::RUNTIME_EVENT_PERSISTED_SEGMENT_SIZE,
+        "persisted_segment_count": journal_stats.as_ref().map(|stats| stats.active_segment_count).unwrap_or(0),
+        "oldest_persisted_segment_id": journal_stats.as_ref().and_then(|stats| stats.oldest_active_segment_id),
+        "latest_persisted_segment_id": journal_stats.as_ref().and_then(|stats| stats.latest_active_segment_id),
+        "compacted_segment_count": journal_stats.as_ref().map(|stats| stats.compacted_segment_count).unwrap_or(0),
+        "latest_compacted_segment_id": journal_stats.as_ref().and_then(|stats| stats.latest_compacted_segment_id),
+        "compaction_watermark_seq": journal_stats.as_ref().map(|stats| stats.compaction_watermark_seq).unwrap_or(0),
+        "compaction_watermark_segment_id": journal_stats.as_ref().map(|stats| stats.compaction_watermark_segment_id).unwrap_or(0),
+        "last_compacted_at_unix_ms": journal_stats.as_ref().and_then(|stats| stats.last_compacted_at_unix_ms),
+        "persisted_window_len": persisted_window_len,
+        "persisted_oldest_seq": runtime_event_persisted_oldest_seq,
+        "oldest_recoverable_seq": oldest_recoverable_seq,
+        "persisted_baseline_oldest_seq": persisted_baseline_oldest_seq,
+        "persisted_max_oldest_seq": persisted_max_oldest_seq,
+        "retention_mode": retention_mode,
+        "retention_cutoff_reason": retention_cutoff_reason,
+        "persisted_journal_health": persisted_journal_health,
+        "retention_pinned_checkpoint_count": retention_pinned_checkpoint_count,
+        "oldest_retention_pinned_checkpoint_seq": oldest_retention_pinned_checkpoint_seq,
+        "checkpoint_heartbeat_interval_ms": crate::state::RUNTIME_EVENT_CHECKPOINT_HEARTBEAT_INTERVAL_MS,
+        "checkpoint_active_threshold_ms": crate::state::RUNTIME_EVENT_CHECKPOINT_ACTIVE_THRESHOLD_MS,
+        "checkpoint_stale_threshold_ms": crate::state::RUNTIME_EVENT_CHECKPOINT_STALE_THRESHOLD_MS,
+        "checkpoint_ttl_ms": crate::state::RUNTIME_EVENT_CHECKPOINT_TTL_MS,
+        "checkpoint_count": runtime_event_checkpoint_rows.len(),
+        "active_checkpoint_count": runtime_event_checkpoint_active_count,
+        "idle_checkpoint_count": runtime_event_checkpoint_idle_count,
+        "stale_checkpoint_count": runtime_event_checkpoint_stale_count,
+        "resync_required_checkpoint_count": runtime_event_checkpoint_resync_required_count,
+        "metrics": runtime_event_replay_metrics,
+        "checkpoints": runtime_event_checkpoint_rows,
+    });
 
     serde_json::json!({
         "runtime": runtime,
@@ -735,6 +2488,9 @@ async fn build_discovery_diagnostics(
         "listener_addrs": listener_addrs,
         "network_interfaces": network_interfaces,
         "slo_observability": slo_observability,
+        "runtime_event_replay": runtime_event_replay,
+        "transfer_progress_persistence": transfer_progress_persistence,
+        "link_capabilities": link_capabilities,
         "browser_status": serde_json::json!({
             "active": browser_status.active,
             "restart_count": browser_status.restart_count,
@@ -845,12 +2601,55 @@ fn discovery_device_row(d: &DeviceInfo) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_network_interfaces, discovery_device_row};
+    use super::{
+        collect_network_interfaces, control_plane_mode_from_sources, discovery_device_row,
+    };
     use crate::state::{DeviceInfo, Platform, ReachabilityStatus, SessionInfo};
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::str::FromStr;
     use std::time::Instant;
+
+    #[test]
+    fn control_plane_mode_prefers_runtime_state_over_env() {
+        assert_eq!(
+            control_plane_mode_from_sources(Some("in_process"), Some("daemon")),
+            "in_process"
+        );
+        assert_eq!(
+            control_plane_mode_from_sources(Some("daemon"), Some("in_process")),
+            "daemon"
+        );
+    }
+
+    #[test]
+    fn control_plane_mode_falls_back_to_env_and_default() {
+        assert_eq!(
+            control_plane_mode_from_sources(None, Some("daemon")),
+            "daemon"
+        );
+        assert_eq!(
+            control_plane_mode_from_sources(Some("invalid"), Some("in_process")),
+            "in_process"
+        );
+        assert_eq!(control_plane_mode_from_sources(None, None), "in_process");
+    }
+
+    #[test]
+    fn control_plane_mode_ignores_empty_or_invalid_state_values() {
+        assert_eq!(
+            control_plane_mode_from_sources(Some(" "), Some("daemon")),
+            "daemon"
+        );
+        assert_eq!(
+            control_plane_mode_from_sources(Some("invalid"), Some("daemon")),
+            "daemon"
+        );
+        assert_eq!(
+            control_plane_mode_from_sources(Some("invalid"), Some("in_process")),
+            "in_process"
+        );
+    }
 
     #[test]
     fn discovery_device_row_contains_resolve_and_probe_details() {
@@ -917,8 +2716,18 @@ mod tests {
 
 #[tauri::command]
 pub async fn get_transfer_metrics(
+    app: AppHandle,
     state: AppStateRef<'_>,
 ) -> Result<crate::state::TransferMetrics, String> {
+    if let Some(metrics) = proxy_read::<crate::state::TransferMetrics>(
+        &app,
+        LocalIpcCommand::TransferGetMetrics,
+        "metrics",
+    )
+    .await?
+    {
+        return Ok(metrics);
+    }
     let guard = state.db.lock().map_err(|_| "DB lock poisoned")?;
     crate::db::get_transfer_metrics(&guard).map_err(|e| e.to_string())
 }

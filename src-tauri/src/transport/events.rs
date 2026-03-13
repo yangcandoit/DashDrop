@@ -1,17 +1,15 @@
 use std::sync::Arc;
 
-use tauri::{AppHandle, Emitter, Manager};
-
+use crate::runtime::host::RuntimeHost;
 use crate::state::{AppState, TransferStatus};
 use crate::transport::protocol::FileItem;
 
-fn emit_json(app: &AppHandle, event: &str, payload: serde_json::Value) {
-    app.emit(event, payload)
+fn emit_json(host: &Arc<dyn RuntimeHost>, event: &str, payload: serde_json::Value) {
+    host.emit_json(event, payload)
         .unwrap_or_else(|e| tracing::warn!("Emit {event} failed: {e}"));
 }
 
-fn transfer_batch_id(app: &AppHandle, transfer_id: &str) -> Option<String> {
-    let state = app.try_state::<Arc<AppState>>()?;
+fn transfer_batch_id(state: &Arc<AppState>, transfer_id: &str) -> Option<String> {
     let transfers = state.transfers.try_read().ok()?;
     transfers
         .get(transfer_id)
@@ -28,8 +26,10 @@ fn with_optional_batch_id(
     payload
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn emit_transfer_started(
-    app: &AppHandle,
+    host: &Arc<dyn RuntimeHost>,
+    state: &Arc<AppState>,
     transfer_id: &str,
     peer_fp: &str,
     peer_name: &str,
@@ -37,9 +37,9 @@ pub fn emit_transfer_started(
     total_size: u64,
     revision: u64,
 ) {
-    let batch_id = transfer_batch_id(app, transfer_id);
+    let batch_id = transfer_batch_id(state, transfer_id);
     emit_json(
-        app,
+        host,
         "transfer_started",
         with_optional_batch_id(
             serde_json::json!({
@@ -57,7 +57,8 @@ pub fn emit_transfer_started(
 
 #[allow(clippy::too_many_arguments)]
 pub fn emit_transfer_incoming(
-    app: &AppHandle,
+    host: &Arc<dyn RuntimeHost>,
+    state: &Arc<AppState>,
     transfer_id: &str,
     notification_id: &str,
     sender_name: &str,
@@ -67,9 +68,9 @@ pub fn emit_transfer_incoming(
     total_size: u64,
     revision: u64,
 ) {
-    let batch_id = transfer_batch_id(app, transfer_id);
+    let batch_id = transfer_batch_id(state, transfer_id);
     emit_json(
-        app,
+        host,
         "transfer_incoming",
         with_optional_batch_id(
             serde_json::json!({
@@ -87,10 +88,15 @@ pub fn emit_transfer_incoming(
     );
 }
 
-pub fn emit_transfer_accepted(app: &AppHandle, transfer_id: &str, revision: u64) {
-    let batch_id = transfer_batch_id(app, transfer_id);
+pub fn emit_transfer_accepted(
+    host: &Arc<dyn RuntimeHost>,
+    state: &Arc<AppState>,
+    transfer_id: &str,
+    revision: u64,
+) {
+    let batch_id = transfer_batch_id(state, transfer_id);
     emit_json(
-        app,
+        host,
         "transfer_accepted",
         with_optional_batch_id(
             serde_json::json!({
@@ -103,15 +109,16 @@ pub fn emit_transfer_accepted(app: &AppHandle, transfer_id: &str, revision: u64)
 }
 
 pub fn emit_transfer_progress(
-    app: &AppHandle,
+    host: &Arc<dyn RuntimeHost>,
+    state: &Arc<AppState>,
     transfer_id: &str,
     bytes_transferred: u64,
     total_bytes: u64,
     revision: u64,
 ) {
-    let batch_id = transfer_batch_id(app, transfer_id);
+    let batch_id = transfer_batch_id(state, transfer_id);
     emit_json(
-        app,
+        host,
         "transfer_progress",
         with_optional_batch_id(
             serde_json::json!({
@@ -125,10 +132,15 @@ pub fn emit_transfer_progress(
     );
 }
 
-pub fn emit_transfer_complete(app: &AppHandle, transfer_id: &str, revision: u64) {
-    let batch_id = transfer_batch_id(app, transfer_id);
+pub fn emit_transfer_complete(
+    host: &Arc<dyn RuntimeHost>,
+    state: &Arc<AppState>,
+    transfer_id: &str,
+    revision: u64,
+) {
+    let batch_id = transfer_batch_id(state, transfer_id);
     emit_json(
-        app,
+        host,
         "transfer_complete",
         with_optional_batch_id(
             serde_json::json!({
@@ -141,14 +153,15 @@ pub fn emit_transfer_complete(app: &AppHandle, transfer_id: &str, revision: u64)
 }
 
 pub fn emit_transfer_partial(
-    app: &AppHandle,
+    host: &Arc<dyn RuntimeHost>,
+    state: &Arc<AppState>,
     transfer_id: &str,
     succeeded_count: usize,
     failed: &[crate::transport::protocol::FailedFile],
     terminal_cause: Option<&str>,
     revision: u64,
 ) {
-    let batch_id = transfer_batch_id(app, transfer_id);
+    let batch_id = transfer_batch_id(state, transfer_id);
     let mut payload = with_optional_batch_id(
         serde_json::json!({
             "transfer_id": transfer_id,
@@ -163,11 +176,13 @@ pub fn emit_transfer_partial(
         payload["terminal_cause"] = serde_json::json!(cause);
     }
 
-    emit_json(app, "transfer_partial", payload);
+    emit_json(host, "transfer_partial", payload);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn emit_transfer_terminal(
-    app: &AppHandle,
+    host: &Arc<dyn RuntimeHost>,
+    state: &Arc<AppState>,
     transfer_id: &str,
     status: &TransferStatus,
     reason_code: &str,
@@ -179,7 +194,7 @@ pub fn emit_transfer_terminal(
         return;
     };
 
-    let batch_id = transfer_batch_id(app, transfer_id);
+    let batch_id = transfer_batch_id(state, transfer_id);
     let mut payload = with_optional_batch_id(
         serde_json::json!({
             "transfer_id": transfer_id,
@@ -194,7 +209,7 @@ pub fn emit_transfer_terminal(
         payload["phase"] = serde_json::json!(p);
     }
 
-    emit_json(app, event, payload);
+    emit_json(host, event, payload);
 }
 
 pub fn terminal_event_name(status: &TransferStatus) -> Option<&'static str> {
@@ -208,7 +223,8 @@ pub fn terminal_event_name(status: &TransferStatus) -> Option<&'static str> {
 }
 
 pub fn emit_transfer_error(
-    app: &AppHandle,
+    host: &Arc<dyn RuntimeHost>,
+    state: &Arc<AppState>,
     transfer_id: Option<&str>,
     reason_code: &str,
     terminal_cause: &str,
@@ -216,7 +232,8 @@ pub fn emit_transfer_error(
     revision: u64,
 ) {
     emit_transfer_error_with_detail(
-        app,
+        host,
+        state,
         transfer_id,
         reason_code,
         terminal_cause,
@@ -226,8 +243,10 @@ pub fn emit_transfer_error(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn emit_transfer_error_with_detail(
-    app: &AppHandle,
+    host: &Arc<dyn RuntimeHost>,
+    state: &Arc<AppState>,
     transfer_id: Option<&str>,
     reason_code: &str,
     terminal_cause: &str,
@@ -235,7 +254,7 @@ pub fn emit_transfer_error_with_detail(
     revision: u64,
     detail: Option<&str>,
 ) {
-    let batch_id = transfer_id.and_then(|id| transfer_batch_id(app, id));
+    let batch_id = transfer_id.and_then(|id| transfer_batch_id(state, id));
     let mut payload = with_optional_batch_id(
         serde_json::json!({
             "transfer_id": transfer_id,
@@ -249,7 +268,7 @@ pub fn emit_transfer_error_with_detail(
     if let Some(d) = detail {
         payload["detail"] = serde_json::json!(d);
     }
-    emit_json(app, "transfer_error", payload);
+    emit_json(host, "transfer_error", payload);
 }
 
 #[cfg(test)]

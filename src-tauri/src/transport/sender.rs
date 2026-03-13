@@ -9,11 +9,11 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use tauri::AppHandle;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{oneshot, Mutex};
 
+use crate::runtime::host::RuntimeHost;
 use crate::state::{AppState, TransferDirection, TransferStatus};
 use crate::transport::events::{
     emit_transfer_accepted, emit_transfer_complete, emit_transfer_error, emit_transfer_partial,
@@ -120,7 +120,7 @@ pub async fn send_files(
     peer_fp: String,
     paths: Vec<PathBuf>,
     conn: Connection,
-    app: AppHandle,
+    host: Arc<dyn RuntimeHost>,
     state: Arc<AppState>,
 ) -> Result<TransferOutcome> {
     tracing::info!(
@@ -190,6 +190,7 @@ pub async fn send_files(
                         name: f.name.clone(),
                         rel_path: f.rel_path.clone(),
                         size: f.size,
+                        hash: None,
                         risk_class: f.risk_class.clone(),
                     })
                     .collect(),
@@ -256,7 +257,8 @@ pub async fn send_files(
     let _ = control_send.finish();
 
     emit_transfer_started(
-        &app,
+        &host,
+        &state,
         &transfer_id,
         &peer_fp,
         &peer_name,
@@ -295,7 +297,8 @@ pub async fn send_files(
                     let _ = crate::db::save_transfer(&guard, t);
                 }
                 emit_transfer_terminal(
-                    &app,
+                    &host,
+                    &state,
                     &transfer_id,
                     &t.status,
                     &error_code_key(&r.reason),
@@ -349,7 +352,8 @@ pub async fn send_files(
                     let _ = crate::db::save_transfer(&guard, t);
                 }
                 emit_transfer_terminal(
-                    &app,
+                    &host,
+                    &state,
                     &transfer_id,
                     &t.status,
                     ErrorCode::Timeout.reason_code(),
@@ -358,7 +362,8 @@ pub async fn send_files(
                     Some("offer"),
                 );
                 emit_transfer_error(
-                    &app,
+                    &host,
+                    &state,
                     Some(&transfer_id),
                     ErrorCode::Timeout.reason_code(),
                     "Timeout",
@@ -378,6 +383,7 @@ pub async fn send_files(
         }
     };
 
+    let resume_offsets = accept.resume_offsets.unwrap_or_default();
     if accept.chosen_version != _chosen_version {
         bail!("Peer chose a different protocol version after handshake");
     }
@@ -393,7 +399,7 @@ pub async fn send_files(
             0
         }
     };
-    emit_transfer_accepted(&app, &transfer_id, transferring_revision);
+    emit_transfer_accepted(&host, &state, &transfer_id, transferring_revision);
     state.mark_peer_used(&peer_fp).await;
 
     // Send files concurrently, bounded by runtime config
@@ -476,12 +482,14 @@ pub async fn send_files(
 
     for item in &items {
         let conn2 = conn.clone();
-        let app2 = app.clone();
+        let host2 = Arc::clone(&host);
         let state2 = state.clone();
         let item2 = item.clone();
         let sem2 = sem.clone();
         let transfer_id_clone = transfer_id.clone();
         let ack_waiters2 = ack_waiters.clone();
+        let resume_offset = resume_offsets.get(&item.file_id).copied().unwrap_or(0);
+        let policy_clone = resume_source_policy.clone();
 
         let src_path = file_id_to_path.get(&item.file_id).cloned();
         let handle = tokio::spawn(async move {
@@ -505,10 +513,15 @@ pub async fn send_files(
                         item2,
                         path,
                         conn2,
-                        app2,
+                        host2,
                         state2,
                         transfer_id_clone,
                         ack_waiters2,
+                        if matches!(policy_clone, ResumeSourcePolicy::ReuseExistingProgress) {
+                            resume_offset
+                        } else {
+                            0
+                        },
                     )
                     .await
                 }
@@ -603,11 +616,12 @@ pub async fn send_files(
             terminal_snapshot = Some(crate::persistence_progress::progress_snapshot(t));
             match &outcome {
                 TransferOutcome::Success => {
-                    emit_transfer_complete(&app, &transfer_id, t.revision);
+                    emit_transfer_complete(&host, &state, &transfer_id, t.revision);
                 }
                 TransferOutcome::PartialSuccess(failed) => {
                     emit_transfer_partial(
-                        &app,
+                        &host,
+                        &state,
                         &transfer_id,
                         items.len().saturating_sub(failed.len()),
                         failed,
@@ -616,7 +630,8 @@ pub async fn send_files(
                     );
                 }
                 TransferOutcome::Failed(code) => emit_transfer_terminal(
-                    &app,
+                    &host,
+                    &state,
                     &transfer_id,
                     &t.status,
                     &error_code_key(code),
@@ -625,7 +640,8 @@ pub async fn send_files(
                     Some("send"),
                 ),
                 TransferOutcome::CancelledByReceiver => emit_transfer_terminal(
-                    &app,
+                    &host,
+                    &state,
                     &transfer_id,
                     &t.status,
                     "E_CANCELLED_BY_RECEIVER",
@@ -634,7 +650,8 @@ pub async fn send_files(
                     Some("send"),
                 ),
                 TransferOutcome::CancelledBySender => emit_transfer_terminal(
-                    &app,
+                    &host,
+                    &state,
                     &transfer_id,
                     &t.status,
                     "E_CANCELLED_BY_SENDER",
@@ -645,7 +662,8 @@ pub async fn send_files(
             }
             if let TransferOutcome::Failed(code) = &outcome {
                 emit_transfer_error(
-                    &app,
+                    &host,
+                    &state,
                     Some(&transfer_id),
                     &error_code_key(code),
                     "TransferFailed",
@@ -787,14 +805,16 @@ fn validate_resume_source_snapshots(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_one_file(
     item: FileItem,
     src_path: PathBuf,
     conn: Connection,
-    app: AppHandle,
+    host: Arc<dyn RuntimeHost>,
     state: Arc<AppState>,
     transfer_id: String,
     ack_waiters: AckWaiters,
+    resume_offset: u64,
 ) -> Result<AckResult> {
     let file_id = item.file_id;
     let (ack_tx, ack_rx) = oneshot::channel();
@@ -820,6 +840,54 @@ async fn send_one_file(
     let mut chunk_id = 0u32;
     let mut offset = 0u64;
     let mut buf = vec![0u8; CHUNK_SIZE];
+
+    // If resuming, hash the skipped part without sending
+    if resume_offset > 0 {
+        let mut bytes_to_skip = resume_offset;
+        while bytes_to_skip > 0 {
+            let to_read = std::cmp::min(bytes_to_skip as usize, buf.len());
+            let n = match file.read(&mut buf[..to_read]).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    ack_waiters.lock().await.remove(&file_id);
+                    return Err(e).context("read file for hashing resume");
+                }
+            };
+            hasher.update(&buf[..n]);
+            bytes_to_skip -= n as u64;
+            offset += n as u64;
+            chunk_id += 1; // Align chunk IDs with offset for simplicity
+        }
+
+        // Also update the transferred state up to this point so progress bar starts accurately
+        let (progress_snapshot, overall_transferred, total_bytes, revision) = {
+            let mut transfers = state.transfers.write().await;
+            if let Some(t) = transfers.get_mut(&transfer_id) {
+                t.bytes_transferred += offset;
+                (
+                    Some(crate::persistence_progress::progress_snapshot(t)),
+                    t.bytes_transferred,
+                    t.total_bytes,
+                    t.revision,
+                )
+            } else {
+                (None, 0, 0, 0)
+            }
+        };
+        if let Some(task) = progress_snapshot.as_ref() {
+            state.schedule_progress_persist(task).await;
+        }
+
+        emit_transfer_progress(
+            &host,
+            &state,
+            &transfer_id,
+            overall_transferred,
+            total_bytes,
+            revision,
+        );
+    }
 
     loop {
         let n = match file.read(&mut buf).await {
@@ -869,13 +937,15 @@ async fn send_one_file(
         }
 
         emit_transfer_progress(
-            &app,
+            &host,
+            &state,
             &transfer_id,
             overall_transferred,
             total_bytes,
             revision,
         );
     }
+
 
     // Send Complete with BLAKE3 hash
     let file_hash: [u8; 32] = hasher.finalize().into();

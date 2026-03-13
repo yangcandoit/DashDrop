@@ -1,11 +1,22 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { message } from '@tauri-apps/plugin-dialog';
-import type { TrustedPeer } from '../types';
-import { getTrustedPeers, setTrustedAlias, unpairDevice } from '../ipc';
-import { devices } from '../store';
+import PairingImportModal from '../components/PairingImportModal.vue';
+import type { LocalIdentity, TrustedPeer } from '../types';
+import type { PairingQrPayload } from '../security';
+import {
+  confirmTrustedPeerVerification,
+  getLocalIdentity,
+  getTrustedPeers,
+  pairDevice,
+  setTrustedAlias,
+  subscribeRuntimeEvents,
+  unpairDevice,
+} from '../ipc';
+import { clearPendingPairingLink, devices, pendingPairingLink } from '../store';
 import ConfirmModal from '../components/ConfirmModal.vue';
 import { isDeviceOnline } from '../devicePresence';
+import { verificationCodeFromFingerprint } from '../security';
 
 const emit = defineEmits(['openSettings']);
 
@@ -17,6 +28,11 @@ const savingAlias = ref<Record<string, boolean>>({});
 const unpairTarget = ref<TrustedPeer | null>(null);
 const loadError = ref<string | null>(null);
 const actionError = ref<string | null>(null);
+const localIdentity = ref<LocalIdentity | null>(null);
+const showPairingImport = ref(false);
+const pairingImportBusy = ref(false);
+const pairingImportInitialInput = ref('');
+const unlistens: Array<() => void> = [];
 
 const showActionError = async (summary: string, error: unknown) => {
   const detail = String(error || '').trim();
@@ -39,6 +55,21 @@ const onlineFingerprints = computed(() => {
 });
 
 const isOnline = (fp: string) => onlineFingerprints.value.has(fp);
+const localVerificationCode = computed(() =>
+  localIdentity.value ? verificationCodeFromFingerprint(localIdentity.value.fingerprint) : '',
+);
+
+watch(
+  pendingPairingLink,
+  (value) => {
+    if (!value) {
+      return;
+    }
+    pairingImportInitialInput.value = value;
+    showPairingImport.value = true;
+  },
+  { immediate: true },
+);
 
 const loadPeers = async () => {
   loading.value = true;
@@ -134,7 +165,101 @@ const formatLastUsedAt = (unix?: number | null) => {
   return new Date(unix * 1000).toLocaleString();
 };
 
-onMounted(loadPeers);
+const formatTrustLevel = (peer: TrustedPeer) => {
+  switch (peer.trust_level) {
+    case 'mutual_confirmed':
+      return 'Mutual confirmed';
+    case 'signed_link_verified':
+      return 'Signed link verified';
+    case 'frozen':
+      return 'Frozen';
+    default:
+      return 'Legacy paired';
+  }
+};
+
+const trustBadgeClass = (peer: TrustedPeer) => {
+  switch (peer.trust_level) {
+    case 'mutual_confirmed':
+      return 'trust-badge trust-strong';
+    case 'signed_link_verified':
+      return 'trust-badge trust-medium';
+    case 'frozen':
+      return 'trust-badge trust-frozen';
+    default:
+      return 'trust-badge trust-legacy';
+  }
+};
+
+onMounted(async () => {
+  await Promise.all([
+    loadPeers(),
+    getLocalIdentity()
+      .then((identity) => {
+        localIdentity.value = identity;
+      })
+      .catch((error) => {
+        console.error('Failed to load local identity for trusted devices', error);
+      }),
+  ]);
+
+  unlistens.push(
+    await subscribeRuntimeEvents(['trusted_peer_updated', 'daemon_control_plane_recovered', 'daemon_event_feed_resync_required'], () => {
+      void loadPeers();
+    }),
+  );
+});
+
+onUnmounted(() => {
+  for (const unlisten of unlistens) {
+    unlisten();
+  }
+  unlistens.length = 0;
+});
+
+function closePairingImport() {
+  if (pairingImportBusy.value) return;
+  showPairingImport.value = false;
+  pairingImportInitialInput.value = '';
+  clearPendingPairingLink();
+}
+
+async function importPairingLink({
+  payload,
+  mutualConfirmationRequested,
+}: {
+  payload: PairingQrPayload;
+  mutualConfirmationRequested: boolean;
+}) {
+  pairingImportBusy.value = true;
+  try {
+    actionError.value = null;
+    await pairDevice(payload.fingerprint);
+    await setTrustedAlias(payload.fingerprint, payload.device_name);
+    await confirmTrustedPeerVerification(
+      payload.fingerprint,
+      payload.trust_model === 'signed_link' && payload.signature_verified
+        ? 'signed_pairing_link'
+        : 'legacy_unsigned_link',
+      mutualConfirmationRequested,
+    );
+    showPairingImport.value = false;
+    pairingImportInitialInput.value = '';
+    clearPendingPairingLink();
+    await loadPeers();
+    await message(
+      mutualConfirmationRequested
+        ? `Trusted ${payload.device_name} with mutual confirmation recorded.`
+        : `Trusted ${payload.device_name}. Mutual confirmation can be completed later after both sides compare the shared pair code.`,
+      { title: 'Pairing Complete', kind: 'info' },
+    );
+  } catch (error) {
+    console.error('Failed to import pairing link from trusted devices', error);
+    await showActionError('Unable to import this pairing link.', error);
+  } finally {
+    pairingImportBusy.value = false;
+  }
+}
 </script>
 
 <template>
@@ -144,7 +269,12 @@ onMounted(loadPeers);
         <h2>Trusted Devices</h2>
         <p class="text-muted">Paired peers and aliases</p>
       </div>
-      <button class="btn btn-secondary" @click="emit('openSettings')">Settings</button>
+      <div class="header-actions">
+        <button class="btn btn-secondary" @click="showPairingImport = true" :disabled="!localIdentity">
+          Import Pairing
+        </button>
+        <button class="btn btn-secondary" @click="emit('openSettings')">Settings</button>
+      </div>
     </header>
 
     <main class="content">
@@ -169,6 +299,9 @@ onMounted(loadPeers);
           <path d="M72 41l7 7-7 7" />
         </svg>
         <p class="text-muted">No trusted devices yet.</p>
+        <button class="btn btn-primary" @click="showPairingImport = true" :disabled="!localIdentity">
+          Import or Scan Pairing
+        </button>
       </div>
 
       <TransitionGroup v-else name="trusted-list" tag="div" class="trusted-list">
@@ -176,6 +309,7 @@ onMounted(loadPeers);
           <div class="meta">
             <div class="name-row">
               <div class="name">{{ peer.name }}</div>
+              <span :class="trustBadgeClass(peer)">{{ formatTrustLevel(peer) }}</span>
               <span class="online-chip" :class="isOnline(peer.fingerprint) ? 'online' : 'offline'">
                 <span class="dot"></span>
                 {{ isOnline(peer.fingerprint) ? 'Online' : 'Offline' }}
@@ -184,6 +318,18 @@ onMounted(loadPeers);
             <div class="fingerprint text-muted">{{ peer.fingerprint }}</div>
             <div class="paired-at text-muted">Paired: {{ formatPairedAt(peer.paired_at) }}</div>
             <div class="paired-at text-muted">Last used: {{ formatLastUsedAt(peer.last_used_at) }}</div>
+            <div v-if="peer.trust_level === 'signed_link_verified'" class="paired-at text-muted">
+              Verified via signed link. Waiting for both sides to compare the shared pair code before this becomes mutual.
+            </div>
+            <div v-if="peer.mutual_confirmed_at" class="paired-at text-muted">
+              Mutual confirmation: {{ formatPairedAt(peer.mutual_confirmed_at) }}
+            </div>
+            <div v-if="peer.trust_level === 'frozen'" class="paired-at trust-warning">
+              Frozen{{ peer.frozen_at ? `: ${formatPairedAt(peer.frozen_at)}` : '' }}
+            </div>
+            <div v-if="peer.trust_level === 'frozen' && peer.freeze_reason" class="paired-at trust-warning">
+              {{ peer.freeze_reason }}
+            </div>
 
             <div class="alias-row" v-if="editingAliasFp === peer.fingerprint">
               <input
@@ -218,6 +364,16 @@ onMounted(loadPeers);
       @confirm="removePeer"
       @cancel="closeUnpairDialog"
     />
+
+    <PairingImportModal
+      :open="showPairingImport"
+      :local-fingerprint="localIdentity?.fingerprint || ''"
+      :local-verification-code="localVerificationCode"
+      :initial-input="pairingImportInitialInput"
+      :busy="pairingImportBusy"
+      @close="closePairingImport"
+      @confirm="importPairingLink"
+    />
   </div>
 </template>
 
@@ -237,6 +393,12 @@ onMounted(loadPeers);
   align-items: center;
   padding: 20px 22px 12px;
   border-bottom: 1px solid var(--border-subtle);
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .title-wrap {
@@ -309,6 +471,39 @@ onMounted(loadPeers);
 
 .name {
   font-weight: 600;
+}
+
+.trust-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 0.76rem;
+  font-weight: 700;
+}
+
+.trust-strong {
+  background: rgba(46, 125, 50, 0.12);
+  color: #2f6c31;
+}
+
+.trust-medium {
+  background: rgba(184, 129, 34, 0.12);
+  color: #8a5d16;
+}
+
+.trust-legacy {
+  background: rgba(100, 96, 90, 0.12);
+  color: #5a554e;
+}
+
+.trust-frozen {
+  background: rgba(157, 58, 51, 0.12);
+  color: #8f2d2a;
+}
+
+.trust-warning {
+  color: #8f2d2a;
 }
 
 .online-chip {
@@ -388,6 +583,12 @@ onMounted(loadPeers);
     flex-direction: column;
     align-items: flex-start;
     gap: 10px;
+  }
+
+  .header-actions {
+    width: 100%;
+    justify-content: flex-start;
+    flex-wrap: wrap;
   }
 
   .error-banner {

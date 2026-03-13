@@ -2,8 +2,8 @@ use anyhow::{bail, Context, Result};
 use quinn::Connection;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::AppHandle;
 
+use crate::runtime::host::RuntimeHost;
 use crate::state::AppState;
 use crate::transport::protocol::{
     read_message, write_message, DashMessage, ErrorCode, HelloPayload, RejectPayload,
@@ -51,7 +51,11 @@ async fn reject_control_stream(
 
 /// Called for each accepted incoming QUIC connection.
 /// Performs: cert fp binding → Hello exchange → route to receiver.
-pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppState>) -> Result<()> {
+pub async fn handle_incoming(
+    conn: Connection,
+    host: Arc<dyn RuntimeHost>,
+    state: Arc<AppState>,
+) -> Result<()> {
     // 1. Extract peer TLS certificate fingerprint if available.
     // Current runtime accepts transfer clients without mandatory client-auth certs.
     let peer_cert_fp = extract_peer_fp(&conn).ok();
@@ -111,8 +115,7 @@ pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppSta
             cert_fp = %cert_fp,
             "identity mismatch: mDNS fp != cert fp"
         );
-        let _ = tauri::Emitter::emit(
-            &app,
+        let _ = host.emit_json(
             "identity_mismatch",
             serde_json::json!({
                 "remote_addr": remote_addr,
@@ -134,10 +137,47 @@ pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppSta
         let previous_trusted = state.is_trusted(&mdns_fp).await;
         let current_trusted = state.is_trusted(cert_fp).await;
         if previous_trusted && !current_trusted {
+            let previous_trust_level = state.trust_level_for(&mdns_fp).await;
             let now_unix = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
+            let froze_peer = matches!(
+                previous_trust_level,
+                Some(crate::state::TrustLevel::SignedLinkVerified)
+                    | Some(crate::state::TrustLevel::MutualConfirmed)
+            );
+            if froze_peer {
+                let freeze_reason = format!(
+                    "Fingerprint changed on session {session_id}: expected {mdns_fp}, saw {cert_fp}"
+                );
+                if let Some(peer) = state
+                    .freeze_trusted_peer(&mdns_fp, &freeze_reason, now_unix)
+                    .await
+                {
+                    let trusted_snapshot = state.trusted_peers.read().await.clone();
+                    if let Ok(db) = state.db.lock() {
+                        let _ = crate::db::replace_trusted_peers(&db, &trusted_snapshot);
+                        let _ = crate::db::log_security_event(
+                            &db,
+                            "trust_frozen",
+                            "incoming",
+                            Some(&mdns_fp),
+                            &freeze_reason,
+                        );
+                    }
+                    let _ = host.emit_json(
+                        "trusted_peer_updated",
+                        serde_json::json!({
+                            "fingerprint": mdns_fp.clone(),
+                            "action": "frozen",
+                            "trust_level": peer.trust_level,
+                            "frozen_at": peer.frozen_at,
+                            "freeze_reason": peer.freeze_reason,
+                        }),
+                    );
+                }
+            }
             let dedupe_key = format!("{session_id}|{mdns_fp}|{cert_fp}");
             let should_emit = {
                 let mut alerts = state.fingerprint_change_alerts.lock().await;
@@ -150,13 +190,13 @@ pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppSta
                 }
             };
             if should_emit {
-                let _ = tauri::Emitter::emit(
-                    &app,
+                let _ = host.emit_json(
                     "fingerprint_changed",
                     serde_json::json!({
                         "session_id": session_id.clone(),
                         "previous_fp": mdns_fp.clone(),
                         "current_fp": cert_fp,
+                        "previous_trust_level": previous_trust_level,
                         "remote_addr": remote_addr,
                         "phase": "incoming",
                     }),
@@ -326,7 +366,7 @@ pub async fn handle_incoming(conn: Connection, app: AppHandle, state: Arc<AppSta
         peer_fp,
         peer_cert_fp.is_some(),
         chosen_version,
-        app,
+        host,
         state,
     )
     .await

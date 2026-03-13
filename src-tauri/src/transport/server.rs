@@ -6,9 +6,9 @@ use std::net::IpAddr;
 use std::net::{SocketAddrV4, SocketAddrV6, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::AppHandle;
 
 use crate::crypto::Identity;
+use crate::runtime::host::RuntimeHost;
 
 const INCOMING_IP_RATE_LIMIT_WINDOW_SECS: u64 = 60;
 const INCOMING_IP_RATE_LIMIT_MAX_PER_WINDOW: u32 = 120;
@@ -37,7 +37,7 @@ fn ip_rate_limited(
 /// Start the QUIC server and return the bound port.
 pub async fn start_server(
     identity: Identity,
-    app: AppHandle,
+    host: Arc<dyn RuntimeHost>,
     state: Arc<crate::state::AppState>,
 ) -> Result<u16> {
     // Build rustls config, then wrap for quinn
@@ -97,7 +97,7 @@ pub async fn start_server(
     // Accept connections in background
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
-            let app2 = app.clone();
+            let host2 = Arc::clone(&host);
             let state2 = state.clone();
             let rate_limiter2 = rate_limiter.clone();
             tokio::spawn(async move {
@@ -129,9 +129,12 @@ pub async fn start_server(
                             return;
                         }
                         tracing::debug!("Incoming connection from {:?}", conn.remote_address());
-                        if let Err(e) =
-                            super::handshake::handle_incoming(conn, app2.clone(), state2.clone())
-                                .await
+                        if let Err(e) = super::handshake::handle_incoming(
+                            conn,
+                            Arc::clone(&host2),
+                            state2.clone(),
+                        )
+                        .await
                         {
                             tracing::warn!("Incoming connection error: {e:#}");
                             if let Ok(db) = state2.db.lock() {
@@ -144,7 +147,8 @@ pub async fn start_server(
                                 );
                             }
                             crate::transport::events::emit_transfer_error_with_detail(
-                                &app2,
+                                &host2,
+                                &state2,
                                 None,
                                 "E_PROTOCOL",
                                 "IncomingConnectionError",

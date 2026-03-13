@@ -1,6 +1,15 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, watch } from 'vue';
-import { initAppStore, destroyAppStore, systemError, externalSharePaths } from './store';
+import {
+  initAppStore,
+  destroyAppStore,
+  systemError,
+  externalSharePaths,
+  pendingPairingLink,
+  pendingNavigationTarget,
+  clearPendingNavigationRequest,
+  type SystemNoticeTarget,
+} from './store';
 import NearbyView from './views/NearbyView.vue';
 import TransfersView from './views/TransfersView.vue';
 import HistoryView from './views/HistoryView.vue';
@@ -26,8 +35,14 @@ onMounted(async () => {
     await initAppStore();
   } catch (e) {
     console.error('Failed to initialize app store', e);
-    systemError.value =
-      'Failed to initialize DashDrop. Next: Relaunch the app. If this keeps happening, open Settings diagnostics after restart and check backend/runtime status.';
+    systemError.value = {
+      message:
+        'Failed to initialize DashDrop. Next: Relaunch the app. If this keeps happening, open Settings diagnostics after restart and check backend/runtime status.',
+      tone: 'error',
+      code: 'APP_INIT_FAILED',
+      actionLabel: 'Open Settings',
+      actionTarget: 'Settings',
+    };
   }
   if (typeof window !== 'undefined') {
     if ((window as Window & { __DASHDROP_TEST_MOCK__?: unknown }).__DASHDROP_TEST_MOCK__) {
@@ -47,12 +62,37 @@ onUnmounted(() => {
 watch(
   externalSharePaths,
   (paths) => {
+    // External-share handoff always routes to Nearby first; selection is queued
+    // in store state and must not auto-dispatch a send on receipt.
     if (paths.length > 0) {
       currentView.value = 'Nearby';
     }
   },
   { deep: true },
 );
+
+watch(pendingPairingLink, (value) => {
+  if (value) {
+    // Pairing links can be handled in-place by Nearby / Trusted Devices, but
+    // other views should fall back to Settings as the safe review surface.
+    if (
+      currentView.value !== 'Nearby' &&
+      currentView.value !== 'TrustedDevices' &&
+      currentView.value !== 'Settings'
+    ) {
+      currentView.value = 'Settings';
+    }
+  }
+});
+
+watch(pendingNavigationTarget, (target) => {
+  if (!target) {
+    return;
+  }
+  // Explicit shell navigation requests win over passive notices once emitted.
+  currentView.value = target;
+  clearPendingNavigationRequest();
+});
 
 const dismissOnboarding = () => {
   showOnboarding.value = false;
@@ -63,6 +103,10 @@ const dismissOnboarding = () => {
 
 const dismissSystemError = () => {
   systemError.value = null;
+};
+
+const openNoticeTarget = (target: SystemNoticeTarget) => {
+  currentView.value = target;
 };
 </script>
 
@@ -88,11 +132,16 @@ const dismissSystemError = () => {
     <main class="app-workspace">
       <SystemNotice
         v-if="systemError"
-        :message="systemError"
+        :notice="systemError"
+        @action="openNoticeTarget"
         @dismiss="dismissSystemError"
       />
       <div class="workspace-body">
-        <NearbyView v-if="currentView === 'Nearby'" @open-settings="currentView = 'Settings'" />
+        <NearbyView
+          v-if="currentView === 'Nearby'"
+          @open-settings="currentView = 'Settings'"
+          @open-transfers="currentView = 'Transfers'"
+        />
         <TransfersView v-if="currentView === 'Transfers'" @open-settings="currentView = 'Settings'" />
         <HistoryView v-if="currentView === 'History'" @open-settings="currentView = 'Settings'" />
         <TrustedDevicesView v-if="currentView === 'TrustedDevices'" @open-settings="currentView = 'Settings'" />

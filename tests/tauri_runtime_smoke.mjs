@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import fs from "node:fs/promises";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -9,6 +10,9 @@ const READY_TIMEOUT_MS = 120_000;
 const STABLE_WINDOW_MS = 4_000;
 const SHUTDOWN_TIMEOUT_MS = 15_000;
 const OUTPUT_LIMIT = 120;
+const artifactDir = process.env.DASHDROP_SMOKE_ARTIFACT_DIR
+  ? path.resolve(process.cwd(), process.env.DASHDROP_SMOKE_ARTIFACT_DIR)
+  : null;
 
 const readyMarkers = [
   "Running `target/debug/dashdrop`",
@@ -57,6 +61,42 @@ function delay(ms) {
 
 async function cleanupConfigDir() {
   await fs.rm(configDir, { recursive: true, force: true });
+}
+
+async function writeFailureArtifacts() {
+  if (!artifactDir) {
+    return;
+  }
+
+  await fs.mkdir(artifactDir, { recursive: true });
+  await fs.writeFile(path.join(artifactDir, "recent-output.log"), recentOutput() + "\n", "utf8");
+  try {
+    const startupError = await fs.readFile(startupErrorLog, "utf8");
+    await fs.writeFile(path.join(artifactDir, "startup-error.log"), startupError, "utf8");
+  } catch {}
+}
+
+function getFreePort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close(() => reject(new Error("failed to resolve free TCP port")));
+        return;
+      }
+      const { port } = address;
+      server.close((closeError) => {
+        if (closeError) {
+          reject(closeError);
+          return;
+        }
+        resolve(port);
+      });
+    });
+  });
 }
 
 async function terminateChild() {
@@ -113,6 +153,12 @@ async function finish(code, message) {
 
   await terminateChild();
 
+  if (code !== 0) {
+    try {
+      await writeFailureArtifacts();
+    } catch {}
+  }
+
   try {
     await cleanupConfigDir();
   } catch {}
@@ -158,6 +204,8 @@ function checkReady(chunk) {
 
 async function main() {
   await fs.mkdir(configDir, { recursive: true });
+  const devPort = await getFreePort();
+  const hmrPort = await getFreePort();
 
   child = spawn("npm", ["run", "tauri", "dev"], {
     cwd: process.cwd(),
@@ -165,6 +213,9 @@ async function main() {
       ...process.env,
       DASHDROP_CONFIG_DIR: configDir,
       TAURI_DEV_HOST: "127.0.0.1",
+      DASHDROP_TAURI_DEV_PORT: String(devPort),
+      DASHDROP_TAURI_HMR_PORT: String(hmrPort),
+      DASHDROP_TAURI_DEV_URL: `http://127.0.0.1:${devPort}`,
     },
     detached: process.platform !== "win32",
     stdio: ["ignore", "pipe", "pipe"],

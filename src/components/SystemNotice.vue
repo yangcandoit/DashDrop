@@ -1,23 +1,20 @@
 <script setup lang="ts">
 import { computed } from 'vue';
+import type { SystemNoticeState } from '../store';
 
-const props = defineProps<{ message: string }>();
-const emit = defineEmits<{ (e: 'dismiss'): void }>();
+const props = defineProps<{ notice: SystemNoticeState }>();
+const emit = defineEmits<{
+  (e: 'dismiss'): void;
+  (e: 'action', target: NonNullable<SystemNoticeState['actionTarget']>): void;
+}>();
 
 const parts = computed(() => {
-  const [summaryRaw, nextRaw] = props.message.split(' Next: ');
+  const [summaryRaw, nextRaw] = props.notice.message.split(' Next: ');
   const summary = summaryRaw.trim();
   const next = nextRaw?.trim();
-  const lower = summary.toLowerCase();
+  const tone = props.notice.tone ?? 'info';
 
-  let tone: 'error' | 'warning' | 'info' = 'info';
-  if (lower.includes('security warning') || lower.includes('fingerprint')) {
-    tone = 'warning';
-  } else if (lower.includes('failed') || lower.includes('error')) {
-    tone = 'error';
-  }
-
-  return { summary, next, tone };
+  return { summary, next, tone, actionLabel: props.notice.actionLabel, actionTarget: props.notice.actionTarget };
 });
 </script>
 
@@ -28,7 +25,17 @@ const parts = computed(() => {
         {{ parts.summary }}
         <span v-if="parts.next" class="notice-next">{{ parts.next }}</span>
       </p>
-      <button class="notice-dismiss" type="button" @click="emit('dismiss')">Dismiss</button>
+      <div class="notice-actions">
+        <button
+          v-if="parts.actionLabel && parts.actionTarget"
+          class="notice-action"
+          type="button"
+          @click="emit('action', parts.actionTarget)"
+        >
+          {{ parts.actionLabel }}
+        </button>
+        <button class="notice-dismiss" type="button" @click="emit('dismiss')">Dismiss</button>
+      </div>
     </article>
   </section>
 </template>
@@ -69,6 +76,13 @@ const parts = computed(() => {
   color: var(--text-muted);
 }
 
+.notice-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.notice-action,
 .notice-dismiss {
   border: 1px solid var(--border-subtle);
   border-radius: 8px;
@@ -84,6 +98,11 @@ const parts = computed(() => {
   .notice-card {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .notice-actions {
+    width: 100%;
+    justify-content: flex-end;
   }
 }
 </style>

@@ -5,9 +5,10 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 
 use crate::local_ipc::{
-    decode_message, read_frame_bytes, resolve_local_ipc_endpoint, write_framed_message,
-    LocalIpcCommand, LocalIpcEndpoint, LocalIpcResult, LocalIpcWireRequest, LocalIpcWireResponse,
-    LocalResponseEnvelope, LOCAL_IPC_PROTO_VERSION,
+    decode_message, read_frame_bytes, resolve_local_ipc_endpoint,
+    resolve_local_ipc_endpoint_for_kind, write_framed_message, LocalAuthContext,
+    LocalIpcAccessGrant, LocalIpcCommand, LocalIpcEndpoint, LocalIpcEndpointKind, LocalIpcResult,
+    LocalIpcWireRequest, LocalIpcWireResponse, LocalResponseEnvelope, LOCAL_IPC_PROTO_VERSION,
 };
 
 #[allow(dead_code)]
@@ -40,6 +41,12 @@ impl LocalIpcClient {
         }
     }
 
+    pub fn from_config_dir_for_kind(config_dir: &Path, kind: LocalIpcEndpointKind) -> Self {
+        Self {
+            endpoint: resolve_local_ipc_endpoint_for_kind(config_dir, kind),
+        }
+    }
+
     pub fn from_endpoint(endpoint: LocalIpcEndpoint) -> Self {
         Self { endpoint }
     }
@@ -47,6 +54,66 @@ impl LocalIpcClient {
     pub async fn send(&self, command: LocalIpcCommand) -> Result<LocalIpcWireResponse> {
         self.send_envelope(command.to_wire_request(uuid::Uuid::new_v4().to_string(), None))
             .await
+    }
+
+    pub async fn send_authenticated(
+        &self,
+        command: LocalIpcCommand,
+        access_token: &str,
+    ) -> Result<LocalIpcWireResponse> {
+        self.send_envelope(command.to_wire_request(
+            uuid::Uuid::new_v4().to_string(),
+            Some(LocalAuthContext {
+                access_token: Some(access_token.to_string()),
+            }),
+        ))
+        .await
+    }
+
+    pub async fn issue_access_grant(
+        &self,
+        current_access_token: Option<&str>,
+    ) -> Result<LocalIpcAccessGrant> {
+        let request = LocalIpcCommand::AuthIssue.to_wire_request(
+            uuid::Uuid::new_v4().to_string(),
+            current_access_token.map(|access_token| LocalAuthContext {
+                access_token: Some(access_token.to_string()),
+            }),
+        );
+        match self.send_envelope(request).await? {
+            LocalIpcWireResponse::Ok(ok) => {
+                let payload = ok
+                    .payload
+                    .ok_or_else(|| anyhow!("missing auth issue payload"))?;
+                let auth = payload
+                    .get("auth")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("missing payload.auth"))?;
+                serde_json::from_value(auth).context("decode local IPC auth grant")
+            }
+            LocalIpcWireResponse::Err(err) => Err(anyhow!(
+                "daemon auth issue failed: {} ({})",
+                err.error.message,
+                err.error.code
+            )),
+        }
+    }
+
+    pub async fn revoke_access_grant(&self, access_token: &str) -> Result<()> {
+        let request = LocalIpcCommand::AuthRevoke.to_wire_request(
+            uuid::Uuid::new_v4().to_string(),
+            Some(LocalAuthContext {
+                access_token: Some(access_token.to_string()),
+            }),
+        );
+        match self.send_envelope(request).await? {
+            LocalIpcWireResponse::Ok(_) => Ok(()),
+            LocalIpcWireResponse::Err(err) => Err(anyhow!(
+                "daemon auth revoke failed: {} ({})",
+                err.error.message,
+                err.error.code
+            )),
+        }
     }
 
     pub async fn send_envelope(
@@ -130,9 +197,7 @@ impl LocalIpcClient {
 }
 
 #[cfg(windows)]
-fn with_tokio_io_context<T>(
-    operation: impl FnOnce() -> std::io::Result<T>,
-) -> std::io::Result<T> {
+fn with_tokio_io_context<T>(operation: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {
     if tokio::runtime::Handle::try_current().is_ok() {
         operation()
     } else {
@@ -179,7 +244,7 @@ mod tests {
 
     use crate::crypto::Identity;
     use crate::daemon::server;
-    use crate::local_ipc::{LocalIpcCommand, LocalIpcWireResponse};
+    use crate::local_ipc::{LocalAuthContext, LocalIpcCommand, LocalIpcWireResponse};
     use crate::state::{
         AppConfig, AppState, DeviceInfo, Platform, ReachabilityStatus, SessionInfo,
     };
@@ -237,9 +302,21 @@ mod tests {
 
         let config_dir =
             std::env::temp_dir().join(format!("dashdrop-ipc-contract-{}", uuid::Uuid::new_v4()));
-        let server = server::spawn(Arc::clone(&state), None, &config_dir).expect("spawn server");
+        let server = server::spawn(
+            Arc::clone(&state),
+            None,
+            &config_dir,
+            crate::local_ipc::LocalIpcEndpointKind::Service,
+        )
+        .expect("spawn server");
         let client = LocalIpcClient::from_config_dir(&config_dir);
-        let request = LocalIpcCommand::ConfigGet.to_wire_request("req-contract", None);
+        let grant = client.issue_access_grant(None).await.expect("access grant");
+        let request = LocalIpcCommand::ConfigGet.to_wire_request(
+            "req-contract",
+            Some(LocalAuthContext {
+                access_token: Some(grant.access_token),
+            }),
+        );
 
         let response = client.send_envelope(request).await.expect("ipc response");
 

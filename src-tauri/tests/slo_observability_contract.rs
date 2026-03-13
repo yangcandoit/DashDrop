@@ -70,6 +70,7 @@ async fn notification_activation_records_receiver_prompted_at() {
                 name: "a.txt".into(),
                 rel_path: "a.txt".into(),
                 size: 1,
+                hash: None,
                 risk_class: None,
             }],
             status: TransferStatus::PendingAccept,

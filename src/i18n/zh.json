@@ -1,0 +1,32 @@
+{
+  "common": {
+    "send": "发送",
+    "receive": "接收",
+    "cancel": "取消",
+    "confirm": "确认",
+    "accept": "接受",
+    "reject": "拒绝",
+    "completed": "已完成",
+    "failed": "失败",
+    "transferring": "传输中...",
+    "pending": "等待确认",
+    "settings": "设置",
+    "history": "传输历史",
+    "devices": "信任设备"
+  },
+  "errors": {
+    "E_PROTOCOL": "协议握手失败",
+    "E_IDENTITY": "设备身份校验不通过",
+    "E_NETWORK": "网络连接超时",
+    "E_PERMISSION": "存储权限不足",
+    "E_DISK_FULL": "磁盘空间不足",
+    "E_DAEMON_OFFLINE": "后台服务已掉线，尝试重启中...",
+    "E_DAEMON_CRASH": "后台服务异常崩溃，请手动重启应用"
+  },
+  "actions": {
+    "next_steps_quic": "请检查双方是否在同一局域网，且防火墙允许 53319 端口。",
+    "next_steps_mdns": "发现设备失败，请检查路由器是否开启了多播 (Multicast/mDNS)。",
+    "next_steps_disk": "请清理接收端的存储空间。",
+    "next_steps_id": "安全指纹不匹配，可能是该设备尝试伪装成您的信任设备。"
+  }
+}

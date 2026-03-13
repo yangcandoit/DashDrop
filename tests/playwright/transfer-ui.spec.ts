@@ -5,10 +5,21 @@ test.beforeEach(async ({ page }) => {
     type Handler = (payload: unknown) => void;
     const listeners = new Map<string, Set<Handler>>();
     const expiredIncomingIds = new Set<string>();
+    const params = new URLSearchParams(window.location.search);
+    const requestedControlPlaneMode = params.get("requestedControlPlaneMode") ?? "daemon";
+    const controlPlaneMode = params.get("controlPlaneMode") ?? "in_process";
+    const initialRuntimeFeedFailureCount = Number(params.get("runtimeFeedFailureCount") ?? "0");
     const state = {
       devices: {} as Record<string, any>,
       transfers: {} as Record<string, any>,
       incoming: {} as Record<string, any>,
+      requestedControlPlaneMode,
+      controlPlaneMode,
+      runtimeEvents: [] as Array<{ seq: number; event: string; payload: unknown; emitted_at_unix_ms: number }>,
+      runtimeEventSeq: 0,
+      runtimeFeedFailureCount: Number.isFinite(initialRuntimeFeedFailureCount)
+        ? Math.max(0, initialRuntimeFeedFailureCount)
+        : 0,
       history: [] as any[],
       connectByAddressCalls: [] as string[],
       sendFileCalls: [] as Array<{ peerFp: string; paths: string[] }>,
@@ -17,16 +28,44 @@ test.beforeEach(async ({ page }) => {
       trustedPeers: [] as any[],
     };
 
+    const recordRuntimeEvent = (event: string, payload: unknown) => {
+      state.runtimeEventSeq += 1;
+      state.runtimeEvents.push({
+        seq: state.runtimeEventSeq,
+        event,
+        payload,
+        emitted_at_unix_ms: Date.now(),
+      });
+    };
+
     const emit = (event: string, payload: unknown) => {
+      recordRuntimeEvent(event, payload);
       const set = listeners.get(event);
       if (!set) return;
       for (const handler of set) handler(payload);
     };
+    const emitLocalOnly = (event: string, payload: unknown) => {
+      const set = listeners.get(event);
+      if (!set) return;
+      for (const handler of set) handler(payload);
+    };
+    const emitRuntimeOnly = (event: string, payload: unknown) => {
+      recordRuntimeEvent(event, payload);
+    };
 
     (window as any).__emitTestEvent = (event: string, payload: unknown) => emit(event, payload);
+    (window as any).__emitLocalOnlyEvent = (event: string, payload: unknown) => emitLocalOnly(event, payload);
+    (window as any).__emitRuntimeOnlyEvent = (event: string, payload: unknown) => emitRuntimeOnly(event, payload);
     (window as any).__getTestState = () => JSON.parse(JSON.stringify(state));
     (window as any).__setTrustedPeers = (peers: any[]) => {
       state.trustedPeers = peers.map((peer) => ({ ...peer }));
+    };
+    (window as any).__setControlPlaneModes = (requested: string, actual: string) => {
+      state.requestedControlPlaneMode = requested;
+      state.controlPlaneMode = actual;
+    };
+    (window as any).__setRuntimeFeedFailureCount = (count: number) => {
+      state.runtimeFeedFailureCount = Number.isFinite(count) ? Math.max(0, count) : 0;
     };
     (window as any).__setMockDevices = (devices: any[]) => {
       state.devices = Object.fromEntries(devices.map((device) => [device.fingerprint, { ...device }]));
@@ -71,10 +110,17 @@ test.beforeEach(async ({ page }) => {
             return null;
           case "get_runtime_status":
             return {
+              requested_control_plane_mode: state.requestedControlPlaneMode,
+              control_plane_mode: state.controlPlaneMode,
+              runtime_profile: "packaged",
               local_port: 7000,
               mdns_registered: true,
               discovered_devices: 2,
               trusted_devices: state.trustedPeers.length,
+              daemon_status: "connected_after_retry",
+              daemon_connect_attempts: 3,
+              daemon_connect_strategy: "attach_existing",
+              daemon_binary_path: "/Applications/DashDrop.app/Contents/MacOS/dashdropd",
             };
           case "get_transfer_metrics":
             return {
@@ -92,10 +138,17 @@ test.beforeEach(async ({ page }) => {
           case "get_discovery_diagnostics":
             return {
               runtime: {
+                requested_control_plane_mode: state.requestedControlPlaneMode,
+                control_plane_mode: state.controlPlaneMode,
+                runtime_profile: "packaged",
                 local_port: 7000,
                 mdns_registered: true,
                 discovered_devices: Object.keys(state.devices).length,
                 trusted_devices: state.trustedPeers.length,
+                daemon_status: "connected_after_retry",
+                daemon_connect_attempts: 3,
+                daemon_connect_strategy: "attach_existing",
+                daemon_binary_path: "/Applications/DashDrop.app/Contents/MacOS/dashdropd",
               },
               service_type: "_dashdrop._udp.local.",
               own_fingerprint: "local-fp",
@@ -124,6 +177,22 @@ test.beforeEach(async ({ page }) => {
             };
           case "get_trusted_peers":
             return state.trustedPeers;
+          case "get_control_plane_mode":
+            return state.controlPlaneMode;
+          case "get_runtime_events":
+            if (state.runtimeFeedFailureCount > 0) {
+              state.runtimeFeedFailureCount -= 1;
+              throw new Error("mock daemon event feed unavailable");
+            }
+            return {
+              events: state.runtimeEvents
+                .filter((entry) => entry.seq > Number(args?.afterSeq ?? 0))
+                .slice(0, Number(args?.limit ?? 100)),
+              generation: "test-feed",
+              oldest_available_seq: state.runtimeEvents[0]?.seq ?? null,
+              latest_available_seq: state.runtimeEvents[state.runtimeEvents.length - 1]?.seq ?? 0,
+              resync_required: false,
+            };
           case "set_trusted_alias": {
             const fp = String(args?.fp ?? "");
             const alias = args?.alias == null ? null : String(args.alias);
@@ -378,8 +447,51 @@ test("history auto-refreshes on terminal event", async ({ page }) => {
   await expect(page.getByText("Peer Auto")).toBeVisible();
 });
 
+test("requested daemon fallback still uses in-process runtime events", async ({ page }) => {
+  await page.evaluate(() => {
+    (window as any).__setControlPlaneModes("daemon", "in_process");
+    (window as any).__seedIncomingTransfer("t-fallback", "Peer Fallback");
+  });
+
+  await page.getByRole("button", { name: "Transfers" }).click();
+  await expect(page.locator("article.incoming-card", { hasText: "Peer Fallback" })).toBeVisible();
+});
+
+test("daemon mode ignores local-only listeners and consumes daemon event feed", async ({ page }) => {
+  await page.goto("/?requestedControlPlaneMode=daemon&controlPlaneMode=daemon");
+  await page.getByRole("button", { name: "Transfers" }).click();
+
+  await page.evaluate(() => {
+    (window as any).__emitLocalOnlyEvent("transfer_incoming", {
+      transfer_id: "t-local-only",
+      sender_name: "Peer Local Only",
+      sender_fp: "peer-local-only",
+      trusted: false,
+      items: [{ file_id: 1, name: "local-only.txt", rel_path: "local-only.txt", size: 1 }],
+      total_size: 1,
+      revision: 0,
+    });
+  });
+
+  await expect(page.locator("article.incoming-card", { hasText: "Peer Local Only" })).toHaveCount(0);
+
+  await page.evaluate(() => {
+    (window as any).__emitRuntimeOnlyEvent("transfer_incoming", {
+      transfer_id: "t-daemon-feed",
+      sender_name: "Peer Daemon Feed",
+      sender_fp: "peer-daemon-feed",
+      trusted: false,
+      items: [{ file_id: 1, name: "daemon-feed.txt", rel_path: "daemon-feed.txt", size: 1 }],
+      total_size: 1,
+      revision: 0,
+    });
+  });
+
+  await expect(page.locator("article.incoming-card", { hasText: "Peer Daemon Feed" })).toBeVisible();
+});
+
 test("identity mismatch warning is visible", async ({ page }) => {
-  await page.getByRole("button", { name: "Nearby" }).click();
+  await page.getByRole("button", { name: "Nearby", exact: true }).click();
   await page.evaluate(() => {
     (window as any).__emitTestEvent("identity_mismatch", {
       expected_fp: "expected-fp",
@@ -388,6 +500,84 @@ test("identity mismatch warning is visible", async ({ page }) => {
     });
   });
   await expect(page.getByText("Security warning (connect): peer identity mismatch")).toBeVisible();
+  await page.getByRole("button", { name: "Open Security Events" }).click();
+  await expect(page.getByRole("heading", { name: "Security Events" })).toBeVisible();
+});
+
+test("daemon background hide notice links to transfers", async ({ page }) => {
+  await page.evaluate(() => {
+    (window as any).__emitTestEvent("system_error", {
+      code: "DAEMON_UI_HIDDEN",
+      subsystem: "ui_shell",
+      message:
+        "DashDrop is still running in the background. Active transfers and discovery stay attached to the daemon control plane.",
+    });
+  });
+
+  await expect(page.getByText("DashDrop is still running in the background.")).toBeVisible();
+  await page.getByRole("button", { name: "Open Transfers" }).click();
+  await expect(page.getByRole("heading", { name: "Transfers" })).toBeVisible();
+});
+
+test("app window revealed clears daemon background hide notice", async ({ page }) => {
+  await page.evaluate(() => {
+    (window as any).__emitTestEvent("system_error", {
+      code: "DAEMON_UI_HIDDEN",
+      subsystem: "ui_shell",
+      message:
+        "DashDrop is still running in the background. Active transfers and discovery stay attached to the daemon control plane.",
+    });
+  });
+
+  await expect(page.getByText("DashDrop is still running in the background.")).toBeVisible();
+
+  await page.evaluate(() => {
+    (window as any).__emitTestEvent("app_window_revealed", {
+      source: "reopen",
+    });
+  });
+
+  await expect(page.getByText("DashDrop is still running in the background.")).toHaveCount(0);
+});
+
+test("daemon event feed warning clears after recovery", async ({ page }) => {
+  await page.evaluate(() => {
+    (window as any).__emitTestEvent("system_error", {
+      code: "DAEMON_EVENT_FEED_UNAVAILABLE",
+      subsystem: "daemon_event_feed",
+      message:
+        "DashDrop temporarily lost contact with the daemon event feed. The UI will retry automatically.",
+    });
+  });
+
+  await expect(page.getByText("DashDrop temporarily lost contact with the daemon event feed.")).toBeVisible();
+  await page.getByRole("button", { name: "Open Settings" }).click();
+  await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
+
+  await page.evaluate(() => {
+    (window as any).__emitTestEvent("daemon_control_plane_recovered", {
+      source: "daemon_event_feed",
+    });
+  });
+
+  await expect(page.getByText("DashDrop temporarily lost contact with the daemon event feed.")).toHaveCount(0);
+});
+
+test("daemon event feed polling failure warns and auto-recovers", async ({ page }) => {
+  await page.goto("/?requestedControlPlaneMode=daemon&controlPlaneMode=daemon&runtimeFeedFailureCount=3");
+
+  const warning = page.getByText("DashDrop temporarily lost contact with the daemon event feed.");
+  await expect(warning).toBeVisible({ timeout: 5000 });
+  await expect(warning).toHaveCount(0, { timeout: 5000 });
+});
+
+test("settings runtime cards keep requested mode separate from actual control plane", async ({ page }) => {
+  await page.goto("/?requestedControlPlaneMode=daemon&controlPlaneMode=in_process");
+  await page.locator(".rail-nav").getByRole("button", { name: "Settings" }).click();
+
+  await expect(page.locator(".runtime-card", { hasText: "Requested Mode" })).toContainText("daemon");
+  await expect(page.locator(".runtime-card", { hasText: "Control Plane" })).toContainText("in_process");
+  await expect(page.locator(".runtime-card", { hasText: "Daemon Status" })).toContainText("connected_after_retry");
 });
 
 test("history filters by peer and status", async ({ page }) => {
@@ -503,7 +693,7 @@ test("nearby and trusted share online rule when session has no usable address", 
     });
   });
 
-  await page.getByRole("button", { name: "Nearby" }).click();
+  await page.getByRole("button", { name: "Nearby", exact: true }).click();
   await expect(page.getByText("Discovering (address pending)")).toBeVisible();
   await expect(page.locator(".device-card", { hasText: "NoAddr Peer" }).getByText("Unavailable")).toBeVisible();
 
@@ -539,7 +729,7 @@ test("external share event queues files and nearby sends them to selected device
     });
   });
 
-  await page.getByRole("button", { name: "Nearby" }).click();
+  await page.getByRole("button", { name: "Nearby", exact: true }).click();
   await expect(page.locator(".share-banner")).toContainText("2 shared items");
   await page.locator(".device-card", { hasText: "Trusted Peer" }).click();
 
@@ -553,11 +743,17 @@ test("external share event queues files and nearby sends them to selected device
 test("settings diagnostics copy includes extended discovery fields", async ({ page }) => {
   await page.locator(".app-rail").getByRole("button", { name: "Settings", exact: true }).click();
   await expect(page.getByText("Verification Code")).toBeVisible();
+  await expect(page.getByText("packaged")).toBeVisible();
+  await expect(page.getByText("attach_existing")).toBeVisible();
+  await expect(page.getByText("3", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Copy Discovery Diagnostics" }).click();
 
   const copied = await page.evaluate(() => (window as any).__getClipboardText());
   const diagnostics = JSON.parse(copied);
 
+  expect(diagnostics.runtime.runtime_profile).toBe("packaged");
+  expect(diagnostics.runtime.daemon_connect_attempts).toBe(3);
+  expect(diagnostics.runtime.daemon_connect_strategy).toBe("attach_existing");
   expect(diagnostics.service_type).toBe("_dashdrop._udp.local.");
   expect(diagnostics.listener_mode).toBe("dual_stack");
   expect(Array.isArray(diagnostics.listener_addrs)).toBeTruthy();

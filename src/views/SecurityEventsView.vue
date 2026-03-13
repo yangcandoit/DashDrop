@@ -1,6 +1,9 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue';
-import { getSecurityEvents } from '../ipc';
+import { onMounted, onUnmounted, ref } from 'vue';
+import {
+  getSecurityEvents,
+  subscribeRuntimeEvents,
+} from '../ipc';
 import type { SecurityEvent } from '../types';
 
 const emit = defineEmits(['openSettings']);
@@ -8,6 +11,7 @@ const emit = defineEmits(['openSettings']);
 const loading = ref(true);
 const events = ref<SecurityEvent[]>([]);
 const loadError = ref<string | null>(null);
+const unlistens: Array<() => void> = [];
 
 const load = async () => {
   loading.value = true;
@@ -23,6 +27,23 @@ const load = async () => {
 };
 
 onMounted(load);
+onMounted(async () => {
+  unlistens.push(
+    await subscribeRuntimeEvents(
+      ['identity_mismatch', 'fingerprint_changed', 'system_error', 'daemon_control_plane_recovered', 'daemon_event_feed_resync_required'],
+      () => {
+        void load();
+      },
+    ),
+  );
+});
+
+onUnmounted(() => {
+  for (const unlisten of unlistens) {
+    unlisten();
+  }
+  unlistens.length = 0;
+});
 
 const formatTime = (unix: number) => new Date(unix * 1000).toLocaleString();
 </script>

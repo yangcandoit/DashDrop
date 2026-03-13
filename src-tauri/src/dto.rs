@@ -102,8 +102,15 @@ pub struct TrustedPeerView {
     pub fingerprint: String,
     pub name: String,
     pub paired_at: u64,
+    pub trust_level: crate::state::TrustLevel,
+    pub last_verification_method: crate::state::TrustVerificationMethod,
     pub alias: Option<String>,
     pub last_used_at: Option<u64>,
+    pub remote_confirmation_material_seen_at: Option<u64>,
+    pub local_confirmation_at: Option<u64>,
+    pub mutual_confirmed_at: Option<u64>,
+    pub frozen_at: Option<u64>,
+    pub freeze_reason: Option<String>,
 }
 
 impl From<&TrustedPeer> for TrustedPeerView {
@@ -112,8 +119,15 @@ impl From<&TrustedPeer> for TrustedPeerView {
             fingerprint: value.fingerprint.clone(),
             name: value.name.clone(),
             paired_at: value.paired_at,
+            trust_level: value.trust_level.clone(),
+            last_verification_method: value.last_verification_method.clone(),
             alias: value.alias.clone(),
             last_used_at: value.last_used_at,
+            remote_confirmation_material_seen_at: value.remote_confirmation_material_seen_at,
+            local_confirmation_at: value.local_confirmation_at,
+            mutual_confirmed_at: value.mutual_confirmed_at,
+            frozen_at: value.frozen_at,
+            freeze_reason: value.freeze_reason.clone(),
         }
     }
 }

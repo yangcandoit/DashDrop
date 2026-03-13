@@ -7,6 +7,7 @@ const props = defineProps<{
   device: DeviceView;
   isSending?: boolean;
   disabled?: boolean;
+  highlighted?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -82,7 +83,7 @@ const isDisabled = computed(() => Boolean(props.disabled));
 <template>
   <div
     class="device-card animate-fade-in"
-    :class="{ 'drag-over': isDragOver, offline: isOffline, disabled: isDisabled }"
+    :class="{ 'drag-over': isDragOver, offline: isOffline, disabled: isDisabled, highlighted: props.highlighted }"
     @dragenter="onDragEnter"
     @dragover="onDragOver"
     @dragleave="onDragLeave"
@@ -101,6 +102,7 @@ const isDisabled = computed(() => Boolean(props.disabled));
     </div>
 
     <div class="status" v-if="isSending">Sending</div>
+    <div class="status highlighted" v-else-if="props.highlighted">Just Paired</div>
     <div class="status" v-else-if="isDisabled">Unavailable</div>
     <div class="status trusted" v-else-if="device.trusted">Trusted</div>
 
@@ -128,6 +130,16 @@ const isDisabled = computed(() => Boolean(props.disabled));
 .device-card.drag-over {
   border-color: color-mix(in srgb, var(--accent) 45%, transparent);
   box-shadow: 0 0 0 2px rgba(0, 113, 227, 0.14);
+}
+
+.device-card.highlighted {
+  border-color: rgba(44, 108, 76, 0.36);
+  box-shadow:
+    0 0 0 2px rgba(44, 108, 76, 0.12),
+    0 14px 30px rgba(44, 108, 76, 0.08);
+  background:
+    radial-gradient(circle at top right, rgba(194, 227, 208, 0.42), transparent 38%),
+    #fff;
 }
 
 .device-card.offline {
@@ -188,6 +200,12 @@ h3 {
   color: var(--success);
   border-color: rgba(47, 125, 50, 0.3);
   background: rgba(47, 125, 50, 0.06);
+}
+
+.status.highlighted {
+  color: #23513d;
+  border-color: rgba(44, 108, 76, 0.28);
+  background: rgba(44, 108, 76, 0.08);
 }
 
 .drag-overlay {

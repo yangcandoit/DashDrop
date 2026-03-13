@@ -21,9 +21,296 @@
       "csp": "default-src 'self'; img-src 'self' asset: data: blob:; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost"
     }
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": [
+          "dashdrop"
+        ]
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",
+    "category": "Utility",
+    "shortDescription": "Nearby file transfer with alternate Open With entry points for packaged desktop builds.",
+    "longDescription": "DashDrop ships a daemon-backed desktop shell and registers non-default file associations for common user files so Finder, Explorer, and Linux desktop launchers can hand off selected paths to the existing share queue without changing the frontend contract.",
+    "fileAssociations": [
+      {
+        "name": "DashDrop Plain Text Share",
+        "description": "Send plain text files with DashDrop",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "text/plain",
+        "ext": [
+          "txt"
+        ],
+        "contentTypes": [
+          "public.plain-text"
+        ]
+      },
+      {
+        "name": "DashDrop Markdown Share",
+        "description": "Send markdown files with DashDrop",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "text/markdown",
+        "ext": [
+          "md"
+        ],
+        "contentTypes": [
+          "net.daringfireball.markdown"
+        ]
+      },
+      {
+        "name": "DashDrop CSV Share",
+        "description": "Send CSV files with DashDrop",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "text/csv",
+        "ext": [
+          "csv"
+        ],
+        "contentTypes": [
+          "public.comma-separated-values-text"
+        ]
+      },
+      {
+        "name": "DashDrop JSON Share",
+        "description": "Send JSON files with DashDrop",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "application/json",
+        "ext": [
+          "json"
+        ],
+        "contentTypes": [
+          "public.json"
+        ]
+      },
+      {
+        "name": "DashDrop Rich Text Share",
+        "description": "Send rich text files with DashDrop",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "application/rtf",
+        "ext": [
+          "rtf"
+        ],
+        "contentTypes": [
+          "public.rtf"
+        ]
+      },
+      {
+        "name": "DashDrop PDF Share",
+        "description": "Send PDF files with DashDrop",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "application/pdf",
+        "ext": [
+          "pdf"
+        ],
+        "contentTypes": [
+          "com.adobe.pdf"
+        ]
+      },
+      {
+        "name": "DashDrop Word Share",
+        "description": "Send .doc files with DashDrop",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "application/msword",
+        "ext": [
+          "doc"
+        ],
+        "contentTypes": [
+          "public.composite-content"
+        ]
+      },
+      {
+        "name": "DashDrop Word OpenXML Share",
+        "description": "Send .docx files with DashDrop",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "ext": [
+          "docx"
+        ],
+        "contentTypes": [
+          "public.composite-content"
+        ]
+      },
+      {
+        "name": "DashDrop Excel Share",
+        "description": "Send .xls files with DashDrop",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "application/vnd.ms-excel",
+        "ext": [
+          "xls"
+        ],
+        "contentTypes": [
+          "public.composite-content"
+        ]
+      },
+      {
+        "name": "DashDrop Excel OpenXML Share",
+        "description": "Send .xlsx files with DashDrop",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ext": [
+          "xlsx"
+        ],
+        "contentTypes": [
+          "public.composite-content"
+        ]
+      },
+      {
+        "name": "DashDrop PowerPoint Share",
+        "description": "Send .ppt files with DashDrop",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "application/vnd.ms-powerpoint",
+        "ext": [
+          "ppt"
+        ],
+        "contentTypes": [
+          "public.composite-content"
+        ]
+      },
+      {
+        "name": "DashDrop PowerPoint OpenXML Share",
+        "description": "Send .pptx files with DashDrop",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "ext": [
+          "pptx"
+        ],
+        "contentTypes": [
+          "public.composite-content"
+        ]
+      },
+      {
+        "name": "DashDrop Image Share",
+        "description": "Send images with DashDrop",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "image/*",
+        "ext": [
+          "png",
+          "jpg",
+          "jpeg",
+          "gif",
+          "webp",
+          "heic",
+          "bmp",
+          "tif",
+          "tiff",
+          "svg"
+        ],
+        "contentTypes": [
+          "public.image",
+          "public.svg-image"
+        ]
+      },
+      {
+        "name": "DashDrop Audio Share",
+        "description": "Send audio files with DashDrop",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "audio/*",
+        "ext": [
+          "mp3",
+          "m4a",
+          "aac",
+          "wav",
+          "flac",
+          "ogg"
+        ],
+        "contentTypes": [
+          "public.audio"
+        ]
+      },
+      {
+        "name": "DashDrop Video Share",
+        "description": "Send videos with DashDrop",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "video/*",
+        "ext": [
+          "mp4",
+          "mov",
+          "m4v",
+          "mkv",
+          "avi",
+          "webm"
+        ],
+        "contentTypes": [
+          "public.movie",
+          "public.video"
+        ]
+      },
+      {
+        "name": "DashDrop Zip Share",
+        "description": "Send zip archives with DashDrop",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "application/zip",
+        "ext": [
+          "zip"
+        ],
+        "contentTypes": [
+          "public.archive"
+        ]
+      },
+      {
+        "name": "DashDrop 7-Zip Share",
+        "description": "Send 7z archives with DashDrop",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "application/x-7z-compressed",
+        "ext": [
+          "7z"
+        ],
+        "contentTypes": [
+          "public.archive"
+        ]
+      },
+      {
+        "name": "DashDrop Tar Share",
+        "description": "Send tar archives with DashDrop",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "application/x-tar",
+        "ext": [
+          "tar"
+        ],
+        "contentTypes": [
+          "public.archive"
+        ]
+      },
+      {
+        "name": "DashDrop Gzip Share",
+        "description": "Send gzip archives with DashDrop",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "mimeType": "application/gzip",
+        "ext": [
+          "gz",
+          "tgz"
+        ],
+        "contentTypes": [
+          "public.archive"
+        ]
+      }
+    ],
+    "externalBin": [
+      "binaries/dashdropd",
+      "binaries/dashdrop-ble-bridge"
+    ],
     "macOS": {
       "infoPlist": "Info.plist"
     },

@@ -232,6 +232,30 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-bundle
+          {
+            echo "DashDrop signing status"
+            echo "======================"
+            echo "Runner OS: ${RUNNER_OS}"
+            if [[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" && -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]]; then
+              echo "Updater signing: enabled"
+            else
+              echo "Updater signing: disabled"
+            fi
+            if [[ "${RUNNER_OS}" == "macOS" ]]; then
+              if [[ -n "${APPLE_SIGNING_IDENTITY:-}" && -n "${APPLE_TEAM_ID:-}" ]]; then
+                echo "macOS app signing/notarization: enabled"
+              else
+                echo "macOS app signing/notarization: disabled"
+              fi
+            fi
+            if [[ "${RUNNER_OS}" == "Windows" ]]; then
+              if [[ -n "${WINDOWS_CERT_BASE64:-}" && -n "${WINDOWS_CERT_PASSWORD:-}" ]]; then
+                echo "Windows code signing: enabled"
+              else
+                echo "Windows code signing: disabled"
+              fi
+            fi
+          } > release-bundle/SIGNING_STATUS.txt
           cat > release-bundle/INSTALL_NOTES.txt <<'EOF'
           DashDrop unsigned build install notes
           ===================================

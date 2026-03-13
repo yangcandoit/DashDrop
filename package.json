@@ -6,12 +6,15 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
-    "test:e2e:contract": "node tests/e2e_transfer_flow.mjs",
+    "test:e2e:contract": "node tests/e2e_transfer_flow.mjs && node --test --experimental-transform-types tests/runtime_event_routing.test.ts tests/security_pairing.test.ts tests/daemon_event_subscription.test.ts",
     "test:e2e": "playwright test",
     "test:tauri:smoke": "node tests/tauri_runtime_smoke.mjs",
+    "test:tauri:daemon-smoke": "node tests/tauri_daemon_smoke.mjs",
+    "test:tauri:bundle-smoke": "node tests/tauri_bundle_smoke.mjs",
     "test": "npm run test:e2e",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri:prepare-sidecar": "node scripts/prepare_sidecar.mjs",
+    "tauri": "node scripts/tauri_wrapper.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
@@ -19,11 +22,15 @@
     "@tauri-apps/plugin-notification": "^2.3.3",
     "@tauri-apps/plugin-opener": "^2",
     "@tauri-apps/plugin-store": "^2.4.2",
-    "vue": "^3.5.13"
+    "jsqr": "^1.4.0",
+    "qrcode": "^1.5.4",
+    "vue": "^3.5.13",
+    "vue-i18n": "^11.3.0"
   },
   "devDependencies": {
     "@playwright/test": "^1.58.2",
     "@tauri-apps/cli": "^2",
+    "@types/qrcode": "^1.5.6",
     "@vitejs/plugin-vue": "^5.2.1",
     "typescript": "~5.6.2",
     "vite": "^6.0.3",

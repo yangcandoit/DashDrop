@@ -1,10 +1,19 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, computed } from 'vue';
+import { ref, onMounted, onUnmounted, computed, watch } from 'vue';
 import { open, message } from '@tauri-apps/plugin-dialog';
+import PairingImportModal from '../components/PairingImportModal.vue';
 import DeviceCard from '../components/DeviceCard.vue';
-import { pairDevice, sendFiles } from '../ipc';
+import {
+  confirmTrustedPeerVerification,
+  getDiscoveryDiagnostics,
+  pairDevice,
+  sendFiles,
+  setTrustedAlias,
+  subscribeRuntimeEvents,
+} from '../ipc';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
-import type { DeviceView } from '../types';
+import type { DeviceView, DiscoveryDiagnostics } from '../types';
+import type { PairingQrPayload } from '../security';
 import {
   myIdentity,
   devices,
@@ -13,14 +22,17 @@ import {
   externalSharePaths,
   externalShareSource,
   clearExternalShare,
+  clearPendingPairingLink,
+  pendingPairingLink,
 } from '../store';
 import { isDeviceOnline } from '../devicePresence';
 import { sharedVerificationCode, verificationCodeFromFingerprint } from '../security';
 
-const emit = defineEmits(['openSettings']);
+const emit = defineEmits(['openSettings', 'openTransfers']);
 
 const incomingCount = computed(() => incomingQueue.value.length);
 const queuedShareCount = computed(() => externalSharePaths.value.length);
+const queuedExternalShareKey = computed(() => externalSharePaths.value.join('\u0000'));
 const activeDropTargetFp = ref<string | null>(null);
 const showTrustConfirm = ref(false);
 const trustConfirmBusy = ref(false);
@@ -28,8 +40,70 @@ const trustRemember = ref(true);
 const trustVerified = ref(false);
 const pendingTarget = ref<DeviceView | null>(null);
 const pendingPaths = ref<string[]>([]);
+const pendingPathsFromExternalShare = ref(false);
+const pendingExternalShareKey = ref<string | null>(null);
+const showPairingImport = ref(false);
+const pairingImportBusy = ref(false);
+const pairingImportInitialInput = ref('');
+const recentlyPairedFingerprint = ref<string | null>(null);
+const discoveryQuickHints = ref<string[]>([]);
+let clearRecentlyPairedTimer: ReturnType<typeof setTimeout> | null = null;
+const runtimeUnlistens: Array<() => void> = [];
+
+const localVerificationCode = computed(() =>
+  myIdentity.value ? verificationCodeFromFingerprint(myIdentity.value.fingerprint) : '',
+);
+const visibleDevices = computed(() => {
+  const highlightedFp = recentlyPairedFingerprint.value;
+  const indexed = devices.value.map((device, index) => ({ device, index }));
+  indexed.sort((left, right) => {
+    const leftHighlighted = left.device.fingerprint === highlightedFp;
+    const rightHighlighted = right.device.fingerprint === highlightedFp;
+    if (leftHighlighted !== rightHighlighted) {
+      return leftHighlighted ? -1 : 1;
+    }
+    return left.index - right.index;
+  });
+  return indexed.map(({ device }) => device);
+});
+
+const discoveryScopeHint = computed(() => {
+  const matchingHint = discoveryQuickHints.value.find((hint) => {
+    const normalized = hint.toLowerCase();
+    return (
+      normalized.includes('connect by address') ||
+      normalized.includes('vlan') ||
+      normalized.includes('subnet')
+    );
+  });
+  if (matchingHint) {
+    return matchingHint;
+  }
+  return "Automatic discovery is only expected to work on the same LAN/subnet. If your devices are separated by VLANs/subnets, or multicast is filtered, open Transfers and use Connect by Address.";
+});
+
+watch(
+  pendingPairingLink,
+  (value) => {
+    if (!value) {
+      return;
+    }
+    pairingImportInitialInput.value = value;
+    showPairingImport.value = true;
+  },
+  { immediate: true },
+);
 
 let dragDropUnlisten: (() => void) | null = null;
+
+const loadDiscoveryHints = async () => {
+  try {
+    const diagnostics: DiscoveryDiagnostics = await getDiscoveryDiagnostics();
+    discoveryQuickHints.value = diagnostics.quick_hints ?? [];
+  } catch (error) {
+    console.debug('Failed to load Nearby discovery diagnostics', error);
+  }
+};
 
 const canSendToDevice = (device: DeviceView) => isDeviceOnline(device);
 const verificationCode = (fingerprint: string) =>
@@ -45,6 +119,7 @@ const showUnavailableDeviceMessage = async (device: DeviceView) => {
 };
 
 onMounted(async () => {
+  await loadDiscoveryHints();
   dragDropUnlisten = await getCurrentWebview().onDragDropEvent(async (event) => {
     if (event.payload.type !== 'drop') return;
 
@@ -69,11 +144,45 @@ onMounted(async () => {
 
     await prepareAndSend(paths, target);
   });
+
+  runtimeUnlistens.push(
+    await subscribeRuntimeEvents(
+      [
+        'device_discovered',
+        'device_updated',
+        'device_lost',
+        'daemon_control_plane_recovered',
+        'system_error',
+      ],
+      () => {
+        void loadDiscoveryHints();
+      },
+    ),
+  );
 });
 
 onUnmounted(() => {
   if (dragDropUnlisten) dragDropUnlisten();
+  for (const unlisten of runtimeUnlistens) {
+    unlisten();
+  }
+  runtimeUnlistens.length = 0;
+  if (clearRecentlyPairedTimer) {
+    clearTimeout(clearRecentlyPairedTimer);
+    clearRecentlyPairedTimer = null;
+  }
 });
+
+function markRecentlyPaired(fingerprint: string) {
+  recentlyPairedFingerprint.value = fingerprint;
+  if (clearRecentlyPairedTimer) {
+    clearTimeout(clearRecentlyPairedTimer);
+  }
+  clearRecentlyPairedTimer = setTimeout(() => {
+    recentlyPairedFingerprint.value = null;
+    clearRecentlyPairedTimer = null;
+  }, 12_000);
+}
 
 const handleDeviceClick = async (device: DeviceView) => {
   if (!canSendToDevice(device)) {
@@ -81,7 +190,7 @@ const handleDeviceClick = async (device: DeviceView) => {
     return;
   }
   if (queuedShareCount.value > 0) {
-    await prepareAndSend([...externalSharePaths.value], device);
+    await prepareAndSend([...externalSharePaths.value], device, { fromExternalShare: true });
     return;
   }
   const selected = await open({
@@ -152,17 +261,34 @@ const executeSend = async (paths: string[], device: DeviceView) => {
   }
 };
 
-const prepareAndSend = async (paths: string[], device: DeviceView) => {
+const maybeClearExternalShare = (shareKey: string | null) => {
+  if (!shareKey) return;
+  if (queuedExternalShareKey.value === shareKey) {
+    clearExternalShare();
+  }
+};
+
+const prepareAndSend = async (
+  paths: string[],
+  device: DeviceView,
+  options: { fromExternalShare?: boolean; externalShareKey?: string | null } = {},
+) => {
+  const fromExternalShare = options.fromExternalShare === true;
+  const externalShareKey = fromExternalShare
+    ? (options.externalShareKey ?? queuedExternalShareKey.value)
+    : null;
   if (device.trusted) {
     const sent = await executeSend(paths, device);
-    if (sent && queuedShareCount.value > 0) {
-      clearExternalShare();
+    if (sent && fromExternalShare) {
+      maybeClearExternalShare(externalShareKey);
     }
     return;
   }
 
   pendingTarget.value = device;
   pendingPaths.value = [...paths];
+  pendingPathsFromExternalShare.value = fromExternalShare;
+  pendingExternalShareKey.value = externalShareKey;
   trustRemember.value = true;
   trustVerified.value = false;
   showTrustConfirm.value = true;
@@ -173,6 +299,8 @@ const closeTrustConfirm = () => {
   showTrustConfirm.value = false;
   pendingTarget.value = null;
   pendingPaths.value = [];
+  pendingPathsFromExternalShare.value = false;
+  pendingExternalShareKey.value = null;
   trustVerified.value = false;
 };
 
@@ -180,6 +308,8 @@ const forceCloseTrustConfirm = () => {
   showTrustConfirm.value = false;
   pendingTarget.value = null;
   pendingPaths.value = [];
+  pendingPathsFromExternalShare.value = false;
+  pendingExternalShareKey.value = null;
 };
 
 const confirmTrustAndSend = async () => {
@@ -191,11 +321,12 @@ const confirmTrustAndSend = async () => {
   try {
     if (trustRemember.value) {
       await pairDevice(device.fingerprint);
+      markRecentlyPaired(device.fingerprint);
     }
     const sent = await executeSend([...pendingPaths.value], device);
     if (sent) {
-      if (queuedShareCount.value > 0) {
-        clearExternalShare();
+      if (pendingPathsFromExternalShare.value) {
+        maybeClearExternalShare(pendingExternalShareKey.value);
       }
       forceCloseTrustConfirm();
     }
@@ -203,6 +334,49 @@ const confirmTrustAndSend = async () => {
     trustConfirmBusy.value = false;
   }
 };
+
+function closePairingImport() {
+  if (pairingImportBusy.value) return;
+  showPairingImport.value = false;
+  pairingImportInitialInput.value = '';
+  clearPendingPairingLink();
+}
+
+async function importPairingLink({
+  payload,
+  mutualConfirmationRequested,
+}: {
+  payload: PairingQrPayload;
+  mutualConfirmationRequested: boolean;
+}) {
+  pairingImportBusy.value = true;
+  try {
+    await pairDevice(payload.fingerprint);
+    await setTrustedAlias(payload.fingerprint, payload.device_name);
+    await confirmTrustedPeerVerification(
+      payload.fingerprint,
+      payload.trust_model === 'signed_link' && payload.signature_verified
+        ? 'signed_pairing_link'
+        : 'legacy_unsigned_link',
+      mutualConfirmationRequested,
+    );
+    markRecentlyPaired(payload.fingerprint);
+    showPairingImport.value = false;
+    pairingImportInitialInput.value = '';
+    clearPendingPairingLink();
+    await message(
+      mutualConfirmationRequested
+        ? `Trusted ${payload.device_name} with mutual confirmation recorded.`
+        : `Trusted ${payload.device_name}. Mutual confirmation can be completed later after both sides compare the shared pair code.`,
+      { title: 'Pairing Complete', kind: 'info' },
+    );
+  } catch (error) {
+    console.error('Failed to import pairing link from Nearby', error);
+    await message(String(error), { title: 'Pairing Failed', kind: 'error' });
+  } finally {
+    pairingImportBusy.value = false;
+  }
+}
 </script>
 
 <template>
@@ -217,6 +391,7 @@ const confirmTrustAndSend = async () => {
           <span class="identity-label">This Device</span>
           <span class="identity-name">{{ myIdentity.device_name }}</span>
         </div>
+        <button @click="showPairingImport = true" class="btn btn-secondary">Import Pairing</button>
         <button @click="emit('openSettings')" class="btn btn-secondary">Settings</button>
       </div>
     </header>
@@ -234,11 +409,12 @@ const confirmTrustAndSend = async () => {
       <div class="devices-section">
         <div class="devices-grid" v-if="devices.length > 0">
           <DeviceCard
-            v-for="device in devices"
+            v-for="device in visibleDevices"
             :key="device.fingerprint"
             :device="device"
             :isSending="sendingPeerFingerprints.has(device.fingerprint)"
             :disabled="!canSendToDevice(device)"
+            :highlighted="device.fingerprint === recentlyPairedFingerprint"
             @click="handleDeviceClick(device)"
             @drag-target-enter="handleDragTargetEnter(device)"
             @drag-target-leave="handleDragTargetLeave(device)"
@@ -248,6 +424,11 @@ const confirmTrustAndSend = async () => {
         <div class="empty-state" v-else>
           <p>Scanning local network</p>
           <p class="text-muted">Keep both devices awake and on the same Wi-Fi/LAN.</p>
+          <p class="empty-detail text-muted">{{ discoveryScopeHint }}</p>
+          <div class="empty-actions">
+            <button class="btn btn-secondary" @click="emit('openTransfers')">Open Transfers</button>
+            <button class="btn btn-secondary" @click="emit('openSettings')">Open Diagnostics</button>
+          </div>
         </div>
       </div>
     </main>
@@ -287,6 +468,16 @@ const confirmTrustAndSend = async () => {
         </div>
       </section>
     </div>
+
+    <PairingImportModal
+      :open="showPairingImport"
+      :local-fingerprint="myIdentity?.fingerprint || ''"
+      :local-verification-code="localVerificationCode"
+      :initial-input="pairingImportInitialInput"
+      :busy="pairingImportBusy"
+      @close="closePairingImport"
+      @confirm="importPairingLink"
+    />
   </div>
 </template>
 
@@ -389,6 +580,19 @@ const confirmTrustAndSend = async () => {
   border-radius: 12px;
   background: var(--surface-muted);
   color: var(--text-secondary);
+}
+
+.empty-detail {
+  max-width: 520px;
+  text-align: center;
+  line-height: 1.45;
+}
+
+.empty-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: center;
 }
 
 .incoming-hint {

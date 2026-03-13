@@ -6,10 +6,10 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use tauri::{AppHandle, Emitter};
 
 use super::service::SERVICE_TYPE;
 use crate::dto::DeviceView;
+use crate::runtime::host::RuntimeHost;
 use crate::state::{AppState, DeviceInfo, Platform, SessionIndexEntry, SessionInfo};
 
 const OFFLINE_GRACE_SECS: u64 = 15;
@@ -234,13 +234,13 @@ pub fn should_emit_device_lost(device: &DeviceInfo, now_unix: u64) -> bool {
 /// Start mDNS browsing for DashDrop peers.
 pub async fn start_browser(
     mdns: Arc<ServiceDaemon>,
-    app: AppHandle,
+    host: Arc<dyn RuntimeHost>,
     state: Arc<AppState>,
 ) -> Result<()> {
     let receiver = mdns.browse(SERVICE_TYPE).context("mDNS browse")?;
     let own_fp = state.identity.fingerprint.clone();
 
-    let app_events = app.clone();
+    let host_events = Arc::clone(&host);
     let state_events = state.clone();
     {
         let mut status = state.browser_status.write().await;
@@ -266,12 +266,12 @@ pub async fn start_browser(
                 Ok(Ok(ServiceEvent::ServiceResolved(info))) => {
                     join_error_backoff_ms = 100;
                     state_events.bump_discovery_event("service_resolved").await;
-                    handle_resolved(&info, &own_fp, &app_events, &state_events).await;
+                    handle_resolved(&info, &own_fp, &host_events, &state_events).await;
                 }
                 Ok(Ok(ServiceEvent::ServiceRemoved(_service_type, fullname))) => {
                     join_error_backoff_ms = 100;
                     state_events.bump_discovery_event("service_removed").await;
-                    handle_removed(&fullname, &app_events, &state_events).await;
+                    handle_removed(&fullname, &host_events, &state_events).await;
                 }
                 Ok(Ok(_)) => {} // SearchStarted, other events
                 Ok(Err(err)) => match browser_receive_action(&err) {
@@ -342,7 +342,7 @@ pub async fn start_browser(
         }
     });
 
-    let app_for_offline = app.clone();
+    let host_for_offline = Arc::clone(&host);
     let state_for_offline = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -403,12 +403,14 @@ pub async fn start_browser(
                 });
             }
             for payload in updates {
-                app_for_offline.emit("device_updated", payload).ok();
+                let _ = host_for_offline.emit_json(
+                    "device_updated",
+                    serde_json::to_value(payload).unwrap_or(serde_json::Value::Null),
+                );
             }
             for fp in lost {
-                app_for_offline
-                    .emit("device_lost", serde_json::json!({ "fingerprint": fp }))
-                    .ok();
+                let _ = host_for_offline
+                    .emit_json("device_lost", serde_json::json!({ "fingerprint": fp }));
             }
             if stale_sessions_removed > 0 {
                 state_for_offline
@@ -424,7 +426,7 @@ pub async fn start_browser(
 async fn handle_resolved(
     info: &mdns_sd::ServiceInfo,
     own_fp: &str,
-    app: &AppHandle,
+    host: &Arc<dyn RuntimeHost>,
     state: &Arc<AppState>,
 ) {
     let props = info.get_properties();
@@ -589,23 +591,29 @@ async fn handle_resolved(
 
     if is_new {
         tracing::info!("Device discovered: {name} ({fp})");
-        app.emit("device_discovered", &payload).ok();
+        let _ = host.emit_json(
+            "device_discovered",
+            serde_json::to_value(&payload).unwrap_or(serde_json::Value::Null),
+        );
     } else {
         tracing::debug!("Device updated: {name}");
-        app.emit("device_updated", &payload).ok();
+        let _ = host.emit_json(
+            "device_updated",
+            serde_json::to_value(&payload).unwrap_or(serde_json::Value::Null),
+        );
     }
 
-    let probe_app = app.clone();
+    let probe_host = Arc::clone(host);
     let probe_state = state.clone();
     tokio::spawn(async move {
         if addrs.is_empty() {
             return;
         }
-        run_probe_update(&probe_state, &probe_app, &fp, addrs).await;
+        run_probe_update(&probe_state, &probe_host, &fp, addrs).await;
     });
 }
 
-async fn handle_removed(remove_key: &str, app: &AppHandle, state: &Arc<AppState>) {
+async fn handle_removed(remove_key: &str, host: &Arc<dyn RuntimeHost>, state: &Arc<AppState>) {
     let Some(entry) = ({
         let idx = state.session_index.read().await;
         idx.get(remove_key)
@@ -647,7 +655,7 @@ async fn handle_removed(remove_key: &str, app: &AppHandle, state: &Arc<AppState>
     state.bump_discovery_event("service_removed_deferred").await;
     let fp = entry.fingerprint.clone();
     let session_id = entry.session_id.clone();
-    let app2 = app.clone();
+    let host2 = Arc::clone(host);
     let state2 = state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(OFFLINE_GRACE_SECS)).await;
@@ -684,11 +692,13 @@ async fn handle_removed(remove_key: &str, app: &AppHandle, state: &Arc<AppState>
             state2.bump_discovery_event("service_removed_applied").await;
             if device_gone {
                 tracing::info!("Device offline: fp={fp}");
-                app2.emit("device_lost", serde_json::json!({ "fingerprint": fp }))
-                    .ok();
+                let _ = host2.emit_json("device_lost", serde_json::json!({ "fingerprint": fp }));
             } else if let Some(dev) = updated_device {
                 let payload = DeviceView::from(&dev);
-                app2.emit("device_updated", &payload).ok();
+                let _ = host2.emit_json(
+                    "device_updated",
+                    serde_json::to_value(&payload).unwrap_or(serde_json::Value::Null),
+                );
             }
             let mut pending = state2.pending_removed_sessions.lock().await;
             pending.remove(&pending_key);
@@ -711,7 +721,7 @@ async fn handle_removed(remove_key: &str, app: &AppHandle, state: &Arc<AppState>
 
 pub(crate) async fn run_probe_update(
     state: &Arc<AppState>,
-    app: &AppHandle,
+    host: &Arc<dyn RuntimeHost>,
     fp: &str,
     addrs: Vec<SocketAddr>,
 ) {
@@ -783,7 +793,10 @@ pub(crate) async fn run_probe_update(
     if !ok {
         state.bump_discovery_failure("probe_failed").await;
     }
-    app.emit("device_updated", payload).ok();
+    let _ = host.emit_json(
+        "device_updated",
+        serde_json::to_value(payload).unwrap_or_default(),
+    );
 }
 
 #[cfg(test)]

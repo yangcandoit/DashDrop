@@ -130,6 +130,8 @@ pub struct OfferPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcceptPayload {
     pub chosen_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_offsets: Option<std::collections::HashMap<u32, u64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +174,19 @@ pub enum CancelReason {
     Error(ErrorCode),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct P2pRequestPayload {
+    pub supported_methods: Vec<String>, // e.g., ["softap", "wifi_direct"]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct P2pResponsePayload {
+    pub method: String,
+    pub ssid: String,
+    pub password: Option<String>,
+    pub target_address: Option<String>, // The IP address of the host in the P2P network
+}
+
 // ─── Top-level Message Enum ───────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +199,9 @@ pub enum DashMessage {
     Complete(CompletePayload),
     Ack(AckPayload),
     Cancel(CancelPayload),
+    // P2P/SoftAP Extensions
+    P2pRequest(P2pRequestPayload),
+    P2pResponse(P2pResponsePayload),
 }
 
 // ─── Transfer Outcome ─────────────────────────────────────────────────────────

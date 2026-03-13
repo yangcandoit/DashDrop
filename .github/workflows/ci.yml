@@ -81,3 +81,57 @@ jobs:
             playwright-report/**
             test-results/**
           if-no-files-found: ignore
+
+  tauri-runtime-smoke:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      - run: npm run test:tauri:smoke
+        env:
+          DASHDROP_SMOKE_ARTIFACT_DIR: test-results/tauri-runtime-smoke
+      - run: npm run test:tauri:daemon-smoke
+        env:
+          DASHDROP_SMOKE_ARTIFACT_DIR: test-results/tauri-daemon-smoke
+      - name: Upload Tauri smoke artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-smoke-debug-artifacts
+          path: |
+            test-results/tauri-runtime-smoke/**
+            test-results/tauri-daemon-smoke/**
+          if-no-files-found: ignore
+
+  tauri-bundle-smoke:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: macos-latest
+    timeout-minutes: 60
+    needs: [tauri-runtime-smoke]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      - run: npm run test:tauri:bundle-smoke
+        env:
+          DASHDROP_SMOKE_ARTIFACT_DIR: test-results/tauri-bundle-smoke
+      - name: Upload Tauri bundle smoke artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-bundle-smoke-debug-artifacts
+          path: test-results/tauri-bundle-smoke/**
+          if-no-files-found: ignore

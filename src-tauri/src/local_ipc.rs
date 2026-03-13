@@ -5,8 +5,12 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::dto::{DeviceView, TrustedPeerView};
-use crate::state::{AppConfig, LocalIdentityView, RuntimeStatus};
+use crate::ble::BleAssistCapsule;
+use crate::dto::{DeviceView, TransferView, TrustedPeerView};
+use crate::state::{
+    AppConfig, LocalIdentityView, RuntimeEventCheckpoint, RuntimeEventFeedSnapshot, RuntimeStatus,
+    SecurityEvent, TransferMetrics, TrustVerificationMethod,
+};
 
 pub const LOCAL_IPC_PROTO_VERSION: u16 = 1;
 pub const LOCAL_IPC_MAX_FRAME_LEN: usize = 1024 * 1024;
@@ -24,6 +28,13 @@ pub struct ConnectByAddressResult {
 pub struct LocalAuthContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalIpcAccessGrant {
+    pub access_token: String,
+    pub expires_at_unix_ms: u64,
+    pub refresh_after_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -45,6 +56,7 @@ pub enum LocalIpcWireResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LocalIpcWireSuccess {
     pub proto_version: u16,
     pub request_id: String,
@@ -54,6 +66,7 @@ pub struct LocalIpcWireSuccess {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct LocalIpcWireErrorResponse {
     pub proto_version: u16,
     pub request_id: String,
@@ -68,6 +81,20 @@ pub struct LocalEnvelope<T> {
     pub command: T,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_context: Option<LocalAuthContext>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingIncomingRequestPayload {
+    pub transfer_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
+    pub notification_id: String,
+    pub sender_name: String,
+    pub sender_fp: String,
+    pub trusted: bool,
+    pub items: Vec<crate::state::FileItemMeta>,
+    pub total_size: u64,
+    pub revision: u64,
 }
 
 #[allow(dead_code)]
@@ -112,6 +139,8 @@ impl LocalResponseEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum LocalIpcCommand {
+    AuthIssue,
+    AuthRevoke,
     DiscoverList,
     DiscoverConnectByAddress {
         address: String,
@@ -126,6 +155,11 @@ pub enum LocalIpcCommand {
     TrustSetAlias {
         fingerprint: String,
         alias: Option<String>,
+    },
+    TrustConfirmVerification {
+        fingerprint: String,
+        verification_method: TrustVerificationMethod,
+        mutual_confirmation: bool,
     },
     ConfigGet,
     ConfigSet {
@@ -150,26 +184,133 @@ pub enum LocalIpcCommand {
     TransferRetry {
         transfer_id: String,
     },
+    TransferList,
+    TransferGet {
+        transfer_id: String,
+    },
+    TransferHistory {
+        limit: u32,
+        offset: u32,
+    },
+    TransferPendingIncoming,
     AppActivate {
         paths: Vec<String>,
+        pairing_links: Vec<String>,
     },
     AppGetLocalIdentity,
+    AppGetBleAssistCapsule,
+    AppIngestBleAssistCapsule {
+        capsule: BleAssistCapsule,
+        source: Option<String>,
+    },
     AppGetRuntimeStatus,
+    AppGetDiscoveryDiagnostics,
+    AppGetEventCheckpoint {
+        consumer_id: String,
+    },
+    AppGetEventFeed {
+        after_seq: u64,
+        limit: u32,
+    },
+    AppSetEventCheckpoint {
+        consumer_id: String,
+        generation: String,
+        seq: u64,
+    },
     AppQueueExternalShare {
         paths: Vec<String>,
     },
+    SecurityGetEvents {
+        limit: u32,
+        offset: u32,
+    },
+    TransferGetMetrics,
     SecurityGetPosture,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalIpcCommandClass {
+    AuthBootstrap,
+    ReadSide,
+    WriteSide,
+    ActivationShareHandoff,
+    RuntimeEventReplay,
+}
+
 impl LocalIpcCommand {
+    pub fn class(&self) -> LocalIpcCommandClass {
+        match self {
+            Self::AuthIssue | Self::AuthRevoke => LocalIpcCommandClass::AuthBootstrap,
+            Self::DiscoverList
+            | Self::TrustList
+            | Self::ConfigGet
+            | Self::TransferList
+            | Self::TransferGet { .. }
+            | Self::TransferHistory { .. }
+            | Self::TransferPendingIncoming
+            | Self::AppGetLocalIdentity
+            | Self::AppGetBleAssistCapsule
+            | Self::AppGetRuntimeStatus
+            | Self::AppGetDiscoveryDiagnostics
+            | Self::AppGetEventCheckpoint { .. }
+            | Self::SecurityGetEvents { .. }
+            | Self::TransferGetMetrics
+            | Self::SecurityGetPosture => LocalIpcCommandClass::ReadSide,
+            Self::AppActivate { .. } | Self::AppQueueExternalShare { .. } => {
+                LocalIpcCommandClass::ActivationShareHandoff
+            }
+            Self::AppGetEventFeed { .. } => LocalIpcCommandClass::RuntimeEventReplay,
+            Self::DiscoverConnectByAddress { .. }
+            | Self::TrustPair { .. }
+            | Self::TrustUnpair { .. }
+            | Self::TrustSetAlias { .. }
+            | Self::TrustConfirmVerification { .. }
+            | Self::ConfigSet { .. }
+            | Self::AppIngestBleAssistCapsule { .. }
+            | Self::AppSetEventCheckpoint { .. }
+            | Self::TransferSend { .. }
+            | Self::TransferAccept { .. }
+            | Self::TransferReject { .. }
+            | Self::TransferCancel { .. }
+            | Self::TransferCancelAll
+            | Self::TransferRetry { .. } => LocalIpcCommandClass::WriteSide,
+        }
+    }
+
+    pub fn endpoint_kind(&self) -> LocalIpcEndpointKind {
+        match self.class() {
+            LocalIpcCommandClass::AuthBootstrap => LocalIpcEndpointKind::Service,
+            LocalIpcCommandClass::ActivationShareHandoff => LocalIpcEndpointKind::UiActivation,
+            LocalIpcCommandClass::ReadSide
+            | LocalIpcCommandClass::WriteSide
+            | LocalIpcCommandClass::RuntimeEventReplay => LocalIpcEndpointKind::Service,
+        }
+    }
+
+    pub fn requires_auth(&self) -> bool {
+        matches!(
+            self.class(),
+            LocalIpcCommandClass::ReadSide
+                | LocalIpcCommandClass::WriteSide
+                | LocalIpcCommandClass::RuntimeEventReplay
+        )
+    }
+
+    pub fn accepts_on_endpoint(&self, endpoint_kind: LocalIpcEndpointKind) -> bool {
+        self.endpoint_kind() == endpoint_kind
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
+            Self::AuthIssue => "auth/issue",
+            Self::AuthRevoke => "auth/revoke",
             Self::DiscoverList => "discover/list",
             Self::DiscoverConnectByAddress { .. } => "discover/connect_by_address",
             Self::TrustList => "trust/list",
             Self::TrustPair { .. } => "trust/pair",
             Self::TrustUnpair { .. } => "trust/unpair",
             Self::TrustSetAlias { .. } => "trust/set_alias",
+            Self::TrustConfirmVerification { .. } => "trust/confirm_verification",
             Self::ConfigGet => "config/get",
             Self::ConfigSet { .. } => "config/set",
             Self::TransferSend { .. } => "transfer/send",
@@ -178,10 +319,22 @@ impl LocalIpcCommand {
             Self::TransferCancel { .. } => "transfer/cancel",
             Self::TransferCancelAll => "transfer/cancel_all",
             Self::TransferRetry { .. } => "transfer/retry",
+            Self::TransferList => "transfer/list",
+            Self::TransferGet { .. } => "transfer/get",
+            Self::TransferHistory { .. } => "transfer/history",
+            Self::TransferPendingIncoming => "transfer/pending_incoming",
             Self::AppActivate { .. } => "app/activate",
             Self::AppGetLocalIdentity => "app/get_local_identity",
+            Self::AppGetBleAssistCapsule => "app/get_ble_assist_capsule",
+            Self::AppIngestBleAssistCapsule { .. } => "app/ingest_ble_assist_capsule",
             Self::AppGetRuntimeStatus => "app/get_runtime_status",
+            Self::AppGetDiscoveryDiagnostics => "app/get_discovery_diagnostics",
+            Self::AppGetEventCheckpoint { .. } => "app/get_event_checkpoint",
+            Self::AppGetEventFeed { .. } => "app/get_event_feed",
+            Self::AppSetEventCheckpoint { .. } => "app/set_event_checkpoint",
             Self::AppQueueExternalShare { .. } => "app/queue_external_share",
+            Self::SecurityGetEvents { .. } => "security/get_events",
+            Self::TransferGetMetrics => "transfer/get_metrics",
             Self::SecurityGetPosture => "security/get_posture",
         }
     }
@@ -213,12 +366,19 @@ impl LocalIpcCommand {
 
     fn payload(&self) -> Option<Value> {
         match self {
-            Self::DiscoverList
+            Self::AuthIssue
+            | Self::AuthRevoke
+            | Self::DiscoverList
             | Self::TrustList
             | Self::ConfigGet
             | Self::TransferCancelAll
+            | Self::TransferList
+            | Self::TransferPendingIncoming
             | Self::AppGetLocalIdentity
+            | Self::AppGetBleAssistCapsule
             | Self::AppGetRuntimeStatus
+            | Self::AppGetDiscoveryDiagnostics
+            | Self::TransferGetMetrics
             | Self::SecurityGetPosture => None,
             Self::DiscoverConnectByAddress { address } => Some(json!({ "address": address })),
             Self::TrustPair { fingerprint } | Self::TrustUnpair { fingerprint } => {
@@ -227,6 +387,15 @@ impl LocalIpcCommand {
             Self::TrustSetAlias { fingerprint, alias } => Some(json!({
                 "fingerprint": fingerprint,
                 "alias": alias,
+            })),
+            Self::TrustConfirmVerification {
+                fingerprint,
+                verification_method,
+                mutual_confirmation,
+            } => Some(json!({
+                "fingerprint": fingerprint,
+                "verification_method": verification_method,
+                "mutual_confirmation": mutual_confirmation,
             })),
             Self::ConfigSet { config } => Some(json!({ "config": config })),
             Self::TransferSend {
@@ -247,9 +416,39 @@ impl LocalIpcCommand {
                 "transfer_id": transfer_id,
                 "notification_id": notification_id,
             })),
-            Self::TransferCancel { transfer_id }
-            | Self::TransferRetry { transfer_id } => Some(json!({ "transfer_id": transfer_id })),
-            Self::AppActivate { paths } => Some(json!({ "paths": paths })),
+            Self::TransferCancel { transfer_id } | Self::TransferRetry { transfer_id } => {
+                Some(json!({ "transfer_id": transfer_id }))
+            }
+            Self::TransferGet { transfer_id } => Some(json!({ "transfer_id": transfer_id })),
+            Self::TransferHistory { limit, offset } | Self::SecurityGetEvents { limit, offset } => {
+                Some(json!({ "limit": limit, "offset": offset }))
+            }
+            Self::AppGetEventFeed { after_seq, limit } => {
+                Some(json!({ "after_seq": after_seq, "limit": limit }))
+            }
+            Self::AppGetEventCheckpoint { consumer_id } => {
+                Some(json!({ "consumer_id": consumer_id }))
+            }
+            Self::AppSetEventCheckpoint {
+                consumer_id,
+                generation,
+                seq,
+            } => Some(json!({
+                "consumer_id": consumer_id,
+                "generation": generation,
+                "seq": seq,
+            })),
+            Self::AppActivate {
+                paths,
+                pairing_links,
+            } => Some(json!({
+                "paths": paths,
+                "pairing_links": pairing_links,
+            })),
+            Self::AppIngestBleAssistCapsule { capsule, source } => Some(json!({
+                "capsule": capsule,
+                "source": source,
+            })),
             Self::AppQueueExternalShare { paths } => Some(json!({ "paths": paths })),
         }
     }
@@ -259,6 +458,8 @@ impl LocalIpcCommand {
         payload: Option<&Value>,
     ) -> Result<Self, LocalIpcError> {
         match command {
+            "auth/issue" => Ok(Self::AuthIssue),
+            "auth/revoke" => Ok(Self::AuthRevoke),
             "discover/list" => Ok(Self::DiscoverList),
             "discover/connect_by_address" => Ok(Self::DiscoverConnectByAddress {
                 address: required_string(payload, "address")?,
@@ -273,6 +474,11 @@ impl LocalIpcCommand {
             "trust/set_alias" => Ok(Self::TrustSetAlias {
                 fingerprint: required_string(payload, "fingerprint")?,
                 alias: optional_string(payload, "alias")?,
+            }),
+            "trust/confirm_verification" => Ok(Self::TrustConfirmVerification {
+                fingerprint: required_string(payload, "fingerprint")?,
+                verification_method: required_value(payload, "verification_method")?,
+                mutual_confirmation: optional_bool(payload, "mutual_confirmation")?.unwrap_or(false),
             }),
             "config/get" => Ok(Self::ConfigGet),
             "config/set" => Ok(Self::ConfigSet {
@@ -297,14 +503,47 @@ impl LocalIpcCommand {
             "transfer/retry" => Ok(Self::TransferRetry {
                 transfer_id: required_string(payload, "transfer_id")?,
             }),
+            "transfer/list" => Ok(Self::TransferList),
+            "transfer/get" => Ok(Self::TransferGet {
+                transfer_id: required_string(payload, "transfer_id")?,
+            }),
+            "transfer/history" => Ok(Self::TransferHistory {
+                limit: required_value(payload, "limit")?,
+                offset: required_value(payload, "offset")?,
+            }),
+            "transfer/pending_incoming" => Ok(Self::TransferPendingIncoming),
             "app/activate" => Ok(Self::AppActivate {
                 paths: required_string_vec(payload, "paths")?,
+                pairing_links: optional_string_vec(payload, "pairing_links")?,
             }),
             "app/get_local_identity" => Ok(Self::AppGetLocalIdentity),
+            "app/get_ble_assist_capsule" => Ok(Self::AppGetBleAssistCapsule),
+            "app/ingest_ble_assist_capsule" => Ok(Self::AppIngestBleAssistCapsule {
+                capsule: required_value(payload, "capsule")?,
+                source: optional_string(payload, "source")?,
+            }),
             "app/get_runtime_status" => Ok(Self::AppGetRuntimeStatus),
+            "app/get_discovery_diagnostics" => Ok(Self::AppGetDiscoveryDiagnostics),
+            "app/get_event_checkpoint" => Ok(Self::AppGetEventCheckpoint {
+                consumer_id: required_string(payload, "consumer_id")?,
+            }),
+            "app/get_event_feed" => Ok(Self::AppGetEventFeed {
+                after_seq: required_value(payload, "after_seq")?,
+                limit: required_value(payload, "limit")?,
+            }),
+            "app/set_event_checkpoint" => Ok(Self::AppSetEventCheckpoint {
+                consumer_id: required_string(payload, "consumer_id")?,
+                generation: required_string(payload, "generation")?,
+                seq: required_value(payload, "seq")?,
+            }),
             "app/queue_external_share" => Ok(Self::AppQueueExternalShare {
                 paths: required_string_vec(payload, "paths")?,
             }),
+            "security/get_events" => Ok(Self::SecurityGetEvents {
+                limit: required_value(payload, "limit")?,
+                offset: required_value(payload, "offset")?,
+            }),
+            "transfer/get_metrics" => Ok(Self::TransferGetMetrics),
             "security/get_posture" => Ok(Self::SecurityGetPosture),
             reserved if RESERVED_PHASE_A_COMMANDS.contains(&reserved) => Err(
                 LocalIpcError::invalid_request(format!(
@@ -321,15 +560,64 @@ impl LocalIpcCommand {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LocalIpcResponse {
+    AccessGrant {
+        auth: LocalIpcAccessGrant,
+    },
     Ack,
-    Devices { devices: Vec<DeviceView> },
-    ConnectByAddress { result: ConnectByAddressResult },
-    TrustedPeers { trusted_peers: Vec<TrustedPeerView> },
-    AppConfig { config: AppConfig },
-    CancelledTransfers { count: u32 },
-    LocalIdentity { identity: LocalIdentityView },
-    RuntimeStatus { runtime_status: RuntimeStatus },
-    SecurityPosture { posture: serde_json::Value },
+    Devices {
+        devices: Vec<DeviceView>,
+    },
+    ConnectByAddress {
+        result: ConnectByAddressResult,
+    },
+    TrustedPeers {
+        trusted_peers: Vec<TrustedPeerView>,
+    },
+    AppConfig {
+        config: AppConfig,
+    },
+    CancelledTransfers {
+        count: u32,
+    },
+    Transfers {
+        transfers: Vec<TransferView>,
+    },
+    Transfer {
+        transfer: Option<TransferView>,
+    },
+    TransferHistory {
+        history: Vec<TransferView>,
+    },
+    PendingIncomingRequests {
+        requests: Vec<PendingIncomingRequestPayload>,
+    },
+    LocalIdentity {
+        identity: LocalIdentityView,
+    },
+    BleAssistCapsule {
+        capsule: BleAssistCapsule,
+    },
+    RuntimeStatus {
+        runtime_status: RuntimeStatus,
+    },
+    DiscoveryDiagnostics {
+        diagnostics: serde_json::Value,
+    },
+    RuntimeEvents {
+        feed: Box<RuntimeEventFeedSnapshot>,
+    },
+    RuntimeEventCheckpoint {
+        checkpoint: Option<RuntimeEventCheckpoint>,
+    },
+    SecurityEvents {
+        events: Vec<SecurityEvent>,
+    },
+    TransferMetrics {
+        metrics: TransferMetrics,
+    },
+    SecurityPosture {
+        posture: serde_json::Value,
+    },
 }
 
 impl LocalIpcResponse {
@@ -348,16 +636,31 @@ impl LocalIpcResponse {
 
     fn payload(self) -> Option<Value> {
         match self {
+            Self::AccessGrant { auth } => Some(json!({ "auth": auth })),
             Self::Ack => None,
             Self::Devices { devices } => Some(json!({ "devices": devices })),
             Self::ConnectByAddress { result } => Some(json!({ "result": result })),
             Self::TrustedPeers { trusted_peers } => Some(json!({ "trusted_peers": trusted_peers })),
             Self::AppConfig { config } => Some(json!({ "config": config })),
             Self::CancelledTransfers { count } => Some(json!({ "count": count })),
+            Self::Transfers { transfers } => Some(json!({ "transfers": transfers })),
+            Self::Transfer { transfer } => Some(json!({ "transfer": transfer })),
+            Self::TransferHistory { history } => Some(json!({ "history": history })),
+            Self::PendingIncomingRequests { requests } => Some(json!({ "requests": requests })),
             Self::LocalIdentity { identity } => Some(json!({ "identity": identity })),
+            Self::BleAssistCapsule { capsule } => Some(json!({ "capsule": capsule })),
             Self::RuntimeStatus { runtime_status } => {
                 Some(json!({ "runtime_status": runtime_status }))
             }
+            Self::DiscoveryDiagnostics { diagnostics } => {
+                Some(json!({ "diagnostics": diagnostics }))
+            }
+            Self::RuntimeEvents { feed } => serde_json::to_value(feed).ok(),
+            Self::RuntimeEventCheckpoint { checkpoint } => {
+                Some(json!({ "checkpoint": checkpoint }))
+            }
+            Self::SecurityEvents { events } => Some(json!({ "events": events })),
+            Self::TransferMetrics { metrics } => Some(json!({ "metrics": metrics })),
             Self::SecurityPosture { posture } => Some(json!({ "posture": posture })),
         }
     }
@@ -366,6 +669,7 @@ impl LocalIpcResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 #[allow(dead_code)]
+#[allow(clippy::large_enum_variant)]
 pub enum LocalIpcResult {
     Ok { response: LocalIpcResponse },
     Err { error: LocalIpcError },
@@ -415,6 +719,10 @@ impl LocalIpcError {
     pub fn dispatch_failed(message: impl Into<String>) -> Self {
         Self::new("dispatch_failed", message)
     }
+
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self::new("unauthorized", message)
+    }
 }
 
 impl LocalIpcWireResponse {
@@ -454,6 +762,16 @@ fn optional_string(payload: Option<&Value>, field: &str) -> Result<Option<String
     }
 }
 
+fn optional_bool(payload: Option<&Value>, field: &str) -> Result<Option<bool>, LocalIpcError> {
+    match payload_object(payload)?.get(field) {
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(LocalIpcError::invalid_request(format!(
+            "payload.{field} must be a boolean or null"
+        ))),
+    }
+}
+
 fn required_string_vec(payload: Option<&Value>, field: &str) -> Result<Vec<String>, LocalIpcError> {
     let value = payload_object(payload)?
         .get(field)
@@ -473,6 +791,25 @@ fn required_string_vec(payload: Option<&Value>, field: &str) -> Result<Vec<Strin
             })
         })
         .collect()
+}
+
+fn optional_string_vec(payload: Option<&Value>, field: &str) -> Result<Vec<String>, LocalIpcError> {
+    match payload_object(payload)?.get(field) {
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_string).ok_or_else(|| {
+                    LocalIpcError::invalid_request(format!(
+                        "payload.{field} must be an array of strings"
+                    ))
+                })
+            })
+            .collect(),
+        Some(Value::Null) | None => Ok(Vec::new()),
+        Some(_) => Err(LocalIpcError::invalid_request(format!(
+            "payload.{field} must be an array of strings"
+        ))),
+    }
 }
 
 fn required_value<T>(payload: Option<&Value>, field: &str) -> Result<T, LocalIpcError>
@@ -497,6 +834,21 @@ pub enum LocalIpcEndpoint {
     Unsupported,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalIpcEndpointKind {
+    Service,
+    UiActivation,
+}
+
+impl LocalIpcEndpointKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Service => "service",
+            Self::UiActivation => "ui activation",
+        }
+    }
+}
+
 impl LocalIpcEndpoint {
     pub fn describe(&self) -> String {
         match self {
@@ -511,25 +863,40 @@ impl LocalIpcEndpoint {
 }
 
 pub fn resolve_local_ipc_endpoint(config_dir: &Path) -> LocalIpcEndpoint {
+    resolve_local_ipc_endpoint_for_kind(config_dir, LocalIpcEndpointKind::Service)
+}
+
+pub fn resolve_local_ipc_endpoint_for_kind(
+    config_dir: &Path,
+    kind: LocalIpcEndpointKind,
+) -> LocalIpcEndpoint {
     let key = hashed_endpoint_key(config_dir);
+    let suffix = match kind {
+        LocalIpcEndpointKind::Service => "service",
+        LocalIpcEndpointKind::UiActivation => "ui",
+    };
 
     #[cfg(unix)]
     {
         if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-            let path = PathBuf::from(runtime_dir).join(format!("dashdrop-{key}.sock"));
+            let path = PathBuf::from(runtime_dir).join(format!("dashdrop-{suffix}-{key}.sock"));
             return LocalIpcEndpoint::UnixSocket { path };
         }
 
-        let dir = std::env::temp_dir().join(format!("dashdrop-{key}"));
+        let base = if Path::new("/tmp").exists() {
+            PathBuf::from("/tmp")
+        } else {
+            std::env::temp_dir()
+        };
         LocalIpcEndpoint::UnixSocket {
-            path: dir.join("ipc-v1.sock"),
+            path: base.join(format!("dashdrop-{suffix}-{key}.sock")),
         }
     }
 
     #[cfg(windows)]
     {
         return LocalIpcEndpoint::WindowsNamedPipe {
-            path: format!(r"\\.\pipe\dashdrop-service-v1-{key}"),
+            path: format!(r"\\.\pipe\dashdrop-{suffix}-v1-{key}"),
         };
     }
 
@@ -622,14 +989,17 @@ mod tests {
 
     use super::{
         decode_message, encode_message, read_framed_message, resolve_local_ipc_endpoint,
-        write_framed_message, LocalAuthContext, LocalEnvelope, LocalIpcCommand, LocalIpcResponse,
-        LocalIpcResult, LocalIpcWireResponse, LocalRequestEnvelope, LOCAL_IPC_PROTO_VERSION,
+        resolve_local_ipc_endpoint_for_kind, write_framed_message, LocalAuthContext, LocalEnvelope,
+        LocalIpcCommand, LocalIpcEndpoint, LocalIpcEndpointKind, LocalIpcResponse, LocalIpcResult,
+        LocalIpcWireResponse, LocalRequestEnvelope, LOCAL_IPC_PROTO_VERSION,
     };
-    use crate::state::AppConfig;
+    use crate::state::{AppConfig, RuntimeEventCheckpoint};
     use serde_json::json;
 
     #[test]
     fn local_command_names_match_target_shape() {
+        assert_eq!(LocalIpcCommand::AuthIssue.name(), "auth/issue");
+        assert_eq!(LocalIpcCommand::AuthRevoke.name(), "auth/revoke");
         assert_eq!(LocalIpcCommand::DiscoverList.name(), "discover/list");
         assert_eq!(
             LocalIpcCommand::DiscoverConnectByAddress {
@@ -653,9 +1023,194 @@ mod tests {
             "app/get_runtime_status"
         );
         assert_eq!(
-            LocalIpcCommand::AppActivate { paths: vec!["/tmp/a.txt".into()] }.name(),
+            LocalIpcCommand::AppGetDiscoveryDiagnostics.name(),
+            "app/get_discovery_diagnostics"
+        );
+        assert_eq!(
+            LocalIpcCommand::AppGetEventCheckpoint {
+                consumer_id: "shared-ui".into(),
+            }
+            .name(),
+            "app/get_event_checkpoint"
+        );
+        assert_eq!(LocalIpcCommand::TransferList.name(), "transfer/list");
+        assert_eq!(
+            LocalIpcCommand::TransferGet {
+                transfer_id: "tx-1".into()
+            }
+            .name(),
+            "transfer/get"
+        );
+        assert_eq!(
+            LocalIpcCommand::TransferHistory {
+                limit: 20,
+                offset: 0
+            }
+            .name(),
+            "transfer/history"
+        );
+        assert_eq!(
+            LocalIpcCommand::TransferPendingIncoming.name(),
+            "transfer/pending_incoming"
+        );
+        assert_eq!(
+            LocalIpcCommand::SecurityGetEvents {
+                limit: 20,
+                offset: 0
+            }
+            .name(),
+            "security/get_events"
+        );
+        assert_eq!(
+            LocalIpcCommand::TransferGetMetrics.name(),
+            "transfer/get_metrics"
+        );
+        assert_eq!(
+            LocalIpcCommand::AppGetEventFeed {
+                after_seq: 10,
+                limit: 20,
+            }
+            .name(),
+            "app/get_event_feed"
+        );
+        assert_eq!(
+            LocalIpcCommand::AppActivate {
+                paths: vec!["/tmp/a.txt".into()],
+                pairing_links: Vec::new(),
+            }
+            .name(),
             "app/activate"
         );
+    }
+
+    #[test]
+    fn endpoint_kind_resolves_to_distinct_paths() {
+        let config_dir = PathBuf::from("/tmp/dashdrop-endpoint-kind-test");
+        let service =
+            resolve_local_ipc_endpoint_for_kind(&config_dir, LocalIpcEndpointKind::Service);
+        let ui =
+            resolve_local_ipc_endpoint_for_kind(&config_dir, LocalIpcEndpointKind::UiActivation);
+
+        assert_ne!(service.describe(), ui.describe());
+
+        #[cfg(unix)]
+        {
+            let service_path = match service {
+                LocalIpcEndpoint::UnixSocket { path } => path,
+            };
+            let ui_path = match ui {
+                LocalIpcEndpoint::UnixSocket { path } => path,
+            };
+            assert!(service_path.to_string_lossy().contains("service"));
+            assert!(ui_path.to_string_lossy().contains("ui"));
+        }
+
+        #[cfg(windows)]
+        {
+            let service_path = match service {
+                LocalIpcEndpoint::WindowsNamedPipe { path } => path,
+            };
+            let ui_path = match ui {
+                LocalIpcEndpoint::WindowsNamedPipe { path } => path,
+            };
+            assert!(service_path.contains("service"));
+            assert!(ui_path.contains("ui"));
+        }
+    }
+
+    #[test]
+    fn command_classes_capture_control_plane_roles() {
+        assert_eq!(
+            LocalIpcCommand::AuthIssue.class(),
+            super::LocalIpcCommandClass::AuthBootstrap
+        );
+        assert_eq!(
+            LocalIpcCommand::AuthRevoke.class(),
+            super::LocalIpcCommandClass::AuthBootstrap
+        );
+        assert_eq!(
+            LocalIpcCommand::DiscoverList.class(),
+            super::LocalIpcCommandClass::ReadSide
+        );
+        assert_eq!(
+            LocalIpcCommand::TransferSend {
+                peer_fingerprint: "fp-1".into(),
+                paths: vec!["/tmp/a.txt".into()],
+            }
+            .class(),
+            super::LocalIpcCommandClass::WriteSide
+        );
+        assert_eq!(
+            LocalIpcCommand::AppActivate {
+                paths: vec!["/tmp/a.txt".into()],
+                pairing_links: Vec::new(),
+            }
+            .class(),
+            super::LocalIpcCommandClass::ActivationShareHandoff
+        );
+        assert_eq!(
+            LocalIpcCommand::AppGetEventFeed {
+                after_seq: 0,
+                limit: 10,
+            }
+            .class(),
+            super::LocalIpcCommandClass::RuntimeEventReplay
+        );
+        assert_eq!(
+            LocalIpcCommand::AppGetEventCheckpoint {
+                consumer_id: "shared-ui".into(),
+            }
+            .class(),
+            super::LocalIpcCommandClass::ReadSide
+        );
+    }
+
+    #[test]
+    fn command_endpoint_routing_matches_command_role() {
+        assert_eq!(
+            LocalIpcCommand::AuthIssue.endpoint_kind(),
+            LocalIpcEndpointKind::Service
+        );
+        assert!(!LocalIpcCommand::AuthIssue.requires_auth());
+        assert_eq!(
+            LocalIpcCommand::AuthRevoke.endpoint_kind(),
+            LocalIpcEndpointKind::Service
+        );
+        assert!(!LocalIpcCommand::AuthRevoke.requires_auth());
+        assert_eq!(
+            LocalIpcCommand::ConfigGet.endpoint_kind(),
+            LocalIpcEndpointKind::Service
+        );
+        assert!(LocalIpcCommand::ConfigGet.requires_auth());
+        assert_eq!(
+            LocalIpcCommand::AppGetEventFeed {
+                after_seq: 0,
+                limit: 10,
+            }
+            .endpoint_kind(),
+            LocalIpcEndpointKind::Service
+        );
+        assert!(LocalIpcCommand::AppGetEventCheckpoint {
+            consumer_id: "shared-ui".into(),
+        }
+        .requires_auth());
+        assert_eq!(
+            LocalIpcCommand::AppQueueExternalShare {
+                paths: vec!["/tmp/a.txt".into()],
+            }
+            .endpoint_kind(),
+            LocalIpcEndpointKind::UiActivation
+        );
+        assert!(LocalIpcCommand::AppActivate {
+            paths: vec!["/tmp/a.txt".into()],
+            pairing_links: Vec::new(),
+        }
+        .accepts_on_endpoint(LocalIpcEndpointKind::UiActivation));
+        assert!(!LocalIpcCommand::AppActivate {
+            paths: vec!["/tmp/a.txt".into()],
+            pairing_links: Vec::new(),
+        }
+        .accepts_on_endpoint(LocalIpcEndpointKind::Service));
     }
 
     #[test]
@@ -712,6 +1267,102 @@ mod tests {
     }
 
     #[test]
+    fn auth_revoke_wire_request_round_trips_without_payload() {
+        let request = LocalIpcCommand::AuthRevoke.to_wire_request(
+            "req-auth-revoke",
+            Some(LocalAuthContext {
+                access_token: Some("token-1".into()),
+            }),
+        );
+
+        let decoded = LocalIpcCommand::from_wire_request(&request).expect("parse request");
+        assert!(matches!(decoded, LocalIpcCommand::AuthRevoke));
+        assert!(request.payload.is_none());
+        assert_eq!(
+            request
+                .auth_context
+                .as_ref()
+                .and_then(|ctx| ctx.access_token.as_deref()),
+            Some("token-1")
+        );
+    }
+
+    #[test]
+    fn app_event_checkpoint_wire_request_round_trips() {
+        let request = LocalIpcCommand::AppSetEventCheckpoint {
+            consumer_id: "shared-ui".into(),
+            generation: "gen-1".into(),
+            seq: 42,
+        }
+        .to_wire_request("req-checkpoint", None);
+
+        let decoded = LocalIpcCommand::from_wire_request(&request).expect("parse request");
+        assert!(matches!(
+            decoded,
+            LocalIpcCommand::AppSetEventCheckpoint {
+                consumer_id,
+                generation,
+                seq
+            } if consumer_id == "shared-ui" && generation == "gen-1" && seq == 42
+        ));
+    }
+
+    #[test]
+    fn runtime_event_checkpoint_response_preserves_optional_metadata() {
+        let payload = LocalIpcResponse::RuntimeEventCheckpoint {
+            checkpoint: Some(RuntimeEventCheckpoint {
+                consumer_id: "shared-ui".into(),
+                generation: "gen-1".into(),
+                seq: 42,
+                updated_at_unix_ms: 1_234,
+                created_at_unix_ms: Some(1_200),
+                last_read_at_unix_ms: Some(1_235),
+                lease_expires_at_unix_ms: Some(1_534),
+                revision: Some(3),
+                last_transition: Some("advanced".into()),
+                recovery_hint: Some("persisted_catch_up".into()),
+                current_oldest_available_seq: Some(21),
+                current_latest_available_seq: Some(84),
+                current_compaction_watermark_seq: Some(20),
+                current_compaction_watermark_segment_id: Some(1),
+            }),
+        }
+        .payload()
+        .expect("payload");
+
+        assert_eq!(payload["checkpoint"]["consumer_id"], json!("shared-ui"));
+        assert_eq!(payload["checkpoint"]["revision"], json!(3));
+        assert_eq!(payload["checkpoint"]["last_transition"], json!("advanced"));
+        assert_eq!(
+            payload["checkpoint"]["recovery_hint"],
+            json!("persisted_catch_up")
+        );
+        assert_eq!(
+            payload["checkpoint"]["current_compaction_watermark_seq"],
+            json!(20)
+        );
+    }
+
+    #[test]
+    fn app_activate_wire_request_round_trips_pairing_links() {
+        let request = LocalIpcCommand::AppActivate {
+            paths: vec!["/tmp/example.txt".into()],
+            pairing_links: vec!["dashdrop://pair?data=abc".into()],
+        }
+        .to_wire_request("req-activate", None);
+
+        let decoded = LocalIpcCommand::from_wire_request(&request).expect("parse request");
+        assert!(matches!(
+            decoded,
+            LocalIpcCommand::AppActivate {
+                paths,
+                pairing_links
+            } if paths == vec!["/tmp/example.txt".to_string()]
+                && pairing_links == vec!["dashdrop://pair?data=abc".to_string()]
+        ));
+    }
+
+    #[test]
     fn transfer_send_wire_request_parses_paths_and_fingerprint() {
         let request = super::LocalIpcWireRequest {
             proto_version: LOCAL_IPC_PROTO_VERSION,
@@ -746,6 +1397,24 @@ mod tests {
 
         assert_eq!(err.code, "invalid_request");
         assert!(err.message.contains("discover/diagnostics"));
+    }
+
+    #[test]
+    fn error_wire_response_round_trips_as_error_variant() {
+        let response = LocalIpcWireResponse::error(
+            "req-error",
+            LOCAL_IPC_PROTO_VERSION,
+            super::LocalIpcError::invalid_request("bad request"),
+        );
+
+        let bytes = encode_message(&response).expect("serialize response");
+        let decoded: LocalIpcWireResponse = decode_message(&bytes).expect("deserialize response");
+
+        assert!(matches!(
+            decoded,
+            LocalIpcWireResponse::Err(super::LocalIpcWireErrorResponse { request_id, ok, .. })
+                if request_id == "req-error" && !ok
+        ));
     }
 
     #[test]
@@ -822,6 +1491,24 @@ mod tests {
         assert_eq!(value["ok"], json!(false));
         assert_eq!(value["error"]["code"], json!("dispatch_failed"));
         assert_eq!(value["error"]["message"], json!("boom"));
+    }
+
+    #[test]
+    fn access_grant_response_uses_stable_payload_shape() {
+        let response = LocalIpcResponse::AccessGrant {
+            auth: super::LocalIpcAccessGrant {
+                access_token: "token-1".into(),
+                expires_at_unix_ms: 100,
+                refresh_after_unix_ms: 50,
+            },
+        }
+        .into_wire_response("req-auth", LOCAL_IPC_PROTO_VERSION);
+        let value = serde_json::to_value(&response).expect("serialize response");
+
+        assert_eq!(value["ok"], json!(true));
+        assert_eq!(value["payload"]["auth"]["access_token"], json!("token-1"));
+        assert_eq!(value["payload"]["auth"]["expires_at_unix_ms"], json!(100));
+        assert_eq!(value["payload"]["auth"]["refresh_after_unix_ms"], json!(50));
     }
 
     #[tokio::test]

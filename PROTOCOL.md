@@ -1,6 +1,8 @@
 # DashDrop — 协议规范 v0.3
 
-本文件为 DashDrop 的网络协议与状态机规范。任何对协议的修改需要更新此文档并升级协议版本号。
+本文件为 DashDrop 的网络传输协议与状态机规范。任何对网络协议的修改需要更新此文档并升级协议版本号。
+
+本文件**不**定义 daemon local IPC。当前本地 control-plane / activation IPC 合同已单独收口在 [`docs/DAEMON_IPC_PROTOCOL.md`](/Users/young/Desktop/dashdrop/docs/DAEMON_IPC_PROTOCOL.md)。
 
 > **v0.3 修订摘要**（在 v0.2 基础上）：
 > - **传输成功语义闭环**：接收端落盘+校验成功后发 `Ack`，发送端以此为唯一成功判据
@@ -21,7 +23,7 @@
 > - 部分待补：协议文档中的“真实端到端集成测试要求”尚未完全达成（当前为单测+契约测试增强）。
 > - 已落地：`FileItem.risk_class` 可选字段、trusted auto-accept 500MB 阈值、以及高风险文件自动降级为人工确认。
 > - 已明确：当前实现保留 `E_SIZE_POLICY` 码位，但默认大小策略超限只降级为人工确认；若人工确认超时，统一保持 `E_TIMEOUT` 语义。
-> - 目标态预留：daemon/system share/BLE assist 等能力，当前仍未启用。
+> - 目标态预留：system share/BLE assist 等更高阶能力当前仍未启用；daemon local IPC baseline 已存在，但其合同单独见 `docs/DAEMON_IPC_PROTOCOL.md`。
 
 ---
 

@@ -2,6 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>DashDrop uses Bluetooth to discover nearby devices and exchange short-lived assist tokens for local transfers.</string>
+  <key>NSBluetoothPeripheralUsageDescription</key>
+  <string>DashDrop uses Bluetooth to discover nearby devices and exchange short-lived assist tokens for local transfers.</string>
   <key>NSLocalNetworkUsageDescription</key>
   <string>DashDrop uses local network discovery to find nearby devices for secure file transfer.</string>
   <key>NSBonjourServices</key>

@@ -4,14 +4,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::AppHandle;
 
-use crate::dto::{DeviceView, TrustedPeerView};
+use crate::dto::{DeviceView, TransferView, TrustedPeerView};
 use crate::local_ipc::{
     ConnectByAddressResult, LocalIpcCommand, LocalIpcError, LocalIpcResponse, LocalIpcWireRequest,
-    LocalIpcWireResponse,
+    LocalIpcWireResponse, PendingIncomingRequestPayload,
 };
-use crate::state::{AppConfig, AppState, DeviceInfo, Platform, ReachabilityStatus, SessionInfo};
+use crate::runtime::bootstrap::collect_external_share_paths;
+use crate::runtime::host::{RuntimeHost, TauriRuntimeHost};
+use crate::state::{
+    AppConfig, AppState, DeviceInfo, Platform, ReachabilityStatus, RuntimeEventCheckpoint,
+    RuntimeEventFeedSnapshot, SessionInfo, TransferDirection, TransferStatus, TrustLevel,
+    TrustVerificationMethod,
+};
 use crate::transport::connect_to_peer;
 use crate::transport::sender::send_files as transport_send_files;
 
@@ -98,23 +104,33 @@ async fn reconnect_to_peer_by_best_addrs(
 
 pub struct AppCoreService {
     state: Arc<AppState>,
-    app: Option<AppHandle>,
+    host: Option<Arc<dyn RuntimeHost>>,
 }
 
 impl AppCoreService {
     pub fn new(state: Arc<AppState>) -> Self {
-        Self { state, app: None }
+        Self { state, host: None }
+    }
+
+    pub fn with_host(state: Arc<AppState>, host: Arc<dyn RuntimeHost>) -> Self {
+        Self {
+            state,
+            host: Some(host),
+        }
     }
 
     pub fn with_app(state: Arc<AppState>, app: AppHandle) -> Self {
-        Self {
-            state,
-            app: Some(app),
-        }
+        Self::with_host(Arc::clone(&state), TauriRuntimeHost::shared(app, state))
     }
 
     pub async fn dispatch(&self, command: LocalIpcCommand) -> Result<LocalIpcResponse, String> {
         match command {
+            LocalIpcCommand::AuthIssue => Ok(LocalIpcResponse::AccessGrant {
+                auth: self.state.issue_local_ipc_access_grant(None).await,
+            }),
+            LocalIpcCommand::AuthRevoke => {
+                Err("auth/revoke must be handled by the local IPC server".to_string())
+            }
             LocalIpcCommand::DiscoverList => Ok(LocalIpcResponse::Devices {
                 devices: self.get_devices().await?,
             }),
@@ -136,6 +152,19 @@ impl AppCoreService {
             }
             LocalIpcCommand::TrustSetAlias { fingerprint, alias } => {
                 self.set_trusted_alias(&fingerprint, alias).await?;
+                Ok(LocalIpcResponse::Ack)
+            }
+            LocalIpcCommand::TrustConfirmVerification {
+                fingerprint,
+                verification_method,
+                mutual_confirmation,
+            } => {
+                self.confirm_trusted_peer_verification(
+                    &fingerprint,
+                    verification_method,
+                    mutual_confirmation,
+                )
+                .await?;
                 Ok(LocalIpcResponse::Ack)
             }
             LocalIpcCommand::ConfigGet => Ok(LocalIpcResponse::AppConfig {
@@ -173,24 +202,82 @@ impl AppCoreService {
             LocalIpcCommand::TransferCancelAll => Ok(LocalIpcResponse::CancelledTransfers {
                 count: self.cancel_all_transfers().await?,
             }),
+            LocalIpcCommand::TransferList => Ok(LocalIpcResponse::Transfers {
+                transfers: self.get_transfers().await?,
+            }),
+            LocalIpcCommand::TransferGet { transfer_id } => Ok(LocalIpcResponse::Transfer {
+                transfer: self.get_transfer(&transfer_id).await?,
+            }),
+            LocalIpcCommand::TransferHistory { limit, offset } => {
+                Ok(LocalIpcResponse::TransferHistory {
+                    history: self.get_transfer_history(limit, offset).await?,
+                })
+            }
+            LocalIpcCommand::TransferPendingIncoming => {
+                Ok(LocalIpcResponse::PendingIncomingRequests {
+                    requests: self.get_pending_incoming_requests().await?,
+                })
+            }
             LocalIpcCommand::TransferRetry { transfer_id } => {
                 self.retry_transfer(&transfer_id).await?;
                 Ok(LocalIpcResponse::Ack)
             }
-            LocalIpcCommand::AppActivate { paths } => {
-                self.activate_app(paths).await?;
+            LocalIpcCommand::AppActivate {
+                paths,
+                pairing_links,
+            } => {
+                self.activate_app(paths, pairing_links).await?;
                 Ok(LocalIpcResponse::Ack)
             }
             LocalIpcCommand::AppGetLocalIdentity => Ok(LocalIpcResponse::LocalIdentity {
                 identity: self.get_local_identity().await?,
             }),
+            LocalIpcCommand::AppGetBleAssistCapsule => Ok(LocalIpcResponse::BleAssistCapsule {
+                capsule: self.get_local_ble_assist_capsule().await?,
+            }),
+            LocalIpcCommand::AppIngestBleAssistCapsule { capsule, source } => {
+                self.ingest_ble_assist_capsule(capsule, source).await?;
+                Ok(LocalIpcResponse::Ack)
+            }
             LocalIpcCommand::AppGetRuntimeStatus => Ok(LocalIpcResponse::RuntimeStatus {
                 runtime_status: self.get_runtime_status().await?,
             }),
+            LocalIpcCommand::AppGetDiscoveryDiagnostics => {
+                Ok(LocalIpcResponse::DiscoveryDiagnostics {
+                    diagnostics: self.get_discovery_diagnostics().await?,
+                })
+            }
+            LocalIpcCommand::AppGetEventCheckpoint { consumer_id } => {
+                Ok(LocalIpcResponse::RuntimeEventCheckpoint {
+                    checkpoint: self.get_runtime_event_checkpoint(&consumer_id).await?,
+                })
+            }
+            LocalIpcCommand::AppGetEventFeed { after_seq, limit } => {
+                Ok(LocalIpcResponse::RuntimeEvents {
+                    feed: Box::new(self.get_runtime_events(after_seq, limit).await?),
+                })
+            }
+            LocalIpcCommand::AppSetEventCheckpoint {
+                consumer_id,
+                generation,
+                seq,
+            } => {
+                self.set_runtime_event_checkpoint(&consumer_id, &generation, seq)
+                    .await?;
+                Ok(LocalIpcResponse::Ack)
+            }
             LocalIpcCommand::AppQueueExternalShare { paths } => {
                 self.queue_external_share(paths).await?;
                 Ok(LocalIpcResponse::Ack)
             }
+            LocalIpcCommand::SecurityGetEvents { limit, offset } => {
+                Ok(LocalIpcResponse::SecurityEvents {
+                    events: self.get_security_events(limit, offset).await?,
+                })
+            }
+            LocalIpcCommand::TransferGetMetrics => Ok(LocalIpcResponse::TransferMetrics {
+                metrics: self.get_transfer_metrics().await?,
+            }),
             LocalIpcCommand::SecurityGetPosture => Ok(LocalIpcResponse::SecurityPosture {
                 posture: self.get_security_posture().await?,
             }),
@@ -223,6 +310,48 @@ impl AppCoreService {
     pub async fn get_trusted_peers(&self) -> Result<Vec<TrustedPeerView>, String> {
         let trusted = self.state.trusted_peers.read().await;
         Ok(trusted.values().map(TrustedPeerView::from).collect())
+    }
+
+    pub async fn get_pending_incoming_requests(
+        &self,
+    ) -> Result<Vec<PendingIncomingRequestPayload>, String> {
+        let notifications = self
+            .state
+            .incoming_request_notifications
+            .read()
+            .await
+            .clone();
+        let trusted = self.state.trusted_peers.read().await.clone();
+        let transfers = self.state.transfers.read().await;
+
+        let mut requests = transfers
+            .values()
+            .filter(|task| {
+                task.direction == TransferDirection::Receive
+                    && task.status == TransferStatus::PendingAccept
+            })
+            .filter_map(|task| {
+                let notification = notifications.get(&task.id)?;
+                if !notification.active {
+                    return None;
+                }
+
+                Some(PendingIncomingRequestPayload {
+                    transfer_id: task.id.clone(),
+                    batch_id: task.batch_id.clone(),
+                    notification_id: notification.notification_id.clone(),
+                    sender_name: task.peer_name.clone(),
+                    sender_fp: task.peer_fingerprint.clone(),
+                    trusted: trusted.contains_key(&task.peer_fingerprint),
+                    items: task.items.clone(),
+                    total_size: task.total_bytes,
+                    revision: task.revision,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        requests.sort_by(|left, right| left.transfer_id.cmp(&right.transfer_id));
+        Ok(requests)
     }
 
     pub async fn connect_by_address(
@@ -340,11 +469,11 @@ impl AppCoreService {
             (name, payload, is_new)
         };
 
-        if let Some(app) = &self.app {
+        if let Some(host) = &self.host {
             if is_new {
-                app.emit("device_discovered", &payload).ok();
+                emit_host_payload(host, "device_discovered", &payload);
             } else {
-                app.emit("device_updated", &payload).ok();
+                emit_host_payload(host, "device_updated", &payload);
             }
         }
 
@@ -357,49 +486,42 @@ impl AppCoreService {
     }
 
     pub async fn queue_external_share(&self, paths: Vec<String>) -> Result<(), String> {
-        if paths.is_empty() {
-            return Err("external share requires at least one path".to_string());
-        }
-
-        let app = self
-            .app
+        let host = self
+            .host
             .clone()
-            .ok_or_else(|| "app/queue_external_share requires app handle".to_string())?;
+            .ok_or_else(|| "app/queue_external_share requires runtime host".to_string())?;
 
-        let payload = serde_json::json!({
-            "paths": paths,
-            "source": "local_ipc",
-        });
-        app.emit("external_share_received", payload)
-            .map_err(|e| format!("failed to emit external share event: {e}"))?;
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.show();
-            let _ = window.set_focus();
-        }
+        emit_external_share_payload(&host, paths, "local_ipc")?
+            .ok_or_else(|| "external share requires at least one valid path".to_string())?;
+        host.reveal_main_window()?;
         Ok(())
     }
 
-    pub async fn activate_app(&self, paths: Vec<String>) -> Result<(), String> {
-        let app = self
-            .app
+    pub async fn activate_app(
+        &self,
+        paths: Vec<String>,
+        pairing_links: Vec<String>,
+    ) -> Result<(), String> {
+        let host = self
+            .host
             .clone()
-            .ok_or_else(|| "app/activate requires app handle".to_string())?;
+            .ok_or_else(|| "app/activate requires runtime host".to_string())?;
 
-        if !paths.is_empty() {
-            app.emit(
-                "external_share_received",
+        emit_external_share_payload(&host, paths, "app_activate")
+            .map_err(|e| format!("failed to emit activation share event: {e}"))?;
+
+        for pairing_link in pairing_links {
+            host.emit_json(
+                "pairing_link_received",
                 serde_json::json!({
-                    "paths": paths,
-                    "source": "app_activate"
+                    "pairing_link": pairing_link,
+                    "source": "app_activate",
                 }),
             )
-            .map_err(|e| format!("failed to emit activation share event: {e}"))?;
+            .map_err(|e| format!("failed to emit pairing link event: {e}"))?;
         }
 
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.show();
-            let _ = window.set_focus();
-        }
+        host.reveal_main_window()?;
 
         Ok(())
     }
@@ -409,9 +531,9 @@ impl AppCoreService {
             let mut devices = self.state.devices.write().await;
             if let Some(device) = devices.get_mut(fingerprint) {
                 device.trusted = true;
-                if let Some(app) = &self.app {
+                if let Some(host) = &self.host {
                     let payload = DeviceView::from(&*device);
-                    app.emit("device_updated", &payload).ok();
+                    emit_host_payload(host, "device_updated", &payload);
                 }
                 device.name.clone()
             } else {
@@ -419,7 +541,20 @@ impl AppCoreService {
             }
         };
         self.state.add_trust(fingerprint.to_string(), name).await;
-        persist_runtime_state(&self.state).await
+        persist_runtime_state(&self.state).await?;
+        if let Some(host) = &self.host {
+            let payload = serde_json::json!({
+                "fingerprint": fingerprint,
+                "action": "paired",
+                "trust_level": self
+                    .state
+                    .trust_level_for(fingerprint)
+                    .await
+                    .unwrap_or(TrustLevel::LegacyPaired),
+            });
+            let _ = host.emit_json("trusted_peer_updated", payload);
+        }
+        Ok(())
     }
 
     pub async fn unpair_device(&self, fingerprint: &str) -> Result<(), String> {
@@ -431,13 +566,21 @@ impl AppCoreService {
             let mut devices = self.state.devices.write().await;
             if let Some(device) = devices.get_mut(fingerprint) {
                 device.trusted = false;
-                if let Some(app) = &self.app {
+                if let Some(host) = &self.host {
                     let payload = DeviceView::from(&*device);
-                    app.emit("device_updated", &payload).ok();
+                    emit_host_payload(host, "device_updated", &payload);
                 }
             }
         }
-        persist_runtime_state(&self.state).await
+        persist_runtime_state(&self.state).await?;
+        if let Some(host) = &self.host {
+            let payload = serde_json::json!({
+                "fingerprint": fingerprint,
+                "action": "unpaired",
+            });
+            let _ = host.emit_json("trusted_peer_updated", payload);
+        }
+        Ok(())
     }
 
     pub async fn set_trusted_alias(
@@ -459,7 +602,140 @@ impl AppCoreService {
         };
         peer.alias = normalized;
         drop(trusted);
-        persist_runtime_state(&self.state).await
+        persist_runtime_state(&self.state).await?;
+        if let Some(host) = &self.host {
+            let payload = serde_json::json!({
+                "fingerprint": fingerprint,
+                "action": "alias_updated",
+                "trust_level": self
+                    .state
+                    .trust_level_for(fingerprint)
+                    .await
+                    .unwrap_or(TrustLevel::LegacyPaired),
+                "alias": self
+                    .state
+                    .trusted_peers
+                    .read()
+                    .await
+                    .get(fingerprint)
+                    .and_then(|peer| peer.alias.clone()),
+            });
+            let _ = host.emit_json("trusted_peer_updated", payload);
+        }
+        Ok(())
+    }
+
+    pub async fn confirm_trusted_peer_verification(
+        &self,
+        fingerprint: &str,
+        verification_method: TrustVerificationMethod,
+        mutual_confirmation: bool,
+    ) -> Result<(), String> {
+        if mutual_confirmation
+            && matches!(
+                verification_method,
+                TrustVerificationMethod::ManualPairing
+                    | TrustVerificationMethod::LegacyUnsignedLink
+            )
+        {
+            return Err(
+                "Mutual confirmation requires a signed pairing link and matching shared pair code."
+                    .to_string(),
+            );
+        }
+
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut trusted = self.state.trusted_peers.write().await;
+        let Some(peer) = trusted.get_mut(fingerprint) else {
+            return Err(format!("trusted device {fingerprint} not found"));
+        };
+        let previous_level = peer.trust_level.clone();
+        let requested_level = if mutual_confirmation {
+            TrustLevel::MutualConfirmed
+        } else if matches!(
+            verification_method,
+            TrustVerificationMethod::SignedPairingLink
+        ) {
+            TrustLevel::SignedLinkVerified
+        } else {
+            TrustLevel::LegacyPaired
+        };
+        peer.trust_level = peer.trust_level.clone().apply_verification(requested_level);
+        peer.last_verification_method = if mutual_confirmation {
+            TrustVerificationMethod::MutualReceipt
+        } else {
+            verification_method.clone()
+        };
+        peer.local_confirmation_at = Some(now_unix);
+        if matches!(
+            verification_method,
+            TrustVerificationMethod::SignedPairingLink | TrustVerificationMethod::MutualReceipt
+        ) {
+            peer.remote_confirmation_material_seen_at = Some(now_unix);
+        }
+        if mutual_confirmation && peer.mutual_confirmed_at.is_none() {
+            peer.mutual_confirmed_at = Some(now_unix);
+        }
+        if peer.trust_level != TrustLevel::Frozen {
+            peer.frozen_at = None;
+            peer.freeze_reason = None;
+        }
+        let current_level = peer.trust_level.clone();
+        let current_method = peer.last_verification_method.clone();
+        let mutual_confirmed_at = peer.mutual_confirmed_at;
+        let thawed = previous_level == TrustLevel::Frozen && current_level != TrustLevel::Frozen;
+        drop(trusted);
+
+        persist_runtime_state(&self.state).await?;
+
+        if let Some(host) = &self.host {
+            let payload = serde_json::json!({
+                "fingerprint": fingerprint,
+                "action": "verification_confirmed",
+                "trust_level": current_level,
+                "last_verification_method": current_method,
+                "mutual_confirmed_at": mutual_confirmed_at,
+            });
+            let _ = host.emit_json("trusted_peer_updated", payload);
+        }
+
+        if let Ok(db) = self.state.db.lock() {
+            if previous_level != current_level {
+                let _ = crate::db::log_security_event(
+                    &db,
+                    "trust_level_transition",
+                    "pairing",
+                    Some(fingerprint),
+                    &format!(
+                        "trust level moved from {:?} to {:?} via {:?}",
+                        previous_level, current_level, current_method
+                    ),
+                );
+            }
+            if mutual_confirmation {
+                let _ = crate::db::log_security_event(
+                    &db,
+                    "mutual_confirmation_complete",
+                    "pairing",
+                    Some(fingerprint),
+                    "mutual pairing confirmation recorded after shared pair code check",
+                );
+            }
+            if thawed {
+                let _ = crate::db::log_security_event(
+                    &db,
+                    "trust_freeze_cleared",
+                    "pairing",
+                    Some(fingerprint),
+                    "frozen trust relationship cleared by explicit verification confirmation",
+                );
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn get_app_config(&self) -> Result<AppConfig, String> {
@@ -498,15 +774,15 @@ impl AppCoreService {
                 crate::discovery::service::reregister_service(Arc::clone(&self.state)).await
             {
                 *self.state.config.write().await = previous_config;
-                if let Some(app) = &self.app {
-                    app.emit("system_error", serde_json::json!({
+                if let Some(host) = &self.host {
+                    let payload = serde_json::json!({
                         "code": "MDNS_REREGISTER_FAILED",
                         "subsystem": "mdns",
                         "message": format!("Device name update rolled back because mDNS refresh failed: {e:#}"),
                         "attempted_device_name": attempted_device_name,
                         "rollback_device_name": self.state.config.read().await.device_name.clone(),
-                    }))
-                    .ok();
+                    });
+                    let _ = host.emit_json("system_error", payload);
                 }
                 return Err(format!(
                     "device name update rolled back because mDNS refresh failed: {e:#}"
@@ -514,10 +790,45 @@ impl AppCoreService {
             }
         }
 
-        persist_runtime_state(&self.state).await
+        persist_runtime_state(&self.state).await?;
+        if let Some(host) = &self.host {
+            let payload = serde_json::json!({
+                "config": self.state.config.read().await.clone(),
+            });
+            let _ = host.emit_json("app_config_updated", payload);
+        }
+        Ok(())
     }
 
     pub async fn send_files(&self, peer_fp: String, paths: Vec<String>) -> Result<(), String> {
+        if let Some(level) = self.state.trust_level_for(&peer_fp).await {
+            if !level.allows_sensitive_send() {
+                let reason = self
+                    .state
+                    .trusted_peers
+                    .read()
+                    .await
+                    .get(&peer_fp)
+                    .and_then(|peer| peer.freeze_reason.clone())
+                    .unwrap_or_else(|| {
+                        "This trusted peer is frozen and must be re-verified before sending."
+                            .to_string()
+                    });
+                if let Ok(db) = self.state.db.lock() {
+                    let _ = crate::db::log_security_event(
+                        &db,
+                        "frozen_send_blocked",
+                        "outgoing",
+                        Some(&peer_fp),
+                        &reason,
+                    );
+                }
+                return Err(format!(
+                    "trusted peer is frozen: {reason}. Re-run signed pairing verification before sending."
+                ));
+            }
+        }
+
         let transfer_id = uuid::Uuid::new_v4().to_string();
         self.state
             .record_sender_dispatch(&transfer_id, &peer_fp)
@@ -572,16 +883,15 @@ impl AppCoreService {
                 .map_err(|e| format!("failed to verify peer identity: {e:#}"))?;
         if !fp_match {
             conn.close(quinn::VarInt::from_u32(2), b"identity mismatch");
-            if let Some(app) = &self.app {
-                app.emit(
+            if let Some(host) = &self.host {
+                let _ = host.emit_json(
                     "identity_mismatch",
                     serde_json::json!({
                         "expected_fp": peer_fp.clone(),
                         "actual_fp": actual_fp,
                         "phase": "connect",
                     }),
-                )
-                .ok();
+                );
             }
             if let Ok(db) = self.state.db.lock() {
                 let _ = crate::db::log_security_event(
@@ -597,10 +907,10 @@ impl AppCoreService {
             );
         }
 
-        let app = self
-            .app
+        let host = self
+            .host
             .clone()
-            .ok_or_else(|| "transfer/send requires app handle".to_string())?;
+            .ok_or_else(|| "transfer/send requires runtime host".to_string())?;
         let state = Arc::clone(&self.state);
         let transfer_id_clone = transfer_id.clone();
         let retry_paths = path_bufs.clone();
@@ -618,7 +928,7 @@ impl AppCoreService {
                     retry_peer_fp.clone(),
                     retry_paths.clone(),
                     current_conn,
-                    app.clone(),
+                    Arc::clone(&host),
                     state.clone(),
                 )
                 .await;
@@ -697,7 +1007,8 @@ impl AppCoreService {
                                 .unwrap_or(0)
                         };
                         crate::transport::events::emit_transfer_terminal(
-                            &app,
+                            &host,
+                            &state,
                             &transfer_id_clone,
                             &crate::state::TransferStatus::Failed,
                             reason_code,
@@ -706,7 +1017,8 @@ impl AppCoreService {
                             Some("send"),
                         );
                         crate::transport::events::emit_transfer_error_with_detail(
-                            &app,
+                            &host,
+                            &state,
                             Some(&transfer_id_clone),
                             reason_code,
                             terminal_cause,
@@ -730,8 +1042,8 @@ impl AppCoreService {
     ) -> Result<(), String> {
         let result = accept_pending_transfer(&self.state, transfer_id, notification_id).await;
         if matches!(result.as_ref(), Err(err) if err == REQUEST_EXPIRED_CODE) {
-            if let Some(app) = &self.app {
-                emit_request_expired(app, &self.state, transfer_id).await;
+            if let Some(host) = &self.host {
+                emit_request_expired(host, &self.state, transfer_id).await;
             }
         }
         result
@@ -744,15 +1056,15 @@ impl AppCoreService {
     ) -> Result<(), String> {
         let result = reject_pending_transfer(&self.state, transfer_id, notification_id).await;
         if matches!(result.as_ref(), Err(err) if err == REQUEST_EXPIRED_CODE) {
-            if let Some(app) = &self.app {
-                emit_request_expired(app, &self.state, transfer_id).await;
+            if let Some(host) = &self.host {
+                emit_request_expired(host, &self.state, transfer_id).await;
             }
         }
         result
     }
 
     pub async fn cancel_transfer(&self, transfer_id: &str) -> Result<(), String> {
-        if !cancel_transfer_inner(transfer_id, self.app.as_ref(), &self.state).await {
+        if !cancel_transfer_inner(transfer_id, self.host.as_ref(), &self.state).await {
             return Err(format!("transfer {transfer_id} not found"));
         }
         Ok(())
@@ -775,7 +1087,7 @@ impl AppCoreService {
         };
         let mut count = 0u32;
         for transfer_id in active_ids {
-            if cancel_transfer_inner(&transfer_id, self.app.as_ref(), &self.state).await {
+            if cancel_transfer_inner(&transfer_id, self.host.as_ref(), &self.state).await {
                 count += 1;
             }
         }
@@ -814,14 +1126,120 @@ impl AppCoreService {
         ))
     }
 
+    pub async fn get_transfers(&self) -> Result<Vec<TransferView>, String> {
+        let transfers = self.state.transfers.read().await;
+        Ok(transfers.values().map(TransferView::from).collect())
+    }
+
+    pub async fn get_transfer(&self, transfer_id: &str) -> Result<Option<TransferView>, String> {
+        let transfers = self.state.transfers.read().await;
+        Ok(transfers.get(transfer_id).map(TransferView::from))
+    }
+
+    pub async fn get_transfer_history(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<TransferView>, String> {
+        let guard = self
+            .state
+            .db
+            .lock()
+            .map_err(|_| "DB lock poisoned".to_string())?;
+        let history = crate::db::get_history(&guard, limit, offset).map_err(|e| e.to_string())?;
+        Ok(history.iter().map(TransferView::from).collect())
+    }
+
+    pub async fn get_security_events(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<crate::state::SecurityEvent>, String> {
+        let guard = self
+            .state
+            .db
+            .lock()
+            .map_err(|_| "DB lock poisoned".to_string())?;
+        crate::db::get_security_events(&guard, limit, offset).map_err(|e| e.to_string())
+    }
+
     pub async fn get_runtime_status(&self) -> Result<crate::state::RuntimeStatus, String> {
         Ok(self.state.runtime_status().await)
+    }
+
+    pub async fn get_local_ble_assist_capsule(
+        &self,
+    ) -> Result<crate::ble::BleAssistCapsule, String> {
+        crate::ble::build_ble_assist_capsule(&self.state.identity)
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn ingest_ble_assist_capsule(
+        &self,
+        capsule: crate::ble::BleAssistCapsule,
+        source: Option<String>,
+    ) -> Result<(), String> {
+        crate::ble::validate_ble_assist_capsule(&capsule).map_err(|error| error.to_string())?;
+        self.state.record_ble_assist_observation(&capsule).await;
+        if let Ok(db) = self.state.db.lock() {
+            let _ = crate::db::log_security_event(
+                &db,
+                "ble_assist_capsule_seen",
+                source.as_deref().unwrap_or("ble_assist"),
+                None,
+                &format!(
+                    "observed BLE assist capsule {} expiring at {}",
+                    capsule.rolling_identifier, capsule.expires_at_unix_ms
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn get_discovery_diagnostics(&self) -> Result<serde_json::Value, String> {
+        let cadence = crate::discovery::beacon::current_beacon_cadence();
+        Ok(crate::commands::build_discovery_diagnostics(&self.state, cadence).await)
+    }
+
+    pub async fn get_runtime_events(
+        &self,
+        after_seq: u64,
+        limit: u32,
+    ) -> Result<RuntimeEventFeedSnapshot, String> {
+        Ok(self.state.runtime_events_since(after_seq, limit as usize))
+    }
+
+    pub async fn get_runtime_event_checkpoint(
+        &self,
+        consumer_id: &str,
+    ) -> Result<Option<RuntimeEventCheckpoint>, String> {
+        self.state.runtime_event_checkpoint(consumer_id).await
+    }
+
+    pub async fn set_runtime_event_checkpoint(
+        &self,
+        consumer_id: &str,
+        generation: &str,
+        seq: u64,
+    ) -> Result<RuntimeEventCheckpoint, String> {
+        self.state
+            .save_runtime_event_checkpoint(consumer_id, generation, seq)
+            .await
     }
 
     pub async fn get_security_posture(&self) -> Result<serde_json::Value, String> {
         Ok(serde_json::json!({
             "secure_store_available": crate::crypto::secret_store::secure_store_available(),
         }))
+    }
+
+    pub async fn get_transfer_metrics(&self) -> Result<crate::state::TransferMetrics, String> {
+        let guard = self
+            .state
+            .db
+            .lock()
+            .map_err(|_| "DB lock poisoned".to_string())?;
+        crate::db::get_transfer_metrics(&guard).map_err(|e| e.to_string())
     }
 }
 
@@ -891,7 +1309,7 @@ async fn reject_pending_transfer(
                     transfer_id,
                     Some(REQUEST_EXPIRED_CODE),
                 )
-                    .await;
+                .await;
             return Err(REQUEST_EXPIRED_CODE.to_string());
         }
         IncomingRequestActionState::StaleNotification => {
@@ -968,7 +1386,42 @@ async fn incoming_request_action_state(
     }
 }
 
-async fn emit_request_expired(app: &AppHandle, state: &Arc<AppState>, transfer_id: &str) {
+fn emit_host_payload(host: &Arc<dyn RuntimeHost>, event: &str, payload: &impl serde::Serialize) {
+    let Ok(value) = serde_json::to_value(payload) else {
+        tracing::warn!("Failed to serialize payload for host event {event}");
+        return;
+    };
+    if let Err(err) = host.emit_json(event, value) {
+        tracing::warn!("Failed to emit host event {event}: {err}");
+    }
+}
+
+fn emit_external_share_payload(
+    host: &Arc<dyn RuntimeHost>,
+    paths: Vec<String>,
+    source: &str,
+) -> Result<Option<Vec<String>>, String> {
+    let paths = collect_external_share_paths(paths);
+    if paths.is_empty() {
+        return Ok(None);
+    }
+
+    host.emit_json(
+        "external_share_received",
+        serde_json::json!({
+            "paths": paths,
+            "source": source,
+        }),
+    )?;
+
+    Ok(Some(paths))
+}
+
+async fn emit_request_expired(
+    host: &Arc<dyn RuntimeHost>,
+    state: &Arc<AppState>,
+    transfer_id: &str,
+) {
     let revision = {
         let transfers = state.transfers.read().await;
         transfers
@@ -977,7 +1430,8 @@ async fn emit_request_expired(app: &AppHandle, state: &Arc<AppState>, transfer_i
             .unwrap_or(0)
     };
     crate::transport::events::emit_transfer_error(
-        app,
+        host,
+        state,
         Some(transfer_id),
         REQUEST_EXPIRED_CODE,
         REQUEST_EXPIRED_CAUSE,
@@ -1017,7 +1471,7 @@ fn select_retry_paths(task: &crate::state::TransferTask) -> Result<Vec<String>, 
 
 async fn cancel_transfer_inner(
     transfer_id: &str,
-    app: Option<&AppHandle>,
+    host: Option<&Arc<dyn RuntimeHost>>,
     state: &Arc<AppState>,
 ) -> bool {
     let tx = state.pending_accepts.write().await.remove(transfer_id);
@@ -1059,9 +1513,10 @@ async fn cancel_transfer_inner(
         if let Ok(guard) = state.db.lock() {
             let _ = crate::db::save_transfer(&guard, t);
         }
-        if let Some(app) = app {
+        if let Some(host) = host {
             crate::transport::events::emit_transfer_terminal(
-                app,
+                host,
+                state,
                 transfer_id,
                 &t.status,
                 "E_CANCELLED_BY_USER",
@@ -1112,29 +1567,74 @@ async fn persist_runtime_state(state: &Arc<AppState>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::time::Instant;
 
     use crate::crypto::Identity;
     use crate::local_ipc::{LocalIpcCommand, LocalIpcResponse, LocalIpcWireRequest};
+    use crate::runtime::host::RuntimeHost;
     use crate::state::{
         AppConfig, AppState, DeviceInfo, FileItemMeta, Platform, ReachabilityStatus, SessionInfo,
-        TransferDirection, TransferStatus, TransferTask,
+        TransferDirection, TransferStatus, TransferTask, TrustLevel, TrustVerificationMethod,
     };
     use serde_json::json;
+    use tauri::AppHandle;
     use tokio::sync::oneshot;
 
     use super::{select_retry_paths, AppCoreService, REQUEST_EXPIRED_CODE};
+
+    #[derive(Default)]
+    struct RecordingRuntimeHost {
+        events: Mutex<Vec<(String, serde_json::Value)>>,
+        reveal_count: Mutex<usize>,
+    }
+
+    impl RecordingRuntimeHost {
+        fn shared() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn recorded_events(&self) -> Vec<(String, serde_json::Value)> {
+            self.events.lock().expect("events lock").clone()
+        }
+
+        fn reveal_count(&self) -> usize {
+            *self.reveal_count.lock().expect("reveal count lock")
+        }
+    }
+
+    impl RuntimeHost for RecordingRuntimeHost {
+        fn emit_json(&self, event: &str, payload: serde_json::Value) -> Result<(), String> {
+            self.events
+                .lock()
+                .expect("events lock")
+                .push((event.to_string(), payload));
+            Ok(())
+        }
+
+        fn reveal_main_window(&self) -> Result<(), String> {
+            let mut reveal_count = self.reveal_count.lock().expect("reveal count lock");
+            *reveal_count += 1;
+            Ok(())
+        }
+
+        fn download_dir(&self) -> Option<PathBuf> {
+            None
+        }
+
+        fn app_handle(&self) -> Option<AppHandle> {
+            None
+        }
+    }
 
     fn build_test_state() -> Arc<AppState> {
         let config_dir =
             std::env::temp_dir().join(format!("dashdrop-core-{}", uuid::Uuid::new_v4()));
         let identity = Identity::load_or_create(&config_dir).expect("identity");
-        Arc::new(AppState::new(
-            identity,
-            AppConfig::default(),
-            rusqlite::Connection::open_in_memory().expect("db"),
-        ))
+        let db = crate::db::init_db_at(&config_dir).expect("db");
+        Arc::new(AppState::new(identity, AppConfig::default(), db))
     }
 
     fn make_transfer_task(
@@ -1153,6 +1653,7 @@ mod tests {
                 name: "file.txt".into(),
                 rel_path: "file.txt".into(),
                 size: 1,
+                hash: None,
                 risk_class: None,
             }],
             status,
@@ -1258,6 +1759,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queue_external_share_filters_invalid_paths_before_emitting() {
+        let state = build_test_state();
+        let host = RecordingRuntimeHost::shared();
+        let service =
+            AppCoreService::with_host(Arc::clone(&state), host.clone() as Arc<dyn RuntimeHost>);
+        let temp_dir =
+            std::env::temp_dir().join(format!("dashdrop-queue-share-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let file_path = temp_dir.join("shared.txt");
+        std::fs::write(&file_path, "payload").expect("write file");
+        let normalized_file_path = std::fs::canonicalize(&file_path)
+            .expect("canonicalize file")
+            .to_string_lossy()
+            .to_string();
+
+        service
+            .queue_external_share(vec![
+                file_path.to_string_lossy().to_string(),
+                file_path.to_string_lossy().to_string(),
+                temp_dir.join("missing.txt").to_string_lossy().to_string(),
+            ])
+            .await
+            .expect("queue share");
+
+        assert_eq!(host.reveal_count(), 1);
+        assert_eq!(
+            host.recorded_events(),
+            vec![(
+                "external_share_received".to_string(),
+                json!({
+                    "paths": [normalized_file_path],
+                    "source": "local_ipc",
+                }),
+            )]
+        );
+
+        std::fs::remove_dir_all(&temp_dir).expect("remove temp dir");
+    }
+
+    #[tokio::test]
+    async fn queue_external_share_rejects_all_invalid_paths() {
+        let state = build_test_state();
+        let host = RecordingRuntimeHost::shared();
+        let service =
+            AppCoreService::with_host(Arc::clone(&state), host.clone() as Arc<dyn RuntimeHost>);
+
+        let err = service
+            .queue_external_share(vec!["/definitely/missing/file.txt".into()])
+            .await
+            .expect_err("all-invalid share paths should fail");
+
+        assert_eq!(err, "external share requires at least one valid path");
+        assert_eq!(host.reveal_count(), 0);
+        assert!(host.recorded_events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn activate_app_skips_invalid_paths_but_keeps_pairing_links() {
+        let state = build_test_state();
+        let host = RecordingRuntimeHost::shared();
+        let service =
+            AppCoreService::with_host(Arc::clone(&state), host.clone() as Arc<dyn RuntimeHost>);
+        let temp_dir =
+            std::env::temp_dir().join(format!("dashdrop-activate-share-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let file_path = temp_dir.join("shared.txt");
+        std::fs::write(&file_path, "payload").expect("write file");
+        let normalized_file_path = std::fs::canonicalize(&file_path)
+            .expect("canonicalize file")
+            .to_string_lossy()
+            .to_string();
+
+        service
+            .activate_app(
+                vec![
+                    temp_dir.join("missing.txt").to_string_lossy().to_string(),
+                    file_path.to_string_lossy().to_string(),
+                    file_path.to_string_lossy().to_string(),
+                ],
+                vec!["dashdrop://pair?data=abc".into()],
+            )
+            .await
+            .expect("activate app");
+
+        assert_eq!(host.reveal_count(), 1);
+        assert_eq!(
+            host.recorded_events(),
+            vec![
+                (
+                    "external_share_received".to_string(),
+                    json!({
+                        "paths": [normalized_file_path],
+                        "source": "app_activate",
+                    }),
+                ),
+                (
+                    "pairing_link_received".to_string(),
+                    json!({
+                        "pairing_link": "dashdrop://pair?data=abc",
+                        "source": "app_activate",
+                    }),
+                ),
+            ]
+        );
+
+        std::fs::remove_dir_all(&temp_dir).expect("remove temp dir");
+    }
+
+    #[tokio::test]
+    async fn activate_app_emits_pairing_link_when_share_paths_are_all_invalid() {
+        let state = build_test_state();
+        let host = RecordingRuntimeHost::shared();
+        let service =
+            AppCoreService::with_host(Arc::clone(&state), host.clone() as Arc<dyn RuntimeHost>);
+
+        service
+            .activate_app(
+                vec!["/definitely/missing/file.txt".into()],
+                vec!["dashdrop://pair?data=abc".into()],
+            )
+            .await
+            .expect("activate app");
+
+        assert_eq!(host.reveal_count(), 1);
+        assert_eq!(
+            host.recorded_events(),
+            vec![(
+                "pairing_link_received".to_string(),
+                json!({
+                    "pairing_link": "dashdrop://pair?data=abc",
+                    "source": "app_activate",
+                }),
+            )]
+        );
+    }
+
+    #[tokio::test]
     async fn transfer_accept_dispatch_sends_accept_signal() {
         let state = build_test_state();
         let transfer_id = "transfer-accept".to_string();
@@ -1356,6 +1994,34 @@ mod tests {
             .expect_err("expired request should fail");
 
         assert_eq!(err, REQUEST_EXPIRED_CODE);
+    }
+
+    #[tokio::test]
+    async fn confirm_verification_thaws_frozen_peer() {
+        let state = build_test_state();
+        let host = RecordingRuntimeHost::shared();
+        let service =
+            AppCoreService::with_host(Arc::clone(&state), host.clone() as Arc<dyn RuntimeHost>);
+        state.add_trust("peer-fp".into(), "Peer".into()).await;
+        state
+            .freeze_trusted_peer("peer-fp", "fingerprint changed", 42)
+            .await
+            .expect("freeze peer");
+
+        service
+            .confirm_trusted_peer_verification(
+                "peer-fp",
+                TrustVerificationMethod::SignedPairingLink,
+                false,
+            )
+            .await
+            .expect("confirm verification");
+
+        let trusted = state.trusted_peers.read().await;
+        let peer = trusted.get("peer-fp").expect("peer exists");
+        assert_eq!(peer.trust_level, TrustLevel::SignedLinkVerified);
+        assert_eq!(peer.frozen_at, None);
+        assert_eq!(peer.freeze_reason, None);
     }
 
     #[tokio::test]
@@ -1481,6 +2147,7 @@ mod tests {
                 name: "a.txt".into(),
                 rel_path: "a.txt".into(),
                 size: 1,
+                hash: None,
                 risk_class: None,
             },
             FileItemMeta {
@@ -1488,6 +2155,7 @@ mod tests {
                 name: "b.txt".into(),
                 rel_path: "b.txt".into(),
                 size: 1,
+                hash: None,
                 risk_class: None,
             },
         ];

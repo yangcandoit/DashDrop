@@ -5,12 +5,12 @@
 ## P0（发布阻断项，必须完成）
 
 ### 1. 可靠性与回归防线
-- [~] 补齐后端关键集成测试（**进行中：单元/契约测试已补强，真实双端集成未完成**）：
-  - [ ] 设备发现上下线（含 `device_lost` 事件）
+- [ ] 补齐后端关键集成测试（**待实机验收**）：
+  - [ ] 设备发现上下线（含 `device_lost` 事件真机验证）
   - [ ] **Windows/Linux 实机发现链路测试（mDNS + beacon fallback）**（含虚拟网卡、组播受限与广播受限场景）
-  - [x] 发起侧证书指纹强绑定（错误证书必须拒绝）*（契约/单测覆盖）*
-  - [~] 多文件并发传输（100 次以上压力回归）*（已补 120 轮语义压力回归；真实双端吞吐压测未完成）*
-  - [ ] **跨平台大文件双向互传** (Mac <-> Win, Linux <-> Win 等混合平台，含 5GB 以上文件)
+  - [x] 发起侧证书指纹强绑定（错误证书必须拒绝）
+  - [ ] 多文件并发传输（100 次以上实机吞吐压测）
+  - [ ] **跨平台大文件双向互传** (5GB 以上文件，观测内存与取消一致性)
   - [x] Cancel 语义（已确认保留、未确认删除）*（契约/单测覆盖）*
   - [x] 本地 IPC 服务在无预先 Tokio runtime 的 GUI 启动阶段可正常拉起 *（回归测试 + 2026-03-11 `npm run test:tauri:smoke`）*
 - [~] 补齐前端 E2E（Playwright）最小闭环（**已完成核心流程，当前为 mock IPC 的真实 UI 自动化**）：
@@ -32,6 +32,7 @@
 - [x] `fingerprint_changed` 告警链路与审计落地（事件 emit + UI 消费 + SQLite 记录）。
 - [x] 未信任设备发送前强制指纹确认（Nearby 首次发送确认弹窗，可选立即配对）。
 - [x] 首次信任 UI 提供双方一致的 shared verification code，并要求未信任发送/接收/按地址确认前显式核对。
+- [~] 首次信任升级到分层 trust level（**已实现 `legacy_paired` / `signed_link_verified` / `mutual_confirmed` 持久化、signed pairing link 验证与 shared pair code 双边确认记录；更严格冻结/迁移策略未完成**）。
 
 ### 3. 传输一致性
 - [x] 校验所有失败事件 payload 统一为：`transfer_id + reason + phase`（已通过统一 emit 函数收口）。
@@ -59,16 +60,21 @@
 ## P1（高优先级，建议首个小版本完成）
 
 ### 0. 目标态前置规范收口（AirDrop-like 设计实施前）
-- [ ] 固化 daemon 本地 IPC 规范（Unix socket/Named pipe、认证、权限边界、命令集合）。
+- [~] 固化 daemon 本地 IPC 规范（**进行中：协议文档、service/ui 双端点、短时 token、`auth/issue`/`auth/revoke`、Unix same-user gate、Windows owner-only DACL + client-SID 校验、事件回放快照、checkpoint 生命周期、checkpoint-aware retention 与 replay diagnostics 已落地；剩余重点是更长窗口/更耐久的 replay 语义**）。
+- [x] 固化 headless daemon 基础自理策略（**已实现可选 `DASHDROP_HEADLESS_IDLE_EXIT_SECS` 空闲自退：以活动本地 IPC grant 与非终态传输为 blocker，RuntimeStatus/Settings 可见 deadline 与 blockers；默认仍关闭以避免影响现有桌面行为**）。
+- [x] 固化共享入口层 contract（runtime shell events、`app/activate` payload、tray shell attention payload 已在共享入口文件和顶层文档中冻结；后续 worker 应保持 backward compatible）。
 - [ ] 固化 SoftAP 安全与交互策略（一次一密凭据、用户显式同意、单网卡风险提示）。
-- [ ] 固化通知权限降级路径（托盘角标 + 前台 pending 队列），禁止“通知被禁用即静默超时”。
-- [ ] 固化跨 VLAN/子网边界提示策略（默认不支持自动发现，UI 指引 connect-by-address）。
+- [x] 固化通知权限降级路径（通知不可用时改为前台 Transfers pending 队列 + 托盘 pending 状态，并显式提示用户不会再静默超时）。
+- [x] 固化跨 VLAN/子网边界提示策略（默认不支持自动发现，UI 指引 connect-by-address）。（**已实现：discovery diagnostics 的 quick hints 明确提示 VLAN/子网边界与手动地址回退，Nearby 空状态直接引导打开 Transfers -> Connect by Address**）
 - [x] 固化 Windows 防火墙策略：QUIC 固定端口 `53319/udp` 优先 + 端口占用时 fallback 随机端口 + 诊断输出 `listener_port_mode/firewall_rule_state` 已落地；安装期/首次提权引导仍见 P2 文档项。
 - [x] 固化通知生命周期：超时/取消/终态时强制撤回通知，过期点击统一返回 `E_REQUEST_EXPIRED`。
 - [x] 固化断点恢复一致性：恢复前校验 `source_snapshot(size/mtime/head_hash)`，不一致必须整文件重传。
-- [ ] 固化进度持久化写盘策略：SQLite 批量落盘（时间窗或字节窗）、WAL、单写线程。
+- [x] 固化进度持久化写盘策略：SQLite 批量落盘（时间窗或字节窗）、WAL、单写线程。（**已实现：后台 worker 以内存聚合进度，按 `3s` 或 `32MB` 阈值批量写入，终态强制刷盘，并在 diagnostics 中暴露策略与写盘计数**）
 - [~] 固化能耗与隐私策略（**已实现电源状态驱动的 beacon 降频与诊断暴露；休眠联动与 BLE rolling identifier 仍未完成**）。
-- [ ] 明确 BLE 能力落地阶段（探测基线与凭据胶囊分发）及无 BLE 回退链路（二维码/短码）。
+- [~] 明确 BLE 能力落地阶段（探测基线与凭据胶囊分发）及无 BLE 回退链路（二维码/短码）。（**已实现 capability baseline + diagnostics + Settings 可见性，并新增本机短 TTL BLE assist capsule/rolling identifier 骨架；macOS provider 已支持真实 CoreBluetooth helper shell + bridge snapshot ingest，helper 已随 `.app` 打包并由 bundle smoke 校验，且本机 capsule 会写入广告请求并由 helper 通过 compact manufacturer payload 广播；Windows 现已补上 `windows_native` helper scaffold 与 sidecar 打包入口，但仍只有 snapshot/advertisement scaffold，跨平台 BLE runtime 与真实设备端到端验证仍未完成**）
+
+### Trust 策略状态
+- [~] 分层信任级别策略收尾（**已实现 `legacy_paired / signed_link_verified / mutual_confirmed / frozen` 持久化、UI badge、冻结时间/原因展示；`fingerprint_changed` 会冻结已验证关系，`frozen` 目标禁止继续发送，显式 signed-link 验证可解冻；剩余是更严格的迁移策略与实机验证**）
 
 ### 1. 产品功能完整度
 - [x] 传输任务管理增强：重试、批量取消、失败项重传（**已实现批量取消、整任务重试与 partial 失败项按文件级重传**）。

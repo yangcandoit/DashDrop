@@ -7,6 +7,8 @@ Branch baseline: `codex/arch-baseline`
 
 This document freezes the first daemon-boundary contract so parallel agents can work without renaming commands, payload envelopes, terminal events, or cross-layer field names.
 
+For the current implementation-derived daemon IPC contract, see [`docs/DAEMON_IPC_PROTOCOL.md`](/Users/young/Desktop/dashdrop/docs/DAEMON_IPC_PROTOCOL.md). This file remains a historical freeze/reference document.
+
 ## State Split
 
 ### Shipped in current code
@@ -29,11 +31,8 @@ This document freezes the first daemon-boundary contract so parallel agents can 
    - request: `proto_version`, `request_id`, `command`, `payload`, `auth_context`
    - response: `proto_version`, `request_id`, `ok`, `payload|error`
 2. Implemented control-plane command names are frozen even though the app still runs single-process.
-3. Phase A reserved command names are frozen but intentionally return not-implemented in the current single-process baseline:
+3. Some Phase A reserved command names are frozen but intentionally return not-implemented in the current baseline:
    - `discover/diagnostics`
-   - `transfer/send`
-   - `transfer/cancel`
-   - `transfer/retry`
 
 ### Target-state only
 
@@ -45,7 +44,7 @@ This document freezes the first daemon-boundary contract so parallel agents can 
 ## Doc / Code Mismatches Found
 
 1. `docs/AIRDROP_SEAMLESS_EXPERIENCE_DESIGN.md` Phase A requires `command + payload` in the local IPC envelope; previous code encoded request commands as a tagged enum with snake_case variant names. This branch freezes the documented envelope shape.
-2. The design doc lists `discover/diagnostics` and `transfer/*` as Phase A commands, but current code does not implement them behind the core service yet. Their names are now reserved to prevent drift before implementation.
+2. The design doc listed `discover/diagnostics` and `transfer/*` as Phase A commands. Current code now implements `transfer/send`, `transfer/cancel`, and `transfer/retry`, while `discover/diagnostics` remains reserved to prevent drift before implementation.
 3. `ARCHITECTURE.md` and `STATUS.md` correctly describe the shipped app as single-process, but the branch now introduces a stricter daemon-ready control-plane contract than the previously loose in-process abstraction.
 
 ## Frozen Interface Checklist
@@ -55,22 +54,34 @@ This document freezes the first daemon-boundary contract so parallel agents can 
 Implemented and frozen:
 
 1. `discover/list`
-2. `trust/list`
-3. `trust/pair`
-4. `trust/unpair`
-5. `trust/set_alias`
-6. `config/get`
-7. `config/set`
-8. `app/get_local_identity`
-9. `app/get_runtime_status`
-10. `security/get_posture`
+2. `discover/connect_by_address`
+3. `trust/list`
+4. `trust/pair`
+5. `trust/unpair`
+6. `trust/set_alias`
+7. `config/get`
+8. `config/set`
+9. `transfer/send`
+10. `transfer/cancel`
+11. `transfer/retry`
+12. `transfer/cancel_all`
+13. `transfer/list`
+14. `transfer/get`
+15. `transfer/history`
+16. `transfer/pending_incoming`
+17. `app/activate`
+18. `app/get_local_identity`
+19. `app/get_runtime_status`
+20. `app/get_discovery_diagnostics`
+21. `app/get_event_feed`
+22. `app/queue_external_share`
+23. `security/get_events`
+24. `transfer/get_metrics`
+25. `security/get_posture`
 
 Reserved and frozen:
 
 1. `discover/diagnostics`
-2. `transfer/send`
-3. `transfer/cancel`
-4. `transfer/retry`
 
 ### Local IPC response shape
 
@@ -102,11 +113,20 @@ Error responses must stay:
 Response payload keys that are frozen:
 
 1. `devices`
-2. `trusted_peers`
-3. `config`
-4. `identity`
-5. `runtime_status`
-6. `posture`
+2. `result`
+3. `trusted_peers`
+4. `config`
+5. `count`
+6. `transfers`
+7. `transfer`
+8. `history`
+9. `requests`
+10. `identity`
+11. `runtime_status`
+12. `diagnostics`
+13. `events`
+14. `metrics`
+15. `posture`
 
 ### Transfer terminal events
 

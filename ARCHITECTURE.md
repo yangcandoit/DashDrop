@@ -5,7 +5,7 @@
 > **文档版本**：v0.4（2026-03）
 > **主要修订**：五区 IA 与非阻塞接收模型、TransferStatus 与终态事件映射统一、接收方 Cancel 语义对齐、TransferHistoryEntry 与持久化约束、TrustedPeer/AppConfig 结构补全、Reachable Probe 归属与线协议约束
 
-> **实现状态快照（2026-03-11）**：
+> **实现状态快照（2026-03-12）**：
 > - 已实现：DTO 边界（`DeviceView/SessionView/TransferView`）、`transfer_accepted`、终态事件统一映射、`revision` 仅状态跃迁递增。
 > - 已实现：CI 门禁（`cargo check`、`cargo clippy --all-targets --all-features`、`cargo test`、`npm run build`、`npm run test:e2e`）。
 > - 已实现：GitHub 安全与发布自动化（`security-audit`、Code Scanning default setup、`Dependabot`、installers + checksums 上传）。
@@ -23,9 +23,40 @@
 > - 已实现：本地 IPC Unix listener 启动链路不再依赖预先存在的 Tokio reactor；真实 `npm run test:tauri:smoke` 启动烟测已通过。
 > - 已实现：Windows 本地 IPC named pipe baseline（server/client）以对齐 Unix socket 本地控制平面。
 > - 已实现：外部文件分享路径可经启动参数或本地 IPC 排队到前端 Nearby 视图，作为 system share / single-instance 接管的基础。
-> - 已实现：第二实例启动时优先通过 `app/activate` 本地 IPC 激活已运行实例并转交分享路径，避免并行前台会话争用。
+> - 已实现：第二实例启动时优先通过 `app/activate` 本地 IPC 激活已运行实例并转交分享路径；现在也会转交 `dashdrop://pair?...` pairing deep link。除 second-instance handoff 外，已运行实例也会处理操作系统投递的 open-url 事件，前端收到后会自动切到 Settings 并预填导入确认，而不是只能手动粘贴。
+> - 已实现：desktop scheme 注册现在改由 `tauri-plugin-deep-link` 驱动，`dashdrop://` 会写入 Tauri bundle 配置；Linux 与 Windows debug 开发态还会在 setup 期间 best-effort 调用 `register_all()`，让本地开发更接近打包后的 deep-link 行为。
+> - 已实现：运行中的 deep-link 投递也已统一走 `tauri-plugin-deep-link` 的 open-url 回调，再桥接成既有 `pairing_link_received` 壳层事件；不再依赖单独的 `RunEvent::Opened` 手工分发分支。
+> - 已实现：daemon 重构第二阶段基础，运行时初始化、宿主能力与 runtime supervisor 已抽到 `src-tauri/src/runtime/`，并新增 `dashdropd` headless daemon binary；它已能复用 shared discovery/transport runtime，但 UI 仍是主要事件消费端。
+> - 已实现：UI daemon-client 第二批读接口代理。设置 `DASHDROP_CONTROL_PLANE_MODE=daemon` 后，设备列表、trusted peers、pending incoming、app config、本机身份、runtime status、active transfers、history 与 security events 会优先通过 local IPC 读取 daemon 状态。
+> - 已扩展：daemon 运行时事件回放现在返回带 `generation` / `oldest_available_seq` / `latest_available_seq` / `resync_required` 的快照；当前端检测到 ring buffer 截断或 daemon 重启时，会主动回拉权威状态而不是继续依赖失效 cursor。回放现在分成 1024 条内存热窗口和 checkpoint-aware SQLite 持久窗口：默认保留最近 10,000 条，但若最近仍活跃的 consumer checkpoint 还需要更老历史，会把持久窗口向后扩到最多 100,000 条，并按固定 segment 边界做压缩而不是逐条裁剪。共享前端轮询器会优先把 checkpoint 写回 daemon SQLite，并保留本地存储作为兜底，以便 UI 重启后续追。checkpoint 现在还带有 daemon 侧生命周期管理、idle heartbeat lease 续约和 replay diagnostics，可观测每个 consumer 的 age / lag / recovery state。
+> - 已扩展：持久 replay journal 现在还维护正式的 `runtime_event_segments` 元数据和 compaction watermark（当前 compacted 到哪一个 `seq` / `segment_id`、最后一次真正 compact 的时间），让 diagnostics 能直接说明 journal 当前保留了哪些 segment，而不是只能推断窗口长度。
+> - 已扩展：Settings 可导出本机配对二维码与 `dashdrop://pair?...` pairing URI，也支持通过粘贴、二维码图片导入或摄像头扫码把该 pairing link 导回应用并完成 trust + alias 写入；扫码在原生 `BarcodeDetector` 不可用时会回退到 `jsQR`，当前 pairing link 为短时凭据，默认约 10 分钟过期，且仍保留短验证码做人为带外核对。
+> - 已扩展：pairing 导入入口现已铺到 Settings、Nearby 与 Trusted Devices，发送前配对和纯 trust 管理视图都能复用同一套 import/scan 流程。
+> - 已扩展：Nearby 在新配对完成后会把对应设备短时前置并高亮，减少“配完以后还要在列表里再找一遍”的摩擦。
+> - 已扩展：摄像头扫码现已具备可见取景框、检测高亮和短暂成功态，扫码交互不再只有文字提示。
+> - 已扩展：Settings 的 discovery diagnostics / transfer metrics 也可经 local IPC 读取 daemon；Security Events 和 Settings runtime 卡片已补 daemon 模式自动刷新。
+> - 已扩展：Runtime Status 现暴露 `requested_control_plane_mode` 与 `runtime_profile`；packaged build 默认优先 daemon-backed 控制面，dev build 默认保留 in-process。
+> - 已扩展：`test:tauri:smoke` 现使用动态 Vite/HMR 端口，避免本地 `1420/1421` 被占导致伪失败。
+> - 已扩展：新增 `test:tauri:daemon-smoke`，会在共享配置目录下同时拉起真实 `dashdropd` 与 `tauri dev`，覆盖 daemon-backed UI 壳的启动/稳定窗口。
+> - 已扩展：核心写操作也能走 daemon 控制面。daemon 模式下发送、按地址连接、accept/reject、cancel/retry、pair/unpair、alias/config 保存都会优先通过 local IPC 下发给 daemon。
+> - 已扩展：trust/config 变更现已发出显式 runtime event（`trusted_peer_updated`、`app_config_updated`），Trusted Devices 与 Settings 不再依赖手动刷新才能看到控制面更新。
+> - 已扩展：daemon 模式下主窗口关闭改为 hide-on-close，不再直接退出 UI 进程；macOS 的 `Reopen` 会恢复主窗口显示。
+> - 已扩展：本地 IPC 现已拆分 `service` 与 `ui activation` 双端点，UI 壳层与 `dashdropd` 可同时存在而不争用同一控制平面地址。
+> - 已扩展：service 端点上的读/写/事件回放命令现在要求 daemon 发放的短时 `access_token`；UI 在内存中缓存并预刷新 token，成功刷新时会吊销旧 token，真实退出时还会 best-effort 调用 `auth/revoke` 撤销当前 grant。Unix 端点会校验 peer uid；Windows named pipe 现在既有 owner-only DACL，也会在连接后校验 client SID。
+> - 已扩展：启动控制面模式支持 `auto/daemon/in_process`。在 `auto` 下，UI 会优先接入已运行 daemon，并在可用时尝试自动拉起 `dashdropd`；daemon 模式下 UI 不再自行启动 network runtime supervisor。
+> - 已扩展：`dashdropd` 已接入 Tauri `externalBin` 打包链路，运行时会同时搜索可执行目录与资源目录，避免平台 bundle 下找不到 daemon sidecar。
+> - 已扩展：新增 `test:tauri:bundle-smoke`，可自动验证平台 bundle 产物内确实包含 `dashdropd` sidecar，而不是只验证构建命令成功。
+> - 已扩展：运行时状态与 discovery diagnostics 现已带出 `control_plane_mode`、`daemon_status`、`daemon_binary_path`，用于区分真正 daemon-backed 运行与 fallback in-process。
+> - 已扩展：若检测到 daemon sidecar 存在但启动期未能接入控制面，启动流程会主动发出 `system_error`，让前端在首屏就能提示 fallback，而不是只靠诊断页观察。
 > - 未完成：真实双端 QUIC 多机编排压测（当前仍以合同测试+UI mock E2E 为主）。
 > - 说明：本文中若出现与代码细节不一致的结构定义，以 `src-tauri/src/*.rs` 与 `src/*.ts` 的当前实现为准。
+
+## 0. 共享入口层 Contract（冻结）
+
+- shell event 名称固定为 `external_share_received`、`pairing_link_received`、`app_navigation_requested`、`app_window_revealed`；daemon 模式下这些事件仍由本地 UI shell 负责投递。
+- `app/activate` / second-instance handoff 只转交两类壳层输入：`paths[]` 与 `pairing_links[]`。它负责唤起窗口与入队，不直接代替前端做发送或 trust 决策。
+- tray/native shell attention 的跨层 payload 固定为 `pendingIncomingCount`、`activeTransferCount`、`recentFailureCount`、`notificationsDegraded`，由前端聚合、后端原样映射到 tray tooltip/title/menu。
+- 上述 contract 已实现并作为多 worktree 并行开发的共享边界保留；系统级 share/open-with 的真实 OS 行为仍属于发布前实机验证范围。
 
 ---
 
@@ -58,18 +89,25 @@
 
 ### 1.1 进程模型与可靠性边界
 
-DashDrop 是一个**单进程 Tauri 应用**。后端逻辑运行在 Rust 异步线程（tokio runtime），前端运行在同一进程的 WebView 线程。
+DashDrop 当前是一个**双运行形态项目**：
+
+- 开发态默认仍可运行单进程 `in_process` Tauri 应用，便于调试。
+- 打包态默认优先接入/拉起 `dashdropd`，形成“daemon 持有 runtime + Tauri 作为 UI 壳层”的混合进程模型。
+
+在 `in_process` 下，后端逻辑运行在 Tauri 进程内的 Rust 异步线程（tokio runtime），前端运行在同一进程的 WebView 线程。  
+在 daemon-backed 模式下，discovery/transport/trust/config runtime 由 `dashdropd` 持有，Tauri 进程主要负责窗口、激活、本地壳层事件和 daemon client。
 
 **实际保证**：
 - UI 线程卡顿**不影响**后端 tokio 任务（异步隔离）
 - 后端 panic 导致整个进程退出，正在进行的传输**随之终止**
 
 **不保证**：
-- "传输核心崩溃不影响 UI" — 无进程边界，无此保证
-- 应用退出后后台暂停恢复 — MVP 不支持守护进程模式
+- 在 `in_process` 路径下，"传输核心崩溃不影响 UI" 仍无进程边界保证
+- 当前 daemon event replay 已具备 SQLite-backed catch-up 窗口，但仍不是 unbounded durable subscription / WAL 回放
+- 系统级分享入口、BLE assist、P2P/SoftAP 与 1:N 调度仍未完成
 
 如需进程级隔离，未来可将 transport/discovery 拆为系统服务，通过 Unix socket / named pipe 与 UI 通信。  
-目标态 IPC 与权限模型见 [docs/AIRDROP_SEAMLESS_EXPERIENCE_DESIGN.md](./docs/AIRDROP_SEAMLESS_EXPERIENCE_DESIGN.md) §4.1。**当前 MVP 不实现 daemon 拆分**。
+目标态 IPC 与权限模型见 [docs/AIRDROP_SEAMLESS_EXPERIENCE_DESIGN.md](./docs/AIRDROP_SEAMLESS_EXPERIENCE_DESIGN.md) §4.1；分阶段落地方案见 [docs/DAEMON_REFACTOR_PLAN.md](./docs/DAEMON_REFACTOR_PLAN.md)。**当前发布基线已部分实现 daemon 拆分，但距离目标态系统分享/权限/持久回放仍有差距**。
 
 ### 1.2 当前实现与目标态差异（文档对齐）
 
@@ -77,7 +115,8 @@ DashDrop 是一个**单进程 Tauri 应用**。后端逻辑运行在 Rust 异步
 1. 当前单进程实现已优先监听固定 `53319/udp`，占用时才回退随机端口；目标态仍要求安装期/首次提权防火墙引导与 daemon 常驻化。
 2. 当前应用内通知链路已经处理过期撤回与 `E_REQUEST_EXPIRED`；目标态还要求系统分享入口与 daemon 路径沿用同一闭环语义。
 3. 当前恢复路径已执行 `source_snapshot(size/mtime/head_hash)` 一致性校验；目标态仍要求块级恢复与批量写盘策略。
-4. 当前为单进程 Tauri；目标态为 daemon + 本地 IPC（Unix socket / Named Pipe）。
+4. 当前发布基线仍以 Tauri UI 壳为主，但 packaged build 已默认优先接入 `dashdropd` sidecar；dev build 仍默认 `in_process`，可通过环境变量强制切到 daemon-backed UI 模式。本地 IPC 也已拆成 `service` 与 `ui activation` 双端点。
+   同时，真实 daemon-backed smoke 已锁住一个关键回归：当只有 `dashdropd` 在跑时，首个 UI 壳不应把自己误判成“第二实例”并提前退出。
 5. 当前已支持 `batch_id` 分组和逐目标状态/重试，但尚未实现 daemon 调度的 1:N 单读多发扇出。
 
 ---
@@ -634,4 +673,4 @@ QUIC 原生支持路径迁移（RFC 9000 §8），但实际效果受限于：
 | 权限存储 | Keychain | DPAPI | secret-service |
 | VPN 接口识别 | `utun*` | `wintun`, `tap-*` | `tun*`, `tap*` |
 
-> 开机自启、系统托盘、系统通知：**P2，不在 MVP 范围**。
+> 系统通知：**P2，不在 MVP 范围**。系统托盘与开机自启基线现已落地，后续主要剩通知降级与常驻体验打磨收尾。

@@ -5,7 +5,6 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
-use tauri::{AppHandle, Emitter};
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::fs;
@@ -13,6 +12,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::dto::DeviceView;
+use crate::runtime::host::RuntimeHost;
 use crate::state::{AppState, DeviceInfo, Platform, SessionIndexEntry, SessionInfo};
 
 pub const DISCOVERY_BEACON_PORT: u16 = 53318;
@@ -307,7 +307,7 @@ fn build_beacon_packet(state: &Arc<AppState>, instance_id: &str, local_port: u16
     }
 }
 
-pub async fn start_beacon(app: AppHandle, state: Arc<AppState>) -> Result<()> {
+pub async fn start_beacon(host: Arc<dyn RuntimeHost>, state: Arc<AppState>) -> Result<()> {
     let listen_socket = tokio::net::UdpSocket::bind(("0.0.0.0", DISCOVERY_BEACON_PORT))
         .await
         .context("bind discovery beacon listener")?;
@@ -357,7 +357,7 @@ pub async fn start_beacon(app: AppHandle, state: Arc<AppState>) -> Result<()> {
     });
 
     let recv_state = state.clone();
-    let recv_app = app.clone();
+    let recv_host = Arc::clone(&host);
     tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
         loop {
@@ -400,7 +400,7 @@ pub async fn start_beacon(app: AppHandle, state: Arc<AppState>) -> Result<()> {
             }
 
             recv_state.bump_discovery_event("beacon_received").await;
-            upsert_from_beacon(&recv_app, &recv_state, &packet, src.ip(), candidate).await;
+            upsert_from_beacon(&recv_host, &recv_state, &packet, src.ip(), candidate).await;
         }
     });
 
@@ -408,7 +408,7 @@ pub async fn start_beacon(app: AppHandle, state: Arc<AppState>) -> Result<()> {
 }
 
 async fn upsert_from_beacon(
-    app: &AppHandle,
+    host: &Arc<dyn RuntimeHost>,
     state: &Arc<AppState>,
     packet: &BeaconPacket,
     source_ip: IpAddr,
@@ -489,15 +489,21 @@ async fn upsert_from_beacon(
 
     let payload = DeviceView::from(&device_model);
     if is_new {
-        app.emit("device_discovered", &payload).ok();
+        let _ = host.emit_json(
+            "device_discovered",
+            serde_json::to_value(&payload).unwrap_or(serde_json::Value::Null),
+        );
     } else {
-        app.emit("device_updated", &payload).ok();
+        let _ = host.emit_json(
+            "device_updated",
+            serde_json::to_value(&payload).unwrap_or(serde_json::Value::Null),
+        );
     }
 
-    let probe_app = app.clone();
+    let probe_host = Arc::clone(host);
     let probe_state = state.clone();
     tokio::spawn(async move {
-        crate::discovery::browser::run_probe_update(&probe_state, &probe_app, &fp, addrs).await;
+        crate::discovery::browser::run_probe_update(&probe_state, &probe_host, &fp, addrs).await;
     });
 }
 
