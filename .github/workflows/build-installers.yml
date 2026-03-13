@@ -88,6 +88,12 @@ jobs:
       - name: Install JS deps
         run: npm ci
 
+      - name: Prepare sidecars
+        run: npm run tauri:prepare-sidecar -- --release
+        env:
+          # This helps the script skip auto-detecting host if we are cross-compiling
+          TAURI_ENV_TARGET_TRIPLE: ${{ matrix.platform == 'linux' && 'x86_64-unknown-linux-gnu' || (matrix.platform == 'windows' && 'x86_64-pc-windows-msvc' || 'aarch64-apple-darwin') }}
+
       - name: Resolve release label
         id: release_meta
         shell: bash

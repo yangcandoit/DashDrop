@@ -116,12 +116,15 @@ function buildLinuxBleBridge({ release, targetTriple }) {
   }
 
   const extension = binaryExtensionForTarget(targetTriple);
+  // Source is the binary name produced by cargo
   const sourceBinary = path.join(
     srcTauriDir,
     "target",
     release ? "release" : "debug",
     `dashdrop-ble-bridge-linux${extension}`,
   );
+  // Destination MUST match the name in tauri.conf.json + suffix
+  // Note: tauri.conf.json says "binaries/dashdrop-ble-bridge"
   const destinationBinary = path.join(
     binariesDir,
     `dashdrop-ble-bridge-${targetTriple}${extension}`,
@@ -138,6 +141,7 @@ function buildLinuxBleBridge({ release, targetTriple }) {
     cargoArgs.push("--release");
   }
 
+  console.log(`🔨 Building Linux BLE Bridge...`);
   execFileSync("cargo", cargoArgs, {
     cwd: repoRoot,
     stdio: "inherit",
@@ -159,7 +163,10 @@ function buildLinuxBleBridge({ release, targetTriple }) {
 function main() {
   const release = process.argv.includes("--release");
   const profile = release ? "release" : "debug";
-  const targetTriple = currentTargetTriple();
+  
+  let targetTriple = process.env.TAURI_ENV_TARGET_TRIPLE || currentTargetTriple();
+  console.log(`🎯 Target Triple: ${targetTriple}`);
+  
   const extension = binaryExtensionForTarget(targetTriple);
   const sourceBinary = path.join(srcTauriDir, "target", profile, `dashdropd${extension}`);
   const destinationBinary = path.join(
@@ -178,6 +185,7 @@ function main() {
     cargoArgs.push("--release");
   }
 
+  console.log(`🔨 Building DashDrop Daemon...`);
   execFileSync("cargo", cargoArgs, {
     cwd: repoRoot,
     stdio: "inherit",
@@ -197,7 +205,7 @@ function main() {
     release,
     profile,
     targetTriple,
-  }) ?? buildWindowsBleBridge({ release, targetTriple }) ?? buildLinuxBleBridge({ release, targetTriple });
+  }) || buildWindowsBleBridge({ release, targetTriple }) || buildLinuxBleBridge({ release, targetTriple });
 
   console.log(
     `Prepared dashdropd sidecar for ${targetTriple}: ${path.relative(
