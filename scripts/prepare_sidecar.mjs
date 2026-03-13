@@ -110,6 +110,52 @@ function buildWindowsBleBridge({ release, targetTriple }) {
   return path.relative(repoRoot, destinationBinary);
 }
 
+function buildLinuxBleBridge({ release, targetTriple }) {
+  if (!targetTriple.includes("linux")) {
+    return null;
+  }
+
+  const extension = binaryExtensionForTarget(targetTriple);
+  const sourceBinary = path.join(
+    srcTauriDir,
+    "target",
+    release ? "release" : "debug",
+    `dashdrop-ble-bridge-linux${extension}`,
+  );
+  const destinationBinary = path.join(
+    binariesDir,
+    `dashdrop-ble-bridge-${targetTriple}${extension}`,
+  );
+
+  const cargoArgs = [
+    "build",
+    "--manifest-path",
+    path.join("src-tauri", "Cargo.toml"),
+    "--bin",
+    "dashdrop-ble-bridge-linux",
+  ];
+  if (release) {
+    cargoArgs.push("--release");
+  }
+
+  execFileSync("cargo", cargoArgs, {
+    cwd: repoRoot,
+    stdio: "inherit",
+  });
+
+  if (!existsSync(sourceBinary)) {
+    throw new Error(`built Linux BLE bridge helper was not found at ${sourceBinary}`);
+  }
+
+  mkdirSync(binariesDir, { recursive: true });
+  copyFileSync(sourceBinary, destinationBinary);
+  if (extension === "") {
+    chmodSync(destinationBinary, 0o755);
+  }
+
+  return path.relative(repoRoot, destinationBinary);
+}
+
 function main() {
   const release = process.argv.includes("--release");
   const profile = release ? "release" : "debug";
@@ -151,7 +197,7 @@ function main() {
     release,
     profile,
     targetTriple,
-  }) ?? buildWindowsBleBridge({ release, targetTriple });
+  }) ?? buildWindowsBleBridge({ release, targetTriple }) ?? buildLinuxBleBridge({ release, targetTriple });
 
   console.log(
     `Prepared dashdropd sidecar for ${targetTriple}: ${path.relative(
