@@ -98,6 +98,7 @@ function buildWindowsBleBridge({ release, targetTriple }) {
   execFileSync("cargo", cargoArgs, {
     cwd: repoRoot,
     stdio: "inherit",
+    env: { ...process.env, DASHDROP_BUILDING_SIDECAR: "1" },
   });
 
   if (!existsSync(sourceBinary)) {
@@ -145,6 +146,7 @@ function buildLinuxBleBridge({ release, targetTriple }) {
   execFileSync("cargo", cargoArgs, {
     cwd: repoRoot,
     stdio: "inherit",
+    env: { ...process.env, DASHDROP_BUILDING_SIDECAR: "1" },
   });
 
   if (!existsSync(sourceBinary)) {
@@ -189,6 +191,7 @@ function main() {
   execFileSync("cargo", cargoArgs, {
     cwd: repoRoot,
     stdio: "inherit",
+    env: { ...process.env, DASHDROP_BUILDING_SIDECAR: "1" },
   });
 
   if (!existsSync(sourceBinary)) {
