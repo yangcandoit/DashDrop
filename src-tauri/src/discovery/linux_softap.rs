@@ -12,7 +12,7 @@ impl LinuxSoftApManager {
     /// Returns the SSID and Password generated.
     pub fn start_hotspot(ssid_suffix: &str) -> Result<(String, String)> {
         let ssid = format!("DashDrop-{}", ssid_suffix);
-        let password = crate::crypto::generate_random_password(12);
+        let password = crate::crypto::identity::generate_random_password(12);
 
         // nmcli device wifi hotspot [ifname <ifname>] [con-name <name>] [ssid <SSID>] [band a|bg] [channel <channel>] [password <password>]
         let status = Command::new("nmcli")

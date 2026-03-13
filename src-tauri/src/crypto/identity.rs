@@ -236,6 +236,16 @@ impl Identity {
     }
 }
 
+pub fn generate_random_password(length: usize) -> String {
+    use rand::distributions::Alphanumeric;
+    use rand::Rng;
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(length)
+        .map(char::from)
+        .collect()
+}
+
 fn get_hostname() -> String {
     // Use std::process to call hostname command as fallback, or env var
     std::env::var("HOSTNAME")
