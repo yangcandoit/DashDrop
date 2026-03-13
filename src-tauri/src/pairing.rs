@@ -13,6 +13,7 @@ use tauri::State;
 const PAIRING_LINK_TTL_MS: u64 = 10 * 60 * 1000;
 const PAIRING_LINK_FUTURE_SKEW_MS: u64 = 2 * 60 * 1000;
 const DASHDROP_PAIRING_PREFIX: &str = "dashdrop://pair?";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ValidatedPairingPayload {
     pub version: u8,
@@ -35,6 +36,15 @@ pub struct IdentityMigrationProof {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct PairingPayloadV1 {
+    version: u8,
+    fingerprint: String,
+    device_name: String,
+    verification_code: String,
+    issued_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PairingPayloadV2Body {
     version: u8,
     fingerprint: String,
@@ -44,15 +54,6 @@ struct PairingPayloadV2Body {
     signer_public_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migration_proof: Option<IdentityMigrationProof>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PairingPayloadV1 {
-    version: u8,
-    fingerprint: String,
-    device_name: String,
-    verification_code: String,
-    issued_at_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,7 +269,6 @@ fn validate_v2(payload: PairingPayloadV2, now: u64) -> Result<ValidatedPairingPa
     })
 }
 
-#[allow(dead_code)]
 pub fn create_identity_migration_proof(
     identity: &crate::crypto::Identity,
     new_fingerprint: &str,
@@ -289,7 +289,6 @@ pub fn create_identity_migration_proof(
     })
 }
 
-#[allow(dead_code)]
 #[tauri::command]
 pub async fn generate_identity_migration_proof(
     state: State<'_, Arc<crate::state::AppState>>,
@@ -300,13 +299,12 @@ pub async fn generate_identity_migration_proof(
         .map_err(|error| error.to_string())
 }
 
-#[allow(dead_code)]
 #[tauri::command]
 pub async fn apply_identity_migration(
     state: State<'_, Arc<crate::state::AppState>>,
     payload: ValidatedPairingPayload,
 ) -> Result<(), String> {
-    let proof = payload.migration_proof.ok_or_else(|| "No migration proof found in payload".to_string())?;
+    let proof = payload.migration_proof.as_ref().ok_or_else(|| "No migration proof found in payload".to_string())?;
     
     let db = state.db.lock().map_err(|_| "Database lock poisoned".to_string())?;
     crate::db::migrate_trusted_peer_identity(
@@ -316,11 +314,10 @@ pub async fn apply_identity_migration(
         &payload.device_name,
     ).map_err(|error| error.to_string())?;
 
-    // Refresh memory state if needed or emit event
     Ok(())
 }
 
-pub fn validate_pairing_payload(input: &str) -> Result<ValidatedPairingPayload> {
+pub fn validate_pairing_input_value(input: &str) -> Result<ValidatedPairingPayload> {
     let payload_source = decode_pairing_payload_source(input)?;
     let parsed: serde_json::Value = serde_json::from_str(&payload_source)
         .map_err(|_| anyhow!("Pairing payload is not valid JSON."))?;
@@ -396,7 +393,7 @@ pub async fn get_local_pairing_link(
 
 #[tauri::command]
 pub async fn validate_pairing_input(input: String) -> Result<ValidatedPairingPayload, String> {
-    validate_pairing_payload(&input).map_err(|error| error.to_string())
+    validate_pairing_input_value(&input).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -416,7 +413,7 @@ mod tests {
         let identity = crate::crypto::Identity::load_or_create(&dir).expect("create identity");
         let uri =
             build_signed_pairing_link(&identity, "Desk Mac").expect("build signed pairing link");
-        let payload = validate_pairing_payload(&uri).expect("validate signed pairing link");
+        let payload = validate_pairing_input_value(&uri).expect("validate signed pairing link");
 
         assert_eq!(payload.version, 2);
         assert_eq!(payload.trust_model, "signed_link");
@@ -456,7 +453,7 @@ mod tests {
         );
 
         let error =
-            validate_pairing_payload(&tampered).expect_err("tampered payload should fail");
+            validate_pairing_input_value(&tampered).expect_err("tampered payload should fail");
         assert!(
             error.to_string().contains("signature is invalid"),
             "unexpected error: {error:#}"
@@ -476,7 +473,7 @@ mod tests {
         })
         .to_string();
 
-        let payload = validate_pairing_payload(&raw).expect("validate legacy pairing payload");
+        let payload = validate_pairing_input_value(&raw).expect("validate legacy pairing payload");
         assert_eq!(payload.version, 1);
         assert_eq!(payload.trust_model, "legacy_unsigned");
         assert!(!payload.signature_verified);
