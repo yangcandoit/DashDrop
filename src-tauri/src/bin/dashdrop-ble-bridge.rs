@@ -17,8 +17,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "windows")]
 use windows::Devices::Bluetooth::Advertisement::{
-    BluetoothLEAdvertisement, BluetoothLEAdvertisementDataSection,
     BluetoothLEAdvertisementPublisher, BluetoothLEAdvertisementPublisherStatus,
+    BluetoothLEAdvertisementReceivedEventArgs,
     BluetoothLEAdvertisementWatcher, BluetoothLEManufacturerData,
 };
 #[cfg(target_os = "windows")]
@@ -173,20 +173,20 @@ fn run_windows() -> Result<(), String> {
     let advertisement_file = parse_flag("--advertisement-file").ok_or("missing --advertisement-file")?;
     let snapshot_path = PathBuf::from(snapshot_file);
     let advertisement_path = PathBuf::from(advertisement_file);
-    let parent_pid = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() };
+    let _parent_pid = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() };
 
     let discovered_capsules = Arc::new(Mutex::new(HashMap::<String, BleAssistCapsule>::new()));
     let watcher = BluetoothLEAdvertisementWatcher::new().map_err(|e| format!("watcher init: {e}"))?;
     
     let capsules_clone = Arc::clone(&discovered_capsules);
-    watcher.Received(&windows::Foundation::TypedEventHandler::new(move |_, args| {
+    watcher.Received(&windows::Foundation::TypedEventHandler::<BluetoothLEAdvertisementWatcher, BluetoothLEAdvertisementReceivedEventArgs>::new(move |_, args| {
         if let Some(args) = args {
-            let advertisement = args.Advertisement().map_err(|_| "no advertisement")?;
-            let manufacturers = advertisement.ManufacturerData().map_err(|_| "no manufacturers")?;
+            let advertisement = args.Advertisement()?;
+            let manufacturers = advertisement.ManufacturerData()?;
             for manufacturer in manufacturers {
                 let company_id = manufacturer.CompanyId().unwrap_or(0);
                 let data_reader = windows::Storage::Streams::DataReader::FromBuffer(&manufacturer.Data().unwrap_or_default()).unwrap();
-                let mut data = vec![0u8; data_reader.UnconsumedBufferLength() as usize];
+                let mut data = vec![0u8; data_reader.UnconsumedBufferLength().unwrap_or(0) as usize];
                 let _ = data_reader.ReadBytes(&mut data);
                 if let Some(capsule) = CompactCodec::decode(company_id, &data) {
                     if let Ok(mut map) = capsules_clone.lock() {
@@ -208,7 +208,7 @@ fn run_windows() -> Result<(), String> {
         // Simple heuristic: if we can't open the parent process, it might be gone (depending on permissions).
         // For CLI tools, normally we just poll the advertisement file.
         
-        let mut capsules = {
+        let capsules = {
             let mut map = discovered_capsules.lock().expect("lock poisoned");
             let now = now_unix_millis();
             map.retain(|_, c| c.expires_at_unix_ms > now);
@@ -227,14 +227,14 @@ fn run_windows() -> Result<(), String> {
                 if let Some(payload) = CompactCodec::encode(&req.capsule) {
                     if Some(&payload) != last_advertised_payload.as_ref() {
                         let _ = publisher.Stop();
-                        let advertisement = BluetoothLEAdvertisement::new().unwrap();
+                        let advertisement = publisher.Advertisement().unwrap();
+                        let _ = advertisement.ManufacturerData().map(|v| v.Clear());
                         let manufacturer_data = BluetoothLEManufacturerData::new().unwrap();
                         manufacturer_data.SetCompanyId(CompactCodec::COMPANY_ID).unwrap();
                         let writer = DataWriter::new().unwrap();
                         writer.WriteBytes(&payload).unwrap();
                         manufacturer_data.SetData(&writer.DetachBuffer().unwrap()).unwrap();
                         advertisement.ManufacturerData().unwrap().Append(&manufacturer_data).unwrap();
-                        publisher.SetAdvertisement(&advertisement).unwrap();
                         let _ = publisher.Start();
                         last_advertised_payload = Some(payload);
                         advertised_rolling_id = Some(req.capsule.rolling_identifier.clone());
