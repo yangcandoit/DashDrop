@@ -185,7 +185,8 @@ fn run_windows() -> Result<(), String> {
             let manufacturers = advertisement.ManufacturerData()?;
             for manufacturer in manufacturers {
                 let company_id = manufacturer.CompanyId().unwrap_or(0);
-                let data_reader = windows::Storage::Streams::DataReader::FromBuffer(&manufacturer.Data().unwrap_or_default()).unwrap();
+                let Ok(data_buf) = manufacturer.Data() else { continue };
+                let data_reader = windows::Storage::Streams::DataReader::FromBuffer(&data_buf).unwrap();
                 let mut data = vec![0u8; data_reader.UnconsumedBufferLength().unwrap_or(0) as usize];
                 let _ = data_reader.ReadBytes(&mut data);
                 if let Some(capsule) = CompactCodec::decode(company_id, &data) {
