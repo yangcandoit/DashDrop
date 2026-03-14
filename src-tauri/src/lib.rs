@@ -1004,7 +1004,7 @@ pub async fn run_headless_daemon() -> anyhow::Result<()> {
 fn setup_windows_shell_context_menu() {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY_CURRENT_USER, REG_SZ,
+        RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, REG_SZ,
     };
 
     let exe_path = match std::env::current_exe() {
@@ -1030,7 +1030,7 @@ fn setup_windows_shell_context_menu() {
     ];
 
     for (key_path, value) in keys {
-        let mut hkey = 0;
+        let mut hkey: HKEY = std::ptr::null_mut();
         let wide_key: Vec<u16> = std::ffi::OsStr::new(key_path)
             .encode_wide()
             .chain(std::iter::once(0))
@@ -1041,7 +1041,7 @@ fn setup_windows_shell_context_menu() {
                 HKEY_CURRENT_USER,
                 wide_key.as_ptr(),
                 0,
-                std::ptr::null(),
+                std::ptr::null_mut(),
                 0,
                 0x0002 | 0x0004, // KEY_SET_VALUE | KEY_CREATE_SUB_KEY
                 std::ptr::null(),

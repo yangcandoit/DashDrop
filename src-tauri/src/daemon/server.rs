@@ -231,7 +231,7 @@ where
             Arc::clone(&state),
             app.clone(),
             endpoint_kind,
-            peer_identity,
+            peer_identity.clone(),
         )
         .await;
         write_framed_message(&mut stream, &response)
@@ -485,7 +485,7 @@ fn create_windows_pipe_server(
         options.pipe_mode(PipeMode::Byte);
         let security_attributes = build_windows_pipe_security_attributes()?;
         unsafe {
-            options.create_with_security_attributes_raw(path, security_attributes.as_ptr().cast())
+            options.create_with_security_attributes_raw(path, security_attributes.as_ptr() as *mut _)
         }
     })
 }
@@ -508,7 +508,7 @@ impl Drop for WindowsPipeSecurityAttributes {
     fn drop(&mut self) {
         if !self.descriptor.is_null() {
             unsafe {
-                windows_sys::Win32::Foundation::LocalFree(self.descriptor as isize);
+                windows_sys::Win32::Foundation::LocalFree(self.descriptor);
             }
         }
     }
@@ -561,7 +561,7 @@ fn current_windows_user_sid() -> Result<Vec<u8>> {
 
     impl Drop for HandleGuard {
         fn drop(&mut self) {
-            if self.0 != 0 {
+            if !self.0.is_null() {
                 unsafe {
                     CloseHandle(self.0);
                 }
@@ -569,7 +569,7 @@ fn current_windows_user_sid() -> Result<Vec<u8>> {
         }
     }
 
-    let mut token = 0;
+    let mut token: HANDLE = std::ptr::null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(anyhow!(
             "OpenProcessToken failed: {}",
@@ -605,7 +605,7 @@ fn windows_named_pipe_peer_identity(
 
     impl Drop for HandleGuard {
         fn drop(&mut self) {
-            if self.0 != 0 {
+            if !self.0.is_null() {
                 unsafe {
                     CloseHandle(self.0);
                 }
@@ -622,7 +622,7 @@ fn windows_named_pipe_peer_identity(
     }
     let _revert_guard = RevertGuard;
 
-    let mut token = 0;
+    let mut token: HANDLE = std::ptr::null_mut();
     if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) } == 0 {
         return Err(anyhow!(
             "OpenThreadToken failed: {}",
