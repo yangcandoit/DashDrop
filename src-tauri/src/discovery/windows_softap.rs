@@ -1,6 +1,6 @@
 #[cfg(target_os = "windows")]
 use windows::Devices::WiFiDirect::{
-    WiFiDirectAdvertisementListenState, WiFiDirectAdvertisementPublisher,
+    WiFiDirectAdvertisementListenStateDiscoverability, WiFiDirectAdvertisementPublisher,
     WiFiDirectAdvertisementPublisherStatus,
 };
 #[cfg(target_os = "windows")]
@@ -44,7 +44,7 @@ impl WindowsSoftApManager {
 
         // Make the device discoverable for P2P connections
         advertisement
-            .SetListenState(WiFiDirectAdvertisementListenState::Discoverable)
+            .SetListenStateDiscoverability(WiFiDirectAdvertisementListenStateDiscoverability::Normal)
             .map_err(|e| anyhow!("Failed to set listen state: {e}"))?;
 
         publisher
