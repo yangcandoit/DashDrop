@@ -32,6 +32,7 @@ use tauri::{
     Emitter, Manager,
 };
 use tauri_plugin_deep_link::DeepLinkExt;
+#[cfg(not(target_os = "windows"))]
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 struct UiShellState {
@@ -76,11 +77,33 @@ fn write_startup_error_log(config_dir: &std::path::Path, message: &str) {
 }
 
 fn show_startup_error_dialog<R: tauri::Runtime, T: tauri::Manager<R>>(app: &T, message: &str) {
-    app.dialog()
-        .message(message.to_string())
-        .title("DashDrop Startup Error")
-        .kind(MessageDialogKind::Error)
-        .show(|_| {});
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+        fn to_wide(s: &str) -> Vec<u16> {
+            OsStr::new(s)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
+        }
+        let text = to_wide(message);
+        let caption = to_wide("DashDrop Startup Error");
+        unsafe {
+            MessageBoxW(0, text.as_ptr(), caption.as_ptr(), MB_OK | MB_ICONERROR);
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    {
+        app.dialog()
+            .message(message.to_string())
+            .title("DashDrop Startup Error")
+            .kind(MessageDialogKind::Error)
+            .show(|_| {});
+    }
 }
 
 fn handoff_to_running_instance(

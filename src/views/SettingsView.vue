@@ -518,6 +518,7 @@ async function save() {
         <h2>Settings</h2>
       </div>
     </header>
+    <div v-if="loading" style="padding: 24px; color: #888;">Loading settings…</div>
     <main class="content glass-panel" v-if="!loading">
       <div v-if="loadError" class="security-warning">
         {{ loadError }}
