@@ -362,8 +362,11 @@ fn ensure_named_firewall_rule(rule_name: &str, create_script: &str) -> Result<()
 
 #[cfg(target_os = "windows")]
 fn run_powershell(script: &str) -> Result<std::process::Output> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
     let output = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .context("spawn powershell")?;
     if output.status.success() {

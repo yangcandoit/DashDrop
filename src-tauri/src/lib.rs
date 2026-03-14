@@ -363,6 +363,13 @@ fn spawn_daemon_process_from_path(
         command.process_group(0);
     }
 
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
     command.spawn().map(|_| true).map_err(|e| {
         anyhow::anyhow!(
             "failed to spawn dashdropd from {}: {e}",
@@ -1090,6 +1097,31 @@ fn setup_windows_shell_context_menu() {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn ensure_windows_firewall_rules() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    const BEACON_PORT: u16 = crate::discovery::beacon::DISCOVERY_BEACON_PORT;
+
+    // Add inbound UDP rule for discovery beacon (idempotent — netsh ignores duplicates)
+    let _ = std::process::Command::new("netsh")
+        .args([
+            "advfirewall", "firewall", "add", "rule",
+            "name=DashDrop Discovery",
+            "dir=in",
+            "action=allow",
+            "protocol=UDP",
+            &format!("localport={BEACON_PORT}"),
+            "profile=private,domain",
+            "enable=yes",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+
+    // Note: the QUIC transfer port (53319) firewall rule is managed by
+    // transport::server on first bind, so we only need the discovery beacon here.
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     init_tracing();
@@ -1097,6 +1129,7 @@ pub fn run() {
     #[cfg(target_os = "windows")]
     if !tauri::is_dev() {
         setup_windows_shell_context_menu();
+        ensure_windows_firewall_rules();
     }
 
     let app = match tauri::Builder::default()
@@ -1107,7 +1140,7 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_deep_link::init())
         .on_window_event(|window, event| {
-            if !daemon_control_plane_mode_enabled(window.app_handle()) || window.label() != "main" {
+            if window.label() != "main" {
                 return;
             }
 
@@ -1131,9 +1164,9 @@ pub fn run() {
                         .emit(
                             "system_error",
                             serde_json::json!({
-                                "code": "DAEMON_UI_HIDDEN",
+                                "code": "APP_HIDDEN_TO_TRAY",
                                 "subsystem": "ui_shell",
-                                "message": "DashDrop is still running in the background. Active transfers and discovery stay attached to the daemon control plane."
+                                "message": "DashDrop is still running in the background. Click the tray icon to reopen."
                             }),
                         )
                         .ok();

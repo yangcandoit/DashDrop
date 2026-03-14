@@ -6,5 +6,21 @@ fn main() {
         println!("cargo:rerun-if-env-changed=DASHDROP_BUILDING_SIDECAR");
         return;
     }
-    tauri_build::build()
+
+    let mut attributes = tauri_build::Attributes::new();
+
+    // On Windows targets, embed a manifest that activates Common Controls v6.
+    // Without this, TaskDialogIndirect (used by tauri-plugin-dialog) fails to resolve.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let manifest_path = std::path::Path::new("windows/dashdrop.exe.manifest");
+        if manifest_path.exists() {
+            let manifest = std::fs::read_to_string(manifest_path)
+                .expect("failed to read windows manifest");
+            attributes = attributes.windows_attributes(
+                tauri_build::WindowsAttributes::new().app_manifest(manifest),
+            );
+        }
+    }
+
+    tauri_build::try_build(attributes).expect("failed to run tauri_build");
 }
