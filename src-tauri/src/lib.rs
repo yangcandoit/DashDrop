@@ -79,6 +79,7 @@ fn write_startup_error_log(config_dir: &std::path::Path, message: &str) {
 fn show_startup_error_dialog<R: tauri::Runtime, T: tauri::Manager<R>>(app: &T, message: &str) {
     #[cfg(target_os = "windows")]
     {
+        let _ = app;
         use std::ffi::OsStr;
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
@@ -94,9 +95,8 @@ fn show_startup_error_dialog<R: tauri::Runtime, T: tauri::Manager<R>>(app: &T, m
         unsafe {
             MessageBoxW(0, text.as_ptr(), caption.as_ptr(), MB_OK | MB_ICONERROR);
         }
-        return;
     }
-    #[allow(unreachable_code)]
+    #[cfg(not(target_os = "windows"))]
     {
         app.dialog()
             .message(message.to_string())
