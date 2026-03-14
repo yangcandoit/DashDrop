@@ -28,16 +28,15 @@ pub fn start(state: Arc<AppState>, _host: Arc<dyn RuntimeHost>) {
             let mut needs_hotspot = false;
             for device in devices {
                 // Trigger condition: Trusted + Offline + Recently seen via BLE
-                if device.trust_level.is_trusted()
-                    && device.reachability_status == ReachabilityStatus::Offline
-                    && device.ble_last_seen_at.is_some()
+                if device.trusted
+                    && device.reachability == ReachabilityStatus::Offline
+                    && device.last_seen > 0
                 {
-                    
                     let ble_age = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs()
-                        .saturating_sub(device.ble_last_seen_at.unwrap());
+                        .saturating_sub(device.last_seen);
 
                     if ble_age < 60 && last_hotspot_trigger.elapsed() > Duration::from_secs(120) {
                         tracing::info!(
