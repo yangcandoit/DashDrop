@@ -30,6 +30,7 @@ function run(command, args, env = process.env) {
   execFileSync(command, args, {
     stdio: "inherit",
     env,
+    shell: process.platform === "win32",
   });
 }
 
