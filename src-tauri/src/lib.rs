@@ -1018,6 +1018,7 @@ fn setup_windows_shell_context_menu() {
     // HKCU\Software\Classes\*\shell\DashDrop\Icon -> "path\to\exe,0"
     // HKCU\Software\Classes\*\shell\DashDrop\command -> "path\to\exe" "%1"
 
+    let command_value = format!("\"{}\" \"%1\"", exe_str);
     let keys = [
         (
             "Software\\Classes\\*\\shell\\DashDrop",
@@ -1025,7 +1026,7 @@ fn setup_windows_shell_context_menu() {
         ),
         (
             "Software\\Classes\\*\\shell\\DashDrop\\command",
-            Some(format!("\"{}\" \"%1\"", exe_str).as_str()),
+            Some(command_value.as_str()),
         ),
     ];
 
