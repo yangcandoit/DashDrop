@@ -345,6 +345,10 @@ npm run tauri build
   请查看启动日志：
   - `%APPDATA%\\DashDrop\\startup-error.log`
   - `%TEMP%\\dashdrop-startup-error.log`
+  常见原因：
+  - WebView2 Runtime 未就绪
+  - Windows 防火墙尚未放行 `dashdropd.exe`
+  - 旧版 Windows 缺少运行时组件（本仓库现已改为 Windows MSVC CRT 静态链接以降低该风险）
 
 ---
 
@@ -357,7 +361,9 @@ DashDrop uses a combination of **mDNS (Multicast DNS)**, **UDP Beacons**, and **
 - **VLAN/Subnet Segregation**: Devices must be on the same subnet for mDNS to work.
 - **Firewalls**: 
   - Ensure **UDP 5353** (mDNS) is allowed.
+  - Ensure **UDP 53318** (beacon fallback) is allowed.
   - Ensure **UDP 53319** (QUIC) is allowed.
+  - If `Settings -> Runtime` shows a fallback random listener port, allow that UDP port too.
 
 ### 2. VPN Interference
 - Many VPNs disable local network access. Try enabling **Split Tunneling** or turning off the VPN during transfer.

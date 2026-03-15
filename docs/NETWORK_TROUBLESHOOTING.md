@@ -57,6 +57,7 @@ open /Applications/DashDrop.app
 - Discovery works only one way
 - Connect by Address works, but Nearby does not
 - Transfers time out even though the peer is visible
+- The app or daemon sidecar fails to start because of a missing runtime dependency
 
 ### Firewall guidance
 
@@ -71,13 +72,19 @@ Allow DashDrop through Windows Defender Firewall for:
 
 1. Open DashDrop on both devices.
 2. Confirm `Settings -> Runtime` shows a non-zero local listener port.
-3. If discovery fails, compare diagnostics on both peers.
-4. If `Connect by Address` succeeds but Nearby does not, the likely cause is mDNS or beacon firewall filtering.
+3. Confirm the Windows host allowed the firewall prompt for `dashdropd.exe`, not only the UI executable.
+4. If startup closes immediately, check:
+   - `%APPDATA%\\DashDrop\\startup-error.log`
+   - `%TEMP%\\dashdrop-startup-error.log`
+5. If discovery fails, compare diagnostics on both peers.
+6. If `Connect by Address` succeeds but Nearby does not, the likely cause is mDNS or beacon firewall filtering.
+7. If neither Nearby nor Connect by Address works, verify the Windows host is not missing WebView2 Runtime and that the active listener port is allowed through the firewall.
 
 ### Notes
 
 - DashDrop now has a baseline Windows local IPC implementation via named pipes.
 - Discovery still depends on the local network environment; restrictive enterprise firewall policy can still block it.
+- Packaged Windows builds now explicitly request WebView2 bootstrap handling, but real clean-machine verification is still required before release.
 
 ## Linux
 

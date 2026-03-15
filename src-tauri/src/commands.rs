@@ -284,8 +284,11 @@ fn control_plane_mode_from_sources(
 
 fn control_plane_mode_for_app(app: &AppHandle) -> String {
     let state_mode = app.try_state::<Arc<AppState>>().and_then(|state| {
-        let mode =
-            tauri::async_runtime::block_on(async { state.control_plane_mode.read().await.clone() });
+        let mode = tokio::task::block_in_place(|| {
+            tauri::async_runtime::block_on(async {
+                state.control_plane_mode.read().await.clone()
+            })
+        });
         if mode.trim().is_empty() {
             None
         } else {

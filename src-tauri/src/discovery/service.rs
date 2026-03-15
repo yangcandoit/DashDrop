@@ -81,11 +81,31 @@ async fn configure_mdns_interfaces(mdns: &ServiceDaemon, state: &Arc<AppState>) 
         return Ok(());
     }
 
-    mdns.disable_interface(IfKind::All)
-        .context("disable all mDNS interfaces before selective enable")?;
+    if let Err(error) = mdns
+        .disable_interface(IfKind::All)
+        .context("disable all mDNS interfaces before selective enable")
+    {
+        tracing::warn!(
+            "mDNS interface filter fallback: failed to disable all interfaces before selective enable: {error:#}; using all interfaces"
+        );
+        *state.mdns_interface_policy.write().await = "all_fallback".to_string();
+        state.mdns_enabled_interfaces.write().await.clear();
+        return Ok(());
+    }
+
     for ifname in &selected {
-        mdns.enable_interface(ifname.as_str())
-            .with_context(|| format!("enable mDNS interface {ifname}"))?;
+        if let Err(error) = mdns
+            .enable_interface(ifname.as_str())
+            .with_context(|| format!("enable mDNS interface {ifname}"))
+        {
+            tracing::warn!(
+                "mDNS interface filter fallback: failed to enable interface {ifname}: {error:#}; re-enabling all interfaces"
+            );
+            let _ = mdns.enable_interface(IfKind::All);
+            *state.mdns_interface_policy.write().await = "all_fallback".to_string();
+            state.mdns_enabled_interfaces.write().await.clear();
+            return Ok(());
+        }
     }
     *state.mdns_interface_policy.write().await = "filtered".to_string();
     *state.mdns_enabled_interfaces.write().await = selected.clone();

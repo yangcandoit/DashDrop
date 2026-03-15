@@ -36,6 +36,12 @@
     "category": "Utility",
     "shortDescription": "Nearby file transfer with alternate Open With entry points for packaged desktop builds.",
     "longDescription": "DashDrop ships a daemon-backed desktop shell and registers non-default file associations for common user files so Finder, Explorer, and Linux desktop launchers can hand off selected paths to the existing share queue without changing the frontend contract.",
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper",
+        "silent": true
+      }
+    },
     "fileAssociations": [
       {
         "name": "DashDrop Plain Text Share",

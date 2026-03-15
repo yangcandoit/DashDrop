@@ -146,7 +146,7 @@ fn start_network_runtime(state: Arc<AppState>, host: Arc<dyn RuntimeHost>, confi
         tracing::info!("QUIC server on port {port}");
 
         let mdns = match crate::discovery::register_service(Arc::clone(&state)).await {
-            Ok(mdns) => Arc::new(mdns),
+            Ok(mdns) => Some(Arc::new(mdns)),
             Err(err) => {
                 tracing::error!("Failed to register mDNS: {err:#}");
                 emit_system_error(
@@ -155,23 +155,25 @@ fn start_network_runtime(state: Arc<AppState>, host: Arc<dyn RuntimeHost>, confi
                     "mdns",
                     format!("Device discovery unavailable: {err:#}. Other devices won't see you."),
                 );
-                return;
+                None
             }
         };
 
-        let _ = state.mdns.set(Arc::clone(&mdns));
         let state_for_beacon = Arc::clone(&state);
 
-        if let Err(err) =
-            crate::discovery::start_browser(mdns, Arc::clone(&host), Arc::clone(&state)).await
-        {
-            tracing::error!("Failed to start mDNS browser: {err:#}");
-            emit_system_error(
-                &host,
-                "MDNS_BROWSER_FAILED",
-                "mdns_browser",
-                format!("Scanning for nearby devices failed: {err:#}"),
-            );
+        if let Some(mdns) = mdns {
+            let _ = state.mdns.set(Arc::clone(&mdns));
+            if let Err(err) =
+                crate::discovery::start_browser(mdns, Arc::clone(&host), Arc::clone(&state)).await
+            {
+                tracing::error!("Failed to start mDNS browser: {err:#}");
+                emit_system_error(
+                    &host,
+                    "MDNS_BROWSER_FAILED",
+                    "mdns_browser",
+                    format!("Scanning for nearby devices failed: {err:#}"),
+                );
+            }
         }
 
         if let Err(err) = crate::discovery::start_beacon(Arc::clone(&host), state_for_beacon).await
