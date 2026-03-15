@@ -6,9 +6,27 @@ authors = ["DashDrop"]
 edition = "2021"
 default-run = "dashdrop"
 
+[features]
+sidecar = []
+
 [lib]
 name = "dashdrop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "dashdropd"
+path = "src/bin/dashdropd.rs"
+required-features = ["sidecar"]
+
+[[bin]]
+name = "dashdrop-ble-bridge"
+path = "src/bin/dashdrop-ble-bridge.rs"
+required-features = ["sidecar"]
+
+[[bin]]
+name = "dashdrop-ble-bridge-linux"
+path = "src/bin/dashdrop-ble-bridge-linux.rs"
+required-features = ["sidecar"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

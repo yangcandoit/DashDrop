@@ -90,6 +90,8 @@ function buildWindowsBleBridge({ release, targetTriple }) {
     path.join("src-tauri", "Cargo.toml"),
     "--bin",
     "dashdrop-ble-bridge",
+    "--features",
+    "sidecar",
   ];
   if (release) {
     cargoArgs.push("--release");
@@ -137,6 +139,8 @@ function buildLinuxBleBridge({ release, targetTriple }) {
     path.join("src-tauri", "Cargo.toml"),
     "--bin",
     "dashdrop-ble-bridge-linux",
+    "--features",
+    "sidecar",
   ];
   if (release) {
     cargoArgs.push("--release");
@@ -182,6 +186,8 @@ function main() {
     path.join("src-tauri", "Cargo.toml"),
     "--bin",
     "dashdropd",
+    "--features",
+    "sidecar",
   ];
   if (release) {
     cargoArgs.push("--release");
