@@ -82,6 +82,7 @@ fn show_startup_error_dialog<R: tauri::Runtime, T: tauri::Manager<R>>(app: &T, m
         let _ = app;
         use std::ffi::OsStr;
         use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::HWND;
         use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 
         fn to_wide(s: &str) -> Vec<u16> {
@@ -93,7 +94,7 @@ fn show_startup_error_dialog<R: tauri::Runtime, T: tauri::Manager<R>>(app: &T, m
         let text = to_wide(message);
         let caption = to_wide("DashDrop Startup Error");
         unsafe {
-            MessageBoxW(0, text.as_ptr(), caption.as_ptr(), MB_OK | MB_ICONERROR);
+            MessageBoxW(0 as HWND, text.as_ptr(), caption.as_ptr(), MB_OK | MB_ICONERROR);
         }
     }
     #[cfg(not(target_os = "windows"))]
