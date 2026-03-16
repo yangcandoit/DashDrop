@@ -28,6 +28,16 @@ function binaryExtensionForTarget(targetTriple) {
   return targetTriple.includes("windows") ? ".exe" : "";
 }
 
+function copyAliasIfNeeded(sourcePath, destPath, extension) {
+  if (sourcePath === destPath) {
+    return;
+  }
+  copyFileSync(sourcePath, destPath);
+  if (extension === "") {
+    chmodSync(destPath, 0o755);
+  }
+}
+
 function buildMacOsBleBridge({ release, profile, targetTriple }) {
   if (!targetTriple.includes("apple-darwin")) {
     return null;
@@ -63,6 +73,8 @@ function buildMacOsBleBridge({ release, profile, targetTriple }) {
   mkdirSync(binariesDir, { recursive: true });
   copyFileSync(outputBinary, destinationBinary);
   chmodSync(destinationBinary, 0o755);
+  const aliasBinary = path.join(binariesDir, `dashdrop-ble-bridge${binaryExtensionForTarget(targetTriple)}`);
+  copyAliasIfNeeded(destinationBinary, aliasBinary, binaryExtensionForTarget(targetTriple));
 
   return path.relative(repoRoot, destinationBinary);
 }
@@ -109,6 +121,8 @@ function buildWindowsBleBridge({ release, targetTriple }) {
 
   mkdirSync(binariesDir, { recursive: true });
   copyFileSync(sourceBinary, destinationBinary);
+  const aliasBinary = path.join(binariesDir, `dashdrop-ble-bridge${extension}`);
+  copyAliasIfNeeded(destinationBinary, aliasBinary, extension);
 
   return path.relative(repoRoot, destinationBinary);
 }
@@ -162,6 +176,8 @@ function buildLinuxBleBridge({ release, targetTriple }) {
   if (extension === "") {
     chmodSync(destinationBinary, 0o755);
   }
+  const aliasBinary = path.join(binariesDir, `dashdrop-ble-bridge${extension}`);
+  copyAliasIfNeeded(destinationBinary, aliasBinary, extension);
 
   return path.relative(repoRoot, destinationBinary);
 }
@@ -209,6 +225,8 @@ function main() {
   if (extension === "") {
     chmodSync(destinationBinary, 0o755);
   }
+  const aliasBinary = path.join(binariesDir, `dashdropd${extension}`);
+  copyAliasIfNeeded(destinationBinary, aliasBinary, extension);
 
   const bleBridgeBinary = buildMacOsBleBridge({
     release,
