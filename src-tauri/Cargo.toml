@@ -71,7 +71,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 parking_lot = "0.12"
-sysinfo = "0.38.3"
+sysinfo = "0.38.4"
 libc = "0.2"
 tauri-plugin-notification = "2.3.3"
 tauri-plugin-store = "2.4.2"
