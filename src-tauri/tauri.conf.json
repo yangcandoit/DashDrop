@@ -313,10 +313,6 @@
         ]
       }
     ],
-    "externalBin": [
-      "binaries/dashdropd",
-      "binaries/dashdrop-ble-bridge"
-    ],
     "macOS": {
       "infoPlist": "Info.plist"
     },
