@@ -76,7 +76,7 @@ libc = "0.2"
 tauri-plugin-notification = "2.3.3"
 tauri-plugin-store = "2.4.2"
 tauri-plugin-deep-link = "2"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 socket2 = "0.5"
 arboard = "3"
 
